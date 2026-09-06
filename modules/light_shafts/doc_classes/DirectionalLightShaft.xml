@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DirectionalLightShaft" inherits="DirectionalLight" version="3.5">
+	<brief_description>
+		A [DirectionalLight] that also renders Unreal-style light shafts ("god rays").
+	</brief_description>
+	<description>
+		DirectionalLightShaft behaves like a [DirectionalLight] but additionally drives a real screen-space light-shaft post-process in the GLES3 renderer, mirroring how Unreal Engine splits the effect:
+		- [b]Light Shaft Bloom[/b] ([member bloom_enabled]): bright streaks radial-blurred outward from the light's on-screen position.
+		- [b]Light Shaft Occlusion[/b] ([member occlusion_enabled]): the scene is darkened toward the light where geometry blocks it, using the depth buffer so real occluders (not just dark surfaces) cast the shafts.
+		The pass downsamples the frame, builds the bloom and depth-occlusion masks, radial-blurs both toward the sun over several growing-radius iterations, temporally filters the result against the previous frame ([member temporal_blend]), then composites it back before glow and tone mapping. When the sun is off screen or behind the camera the effect costs nothing.
+		This is a GLES3-only feature and requires the HDR/buffers rendering path (the same one glow and DOF use). On the GLES2 backend the node is an ordinary [DirectionalLight].
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+	</methods>
+	<members>
+		<member name="bloom_enabled" type="bool" setter="set_bloom_enabled" getter="is_bloom_enabled" default="true">
+			If [code]true[/code], bright streaks are scattered outward from the light.
+		</member>
+		<member name="bloom_intensity" type="float" setter="set_bloom_intensity" getter="get_bloom_intensity" default="0.8">
+			Overall strength of the scattered streaks in the final composite. The additive contribution is capped relative to the local scene brightness so it can't detonate a downstream [Environment] glow HDR-bleed pass.
+		</member>
+		<member name="bloom_threshold" type="float" setter="set_bloom_threshold" getter="get_bloom_threshold" default="1.0">
+			Brightness (in linear HDR) a pixel must exceed to contribute to the streaks. Keep it near or above [code]1.0[/code] so only the sun and its immediate glow scatter, not the whole sky.
+		</member>
+		<member name="bloom_tint" type="Color" setter="set_bloom_tint" getter="get_bloom_tint" default="Color( 1, 0.95, 0.85, 1 )">
+			Color the scattered streaks are multiplied by.
+		</member>
+		<member name="occlusion_enabled" type="bool" setter="set_occlusion_enabled" getter="is_occlusion_enabled" default="true">
+			If [code]true[/code], the scene is darkened toward the light where geometry blocks it (depth-based).
+		</member>
+		<member name="occlusion_darkness" type="float" setter="set_occlusion_darkness" getter="get_occlusion_darkness" default="0.35">
+			How strongly the scene is dimmed toward the light where geometry blocks it. Localized to the light's on-screen region and floored, so it stays subtle. [code]0[/code] disables it. The bright streaks already carry their own gaps where blocked; this only adds the extra "dark shafts" cue.
+		</member>
+		<member name="shaft_enabled" type="bool" setter="set_shaft_enabled" getter="is_shaft_enabled" default="true">
+			Master switch. When [code]false[/code] the node is a plain [DirectionalLight].
+		</member>
+		<member name="shaft_samples" type="int" setter="set_shaft_samples" getter="get_shaft_samples" default="64">
+			Number of taps in the radial-blur gather. Higher is smoother/longer but costlier. See [enum ShaftQuality].
+		</member>
+		<member name="shaft_density" type="float" setter="set_shaft_density" getter="get_shaft_density" default="0.8">
+			How far along the ray toward the light each tap reaches. Higher spreads the shafts further.
+		</member>
+		<member name="shaft_decay" type="float" setter="set_shaft_decay" getter="get_shaft_decay" default="0.96">
+			Per-tap falloff of the accumulated light along the ray.
+		</member>
+		<member name="shaft_weight" type="float" setter="set_shaft_weight" getter="get_shaft_weight" default="1.0">
+			Gain applied while accumulating the radial-blur samples (before the soft-knee). Raise for punchier streaks.
+		</member>
+		<member name="temporal_blend" type="float" setter="set_temporal_blend" getter="get_temporal_blend" default="0.0">
+			Fraction of the previous frame's result reprojected and kept each frame, to remove the last of the sampling grain. Off by default; any real camera motion drops it to zero automatically. Turn it up ([code]0.7[/code]–[code]0.9[/code]) for a mostly-static camera.
+		</member>
+	</members>
+	<constants>
+		<constant name="SHAFT_QUALITY_LOW" value="16" enum="ShaftQuality">
+			Suggested [member shaft_samples] for low quality.
+		</constant>
+		<constant name="SHAFT_QUALITY_MEDIUM" value="32" enum="ShaftQuality">
+			Suggested [member shaft_samples] for medium quality.
+		</constant>
+		<constant name="SHAFT_QUALITY_HIGH" value="64" enum="ShaftQuality">
+			Suggested [member shaft_samples] for high quality (the default).
+		</constant>
+		<constant name="SHAFT_QUALITY_ULTRA" value="96" enum="ShaftQuality">
+			Suggested [member shaft_samples] for ultra quality.
+		</constant>
+	</constants>
+</class>

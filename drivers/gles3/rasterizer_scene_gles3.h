@@ -37,14 +37,17 @@
 #include "drivers/gles3/shaders/cube_to_dp.glsl.gen.h"
 #include "drivers/gles3/shaders/effect_blur.glsl.gen.h"
 #include "drivers/gles3/shaders/exposure.glsl.gen.h"
+#include "drivers/gles3/shaders/light_shaft.glsl.gen.h"
 #include "drivers/gles3/shaders/resolve.glsl.gen.h"
 #include "drivers/gles3/shaders/scene.glsl.gen.h"
 #include "drivers/gles3/shaders/screen_space_reflection.glsl.gen.h"
+#include "drivers/gles3/shaders/sky.glsl.gen.h"
 #include "drivers/gles3/shaders/ssao.glsl.gen.h"
 #include "drivers/gles3/shaders/ssao_blur.glsl.gen.h"
 #include "drivers/gles3/shaders/ssao_minify.glsl.gen.h"
 #include "drivers/gles3/shaders/subsurf_scattering.glsl.gen.h"
 #include "drivers/gles3/shaders/tonemap.glsl.gen.h"
+#include "drivers/gles3/shaders/volumetric_fog.glsl.gen.h"
 
 class RasterizerSceneGLES3 : public RasterizerScene {
 public:
@@ -101,10 +104,13 @@ public:
 		GLuint current_main_tex;
 
 		SceneShaderGLES3 scene_shader;
+		SkyShaderGLES3 sky_shader;
 		CubeToDpShaderGLES3 cube_to_dp_shader;
 		ResolveShaderGLES3 resolve_shader;
 		ScreenSpaceReflectionShaderGLES3 ssr_shader;
 		EffectBlurShaderGLES3 effect_blur_shader;
+		LightShaftShaderGLES3 light_shaft_shader;
+		VolumetricFogShaderGLES3 volumetric_fog_shader;
 		SubsurfScatteringShaderGLES3 sss_shader;
 		SsaoMinifyShaderGLES3 ssao_minify_shader;
 		SsaoShaderGLES3 ssao_shader;
@@ -456,6 +462,20 @@ public:
 		float fog_height_max;
 		float fog_height_curve;
 
+		// Route C volumetric fog: half-res sun-shadow raymarch (see _volumetric_fog).
+		bool volumetric_fog_enabled;
+		float volumetric_fog_density;
+		float volumetric_fog_height_falloff;
+		float volumetric_fog_height_ref;
+		Color volumetric_fog_albedo;
+		Color volumetric_fog_ambient;
+		float volumetric_fog_sun_energy;
+		float volumetric_fog_anisotropy;
+		float volumetric_fog_length;
+		float volumetric_fog_extinction;
+		int volumetric_fog_samples;
+		float volumetric_fog_temporal_blend;
+
 		Environment() :
 				bg_mode(VS::ENV_BG_CLEAR_COLOR),
 				sky_custom_fov(0.0),
@@ -528,7 +548,19 @@ public:
 				fog_height_enabled(false),
 				fog_height_min(10),
 				fog_height_max(0),
-				fog_height_curve(1) {
+				fog_height_curve(1),
+				volumetric_fog_enabled(false),
+				volumetric_fog_density(0.03),
+				volumetric_fog_height_falloff(0.1),
+				volumetric_fog_height_ref(0.0),
+				volumetric_fog_albedo(Color(1, 1, 1)),
+				volumetric_fog_ambient(Color(0.05, 0.06, 0.08)),
+				volumetric_fog_sun_energy(1.0),
+				volumetric_fog_anisotropy(0.3),
+				volumetric_fog_length(160.0),
+				volumetric_fog_extinction(1.0),
+				volumetric_fog_samples(48),
+				volumetric_fog_temporal_blend(0.9) {
 		}
 	};
 
@@ -562,6 +594,7 @@ public:
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_color, const Color &p_sun_color, float p_sun_amount);
 	virtual void environment_set_fog_depth(RID p_env, bool p_enable, float p_depth_begin, float p_depth_end, float p_depth_curve, bool p_transmit, float p_transmit_curve);
 	virtual void environment_set_fog_height(RID p_env, bool p_enable, float p_min_height, float p_max_height, float p_height_curve);
+	virtual void environment_set_volumetric_fog(RID p_env, bool p_enable, float p_density, float p_height_falloff, float p_height_ref, const Color &p_albedo, const Color &p_ambient, float p_sun_energy, float p_anisotropy, float p_length, float p_extinction, int p_samples, float p_temporal_blend);
 
 	virtual bool is_environment(RID p_env);
 
@@ -838,6 +871,13 @@ public:
 
 	void _draw_sky(RasterizerStorageGLES3::Sky *p_sky, const CameraMatrix &p_projection, const Transform &p_transform, bool p_vflip, float p_custom_fov, float p_energy, const Basis &p_sky_orientation);
 
+	// Shader-driven skies (modules/sky_shader): the visible sky is drawn per screen
+	// pixel by `_draw_sky`, while `_update_sky_shader` re-bakes a small panorama for
+	// radiance/ambient on a throttle.
+	RasterizerStorageGLES3::Material *_get_sky_shader_material(RasterizerStorageGLES3::Sky *p_sky);
+	void _bind_sky_shader_material(RasterizerStorageGLES3::Material *p_material, const Transform &p_cam_transform, const Basis &p_light_frame);
+	void _update_sky_shader(RasterizerStorageGLES3::Sky *p_sky, const Transform &p_cam_transform);
+
 	void _setup_environment(Environment *env, const CameraMatrix &p_cam_projection, const Transform &p_cam_transform, const int p_eye = 0, bool p_no_fog = false);
 	void _setup_directional_light(int p_index, const Transform &p_camera_inverse_transform, bool p_use_shadows);
 	void _setup_lights(RID *p_light_cull_result, int p_light_cull_count, const Transform &p_camera_inverse_transform, const CameraMatrix &p_camera_projection, RID p_shadow_atlas);
@@ -850,7 +890,9 @@ public:
 
 	void _blur_effect_buffer();
 	void _render_mrts(Environment *env, const CameraMatrix &p_cam_projection);
-	void _post_process(Environment *env, const CameraMatrix &p_cam_projection);
+	GLuint _light_shafts(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_source_color);
+	GLuint _volumetric_fog(Environment *env, const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_source_color);
+	void _post_process(Environment *env, const CameraMatrix &p_cam_projection, const Transform &p_cam_transform);
 
 	void _prepare_depth_texture();
 	void _bind_depth_texture();

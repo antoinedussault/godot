@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SceneCatalog" inherits="Resource" version="3.5">
+	<brief_description>
+		Project-wide registry of every travellable scene.
+	</brief_description>
+	<description>
+		A [SceneCatalog] is the "cell list" for [SceneManager]: it maps a stable string id to a scene file path plus metadata. [SceneDoor] and [method SceneManager.travel_to] always refer to a scene by its id, never by raw path, so scenes can be moved on disk without editing every door.
+		Keep one [code].tres[/code] under version control and hand it to the manager with [method SceneManager.set_catalog] or [method SceneManager.set_catalog_path]. The [b]Scenes[/b] editor dock (bottom panel) edits it visually.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_entry">
+			<return type="void" />
+			<argument index="0" name="entry" type="SceneCatalogEntry" />
+			<description>
+				Appends an entry.
+			</description>
+		</method>
+		<method name="get_default_spawn" qualifiers="const">
+			<return type="String" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				The [member SceneCatalogEntry.default_spawn] of the entry with this id, or [code]""[/code].
+			</description>
+		</method>
+		<method name="get_entry" qualifiers="const">
+			<return type="SceneCatalogEntry" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				The entry with this id, or [code]null[/code].
+			</description>
+		</method>
+		<method name="get_entry_by_index" qualifiers="const">
+			<return type="SceneCatalogEntry" />
+			<argument index="0" name="index" type="int" />
+			<description>
+			</description>
+		</method>
+		<method name="get_entry_count" qualifiers="const">
+			<return type="int" />
+			<description>
+			</description>
+		</method>
+		<method name="get_ids" qualifiers="const">
+			<return type="PoolStringArray" />
+			<description>
+				Every entry id, in order.
+			</description>
+		</method>
+		<method name="get_scene_path" qualifiers="const">
+			<return type="String" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				The [member SceneCatalogEntry.scene_path] of the entry with this id, or [code]""[/code].
+			</description>
+		</method>
+		<method name="has_id" qualifiers="const">
+			<return type="bool" />
+			<argument index="0" name="id" type="String" />
+			<description>
+			</description>
+		</method>
+		<method name="remove_entry">
+			<return type="void" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				Removes the first entry with this id.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="entries" type="Array" setter="set_entries" getter="get_entries" default="[  ]">
+			The [SceneCatalogEntry] resources, one per travellable scene.
+		</member>
+	</members>
+	<constants>
+	</constants>
+</class>

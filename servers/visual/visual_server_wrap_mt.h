@@ -113,6 +113,7 @@ public:
 
 	FUNCRID(sky)
 	FUNC3(sky_set_texture, RID, RID, int)
+	FUNC5(sky_set_material, RID, RID, int, int, int)
 
 	/* SHADER API */
 
@@ -265,6 +266,7 @@ public:
 	FUNC2(light_directional_set_shadow_mode, RID, LightDirectionalShadowMode)
 	FUNC2(light_directional_set_blend_splits, RID, bool)
 	FUNC2(light_directional_set_shadow_depth_range_mode, RID, LightDirectionalShadowDepthRangeMode)
+	FUNC11(light_directional_set_light_shafts, RID, bool, float, float, const Color &, float, int, float, float, float, float)
 
 	/* PROBE API */
 
@@ -464,6 +466,7 @@ public:
 	FUNC5(environment_set_fog, RID, bool, const Color &, const Color &, float)
 	FUNC7(environment_set_fog_depth, RID, bool, float, float, float, bool, float)
 	FUNC5(environment_set_fog_height, RID, bool, float, float, float)
+	FUNC13(environment_set_volumetric_fog, RID, bool, float, float, float, const Color &, const Color &, float, float, float, float, int, float)
 
 	/* INTERPOLATION API */
 

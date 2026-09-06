@@ -973,6 +973,24 @@ void RasterizerSceneGLES3::environment_set_fog_height(RID p_env, bool p_enable, 
 	env->fog_height_curve = p_height_curve;
 }
 
+void RasterizerSceneGLES3::environment_set_volumetric_fog(RID p_env, bool p_enable, float p_density, float p_height_falloff, float p_height_ref, const Color &p_albedo, const Color &p_ambient, float p_sun_energy, float p_anisotropy, float p_length, float p_extinction, int p_samples, float p_temporal_blend) {
+	Environment *env = environment_owner.getornull(p_env);
+	ERR_FAIL_COND(!env);
+
+	env->volumetric_fog_enabled = p_enable;
+	env->volumetric_fog_density = p_density;
+	env->volumetric_fog_height_falloff = p_height_falloff;
+	env->volumetric_fog_height_ref = p_height_ref;
+	env->volumetric_fog_albedo = p_albedo;
+	env->volumetric_fog_ambient = p_ambient;
+	env->volumetric_fog_sun_energy = p_sun_energy;
+	env->volumetric_fog_anisotropy = p_anisotropy;
+	env->volumetric_fog_length = p_length;
+	env->volumetric_fog_extinction = p_extinction;
+	env->volumetric_fog_samples = p_samples;
+	env->volumetric_fog_temporal_blend = p_temporal_blend;
+}
+
 bool RasterizerSceneGLES3::is_environment(RID p_env) {
 	return environment_owner.owns(p_env);
 }
@@ -2439,27 +2457,236 @@ void RasterizerSceneGLES3::_add_geometry_with_material(RasterizerStorageGLES3::G
 	}
 }
 
+RasterizerStorageGLES3::Material *RasterizerSceneGLES3::_get_sky_shader_material(RasterizerStorageGLES3::Sky *p_sky) {
+	if (!p_sky->shader_material.is_valid()) {
+		return nullptr;
+	}
+	RasterizerStorageGLES3::Material *material = storage->material_owner.getornull(p_sky->shader_material);
+	if (!material) {
+		return nullptr;
+	}
+	if (material->shader && material->shader->dirty_list.in_list()) {
+		storage->_update_shader(material->shader);
+	}
+	if (material->dirty_list.in_list()) {
+		storage->_update_material(material);
+	}
+	if (!material->shader || !material->shader->valid || material->shader->mode != VS::SHADER_SKY) {
+		return nullptr;
+	}
+	return material;
+}
+
+// Assumes state.sky_shader is already bound and active. Uploads the sky builtins,
+// the material UBO and the material textures (honouring hint defaults).
+void RasterizerSceneGLES3::_bind_sky_shader_material(RasterizerStorageGLES3::Material *p_material, const Transform &p_cam_transform, const Basis &p_light_frame) {
+	state.sky_shader.set_uniform(SkyShaderGLES3::TIME, storage->frame.time[0]);
+	state.sky_shader.set_uniform(SkyShaderGLES3::SKY_POSITION, p_cam_transform.origin);
+
+	const SkyShaderGLES3::Uniforms u_enabled[4] = { SkyShaderGLES3::SKY_LIGHT0_ENABLED, SkyShaderGLES3::SKY_LIGHT1_ENABLED, SkyShaderGLES3::SKY_LIGHT2_ENABLED, SkyShaderGLES3::SKY_LIGHT3_ENABLED };
+	const SkyShaderGLES3::Uniforms u_dir[4] = { SkyShaderGLES3::SKY_LIGHT0_DIRECTION, SkyShaderGLES3::SKY_LIGHT1_DIRECTION, SkyShaderGLES3::SKY_LIGHT2_DIRECTION, SkyShaderGLES3::SKY_LIGHT3_DIRECTION };
+	const SkyShaderGLES3::Uniforms u_energy[4] = { SkyShaderGLES3::SKY_LIGHT0_ENERGY, SkyShaderGLES3::SKY_LIGHT1_ENERGY, SkyShaderGLES3::SKY_LIGHT2_ENERGY, SkyShaderGLES3::SKY_LIGHT3_ENERGY };
+	const SkyShaderGLES3::Uniforms u_color[4] = { SkyShaderGLES3::SKY_LIGHT0_COLOR, SkyShaderGLES3::SKY_LIGHT1_COLOR, SkyShaderGLES3::SKY_LIGHT2_COLOR, SkyShaderGLES3::SKY_LIGHT3_COLOR };
+
+	for (int i = 0; i < 4; i++) {
+		bool en = i < state.directional_light_count;
+		state.sky_shader.set_uniform(u_enabled[i], (int)en);
+		if (en) {
+			LightInstance *li = directional_lights[i];
+			// -Z of the light = the direction it travels (Godot 4 sky convention);
+			// rotate into the same frame as EYEDIR (identity for the radiance bake).
+			Vector3 dir = p_light_frame.xform(li->transform.basis.xform(Vector3(0, 0, -1))).normalized();
+			Color col = li->light_ptr->color;
+			state.sky_shader.set_uniform(u_dir[i], dir);
+			state.sky_shader.set_uniform(u_color[i], Vector3(col.r, col.g, col.b));
+			state.sky_shader.set_uniform(u_energy[i], li->light_ptr->param[VS::LIGHT_PARAM_ENERGY]);
+		}
+	}
+
+	if (p_material->ubo_id) {
+		glBindBufferBase(GL_UNIFORM_BUFFER, 1, p_material->ubo_id);
+	}
+
+	int tc = p_material->textures.size();
+	const RID *textures = p_material->textures.ptr();
+	const ShaderLanguage::ShaderNode::Uniform::Hint *texture_hints = p_material->shader->texture_hints.ptr();
+	const ShaderLanguage::DataType *texture_types = p_material->shader->texture_types.ptr();
+	for (int i = 0; i < tc; i++) {
+		glActiveTexture(GL_TEXTURE0 + i);
+		RasterizerStorageGLES3::Texture *t = storage->texture_owner.getptr(textures[i]);
+		if (t) {
+			t = t->get_ptr();
+			glBindTexture(t->target, t->tex_id);
+			continue;
+		}
+
+		// No texture assigned: fall back to the hint default, matching _setup_material().
+		GLuint tex = storage->resources.white_tex;
+		GLenum target = GL_TEXTURE_2D;
+		ShaderLanguage::ShaderNode::Uniform::Hint hint = texture_hints ? texture_hints[i] : ShaderLanguage::ShaderNode::Uniform::HINT_NONE;
+		switch (texture_types ? texture_types[i] : ShaderLanguage::TYPE_SAMPLER2D) {
+			case ShaderLanguage::TYPE_SAMPLER3D:
+			case ShaderLanguage::TYPE_ISAMPLER3D:
+			case ShaderLanguage::TYPE_USAMPLER3D: {
+				target = GL_TEXTURE_3D;
+				tex = storage->resources.white_tex_3d;
+			} break;
+			case ShaderLanguage::TYPE_SAMPLER2DARRAY:
+			case ShaderLanguage::TYPE_ISAMPLER2DARRAY:
+			case ShaderLanguage::TYPE_USAMPLER2DARRAY: {
+				target = GL_TEXTURE_2D_ARRAY;
+				tex = storage->resources.white_tex_array;
+			} break;
+			default: {
+				if (hint == ShaderLanguage::ShaderNode::Uniform::HINT_BLACK || hint == ShaderLanguage::ShaderNode::Uniform::HINT_BLACK_ALBEDO) {
+					tex = storage->resources.black_tex;
+				} else if (hint == ShaderLanguage::ShaderNode::Uniform::HINT_ANISO) {
+					tex = storage->resources.aniso_tex;
+				} else if (hint == ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL) {
+					tex = storage->resources.normal_tex;
+				}
+			} break;
+		}
+		glBindTexture(target, tex);
+	}
+}
+
+// Re-bakes a small equirect panorama for radiance/ambient only (the visible sky is
+// drawn per screen pixel by _draw_sky). Throttled: on change, or a few times a
+// second in realtime mode.
+void RasterizerSceneGLES3::_update_sky_shader(RasterizerStorageGLES3::Sky *p_sky, const Transform &p_cam_transform) {
+	RasterizerStorageGLES3::Material *material = _get_sky_shader_material(p_sky);
+	if (!material) {
+		return;
+	}
+
+	const bool realtime = p_sky->process_mode == VS::SKY_PROCESS_MODE_REALTIME;
+	const double now = storage->frame.time[0];
+	const bool first = !p_sky->baked_panorama.is_valid();
+
+	// The radiance rebuild (sky_set_texture) reallocates GL textures + FBOs and runs a
+	// full dual-paraboloid convolution -- doing it per frame causes visible stutter.
+	// Coalesce it hard: at most a couple of times a second, no matter how often the
+	// material / its params change. Ambient light doesn't need to update faster.
+	const double radiance_interval = 0.5;
+
+	bool want_bake = first || p_sky->shader_dirty || realtime;
+	if (!want_bake) {
+		return;
+	}
+	if (!first && (now - p_sky->last_bake_time) < radiance_interval) {
+		return; // coalesced -- shader_dirty stays set, we'll bake once the interval elapses
+	}
+	// render_scene() also runs per reflection probe; bake at most once per frame.
+	if (!first && p_sky->last_bake_frame == storage->frame.count) {
+		return;
+	}
+
+	int pw = p_sky->panorama_size;
+	if (pw < 64) {
+		pw = 64;
+	}
+	int ph = pw / 2;
+
+	if (!p_sky->baked_panorama.is_valid()) {
+		Image::Format fmt = storage->config.framebuffer_half_float_supported ? Image::FORMAT_RGBAH : Image::FORMAT_RGBA8;
+		p_sky->baked_panorama = storage->texture_create();
+		storage->texture_allocate(p_sky->baked_panorama, pw, ph, 0, fmt, VS::TEXTURE_TYPE_2D, VS::TEXTURE_FLAG_FILTER | VS::TEXTURE_FLAG_REPEAT);
+
+		// texture_allocate() doesn't back a plain 2D texture with storage; do it here so
+		// it can be used as a color attachment.
+		RasterizerStorageGLES3::Texture *nt = storage->texture_owner.getornull(p_sky->baked_panorama);
+		ERR_FAIL_COND(!nt);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, nt->tex_id);
+		glTexImage2D(GL_TEXTURE_2D, 0, nt->gl_internal_format_cache, pw, ph, 0, nt->gl_format_cache, nt->gl_type_cache, nullptr);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+	}
+
+	RasterizerStorageGLES3::Texture *tex = storage->texture_owner.getornull(p_sky->baked_panorama);
+	ERR_FAIL_COND(!tex);
+
+	if (p_sky->bake_fbo == 0) {
+		glGenFramebuffers(1, &p_sky->bake_fbo);
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, p_sky->bake_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex->tex_id, 0);
+
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_BLEND);
+	glDisable(GL_SCISSOR_TEST);
+	glDepthMask(GL_FALSE);
+	glColorMask(1, 1, 1, 1);
+	glViewport(0, 0, pw, ph);
+
+	state.sky_shader.set_conditional(SkyShaderGLES3::SKY_SCREEN_PASS, false);
+	state.sky_shader.set_custom_shader(material->shader->custom_code_id);
+	bool bound = state.sky_shader.bind();
+	if (!bound || !ShaderGLES3::get_active()) {
+		glBindFramebuffer(GL_FRAMEBUFFER, RasterizerStorageGLES3::system_fbo);
+		return;
+	}
+
+	// Radiance bake works in canonical panorama space; no orientation on light dirs.
+	_bind_sky_shader_material(material, p_cam_transform, Basis());
+
+	glBindVertexArray(storage->resources.quadie_array);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+	glBindVertexArray(0);
+
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, RasterizerStorageGLES3::system_fbo);
+
+	// Update radiance/ambient from the freshly baked panorama. The fast path reuses
+	// persistent GL resources; sky_set_texture (full realloc) is the fallback.
+	p_sky->panorama = p_sky->baked_panorama;
+	if (!storage->sky_shader_bake_radiance(p_sky)) {
+		storage->sky_set_texture(p_sky->self, p_sky->baked_panorama, p_sky->radiance_size);
+	}
+
+	p_sky->shader_dirty = false;
+	p_sky->last_bake_frame = storage->frame.count;
+	p_sky->last_bake_time = now;
+}
+
 void RasterizerSceneGLES3::_draw_sky(RasterizerStorageGLES3::Sky *p_sky, const CameraMatrix &p_projection, const Transform &p_transform, bool p_vflip, float p_custom_fov, float p_energy, const Basis &p_sky_orientation) {
 	ERR_FAIL_COND(!p_sky);
 
-	RasterizerStorageGLES3::Texture *tex = storage->texture_owner.getornull(p_sky->panorama);
+	// Shader-driven sky: run the sky shader per screen pixel (sharp, no panorama
+	// resampling). The radiance panorama is baked separately in _update_sky_shader().
+	RasterizerStorageGLES3::Material *sky_material = _get_sky_shader_material(p_sky);
 
-	ERR_FAIL_COND(!tex);
-	glActiveTexture(GL_TEXTURE0);
+	// A ShaderSky whose shader isn't valid yet (still compiling / has errors): draw
+	// nothing rather than falling through to the panorama path with no panorama.
+	if (!sky_material && p_sky->shader_material.is_valid()) {
+		return;
+	}
 
-	tex = tex->get_ptr(); //resolve for proxies
+	if (!sky_material) {
+		RasterizerStorageGLES3::Texture *tex = storage->texture_owner.getornull(p_sky->panorama);
 
-	glBindTexture(tex->target, tex->tex_id);
+		ERR_FAIL_COND(!tex);
+		glActiveTexture(GL_TEXTURE0);
 
-	if (storage->config.srgb_decode_supported && tex->srgb && !tex->using_srgb) {
-		glTexParameteri(tex->target, _TEXTURE_SRGB_DECODE_EXT, _DECODE_EXT);
-		tex->using_srgb = true;
+		tex = tex->get_ptr(); //resolve for proxies
+
+		glBindTexture(tex->target, tex->tex_id);
+
+		if (storage->config.srgb_decode_supported && tex->srgb && !tex->using_srgb) {
+			glTexParameteri(tex->target, _TEXTURE_SRGB_DECODE_EXT, _DECODE_EXT);
+			tex->using_srgb = true;
 #ifdef TOOLS_ENABLED
-		if (!(tex->flags & VS::TEXTURE_FLAG_CONVERT_TO_LINEAR)) {
-			tex->flags |= VS::TEXTURE_FLAG_CONVERT_TO_LINEAR;
-			//notify that texture must be set to linear beforehand, so it works in other platforms when exported
-		}
+			if (!(tex->flags & VS::TEXTURE_FLAG_CONVERT_TO_LINEAR)) {
+				tex->flags |= VS::TEXTURE_FLAG_CONVERT_TO_LINEAR;
+				//notify that texture must be set to linear beforehand, so it works in other platforms when exported
+			}
 #endif
+		}
 	}
 
 	glDepthMask(GL_TRUE);
@@ -2503,7 +2730,9 @@ void RasterizerSceneGLES3::_draw_sky(RasterizerStorageGLES3::Sky *p_sky, const C
 		Vector3(0, 0, 0)
 	};
 
-	if (!asymmetrical) {
+	if (!asymmetrical || sky_material) {
+		// (asym projection correction is skipped for shader skies; VR + custom sky
+		//  gets a small stereo-disparity error at the frame edges, acceptable.)
 		Vector2 vp_he = camera.get_viewport_half_extents();
 		float zn;
 		zn = p_projection.get_z_near();
@@ -2514,7 +2743,11 @@ void RasterizerSceneGLES3::_draw_sky(RasterizerStorageGLES3::Sky *p_sky, const C
 			uv.y = -(uv.y * 2.0 - 1.0) * vp_he.y;
 			uv.z = -zn;
 			vertices[i * 2 + 1] = p_transform.basis.xform(uv).normalized();
-			vertices[i * 2 + 1].z = -vertices[i * 2 + 1].z;
+			if (!sky_material) {
+				// copy.glsl's panorama path expects a z-flipped ray; the shader path
+				// wants a clean world-space direction (see sky.glsl).
+				vertices[i * 2 + 1].z = -vertices[i * 2 + 1].z;
+			}
 		}
 	}
 
@@ -2523,6 +2756,24 @@ void RasterizerSceneGLES3::_draw_sky(RasterizerStorageGLES3::Sky *p_sky, const C
 	glBindBuffer(GL_ARRAY_BUFFER, 0); //unbind
 
 	glBindVertexArray(state.sky_array);
+
+	if (sky_material) {
+		state.sky_shader.set_conditional(SkyShaderGLES3::SKY_SCREEN_PASS, true);
+		state.sky_shader.set_custom_shader(sky_material->shader->custom_code_id);
+		bool bound = state.sky_shader.bind();
+		if (bound && ShaderGLES3::get_active()) {
+			state.sky_shader.set_uniform(SkyShaderGLES3::SKY_ORIENTATION, Transform(p_sky_orientation, Vector3(0.0, 0.0, 0.0)).affine_inverse());
+			state.sky_shader.set_uniform(SkyShaderGLES3::SKY_ENERGY, p_energy);
+			// EYEDIR gets rotated by inverse(sky_orientation) in the shader; put the
+			// light directions in the same frame so LIGHT*_DIRECTION lines up with it.
+			_bind_sky_shader_material(sky_material, p_transform, p_sky_orientation.inverse());
+			glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+		}
+		state.sky_shader.set_conditional(SkyShaderGLES3::SKY_SCREEN_PASS, false);
+		glBindVertexArray(0);
+		glColorMask(1, 1, 1, 1);
+		return;
+	}
 
 	storage->shaders.copy.set_conditional(CopyShaderGLES3::USE_ASYM_PANO, asymmetrical);
 	storage->shaders.copy.set_conditional(CopyShaderGLES3::USE_PANORAMA, !asymmetrical);
@@ -3575,7 +3826,509 @@ void RasterizerSceneGLES3::_render_mrts(Environment *env, const CameraMatrix &p_
 	state.effect_blur_shader.set_conditional(EffectBlurShaderGLES3::SIMPLE_COPY, false);
 }
 
-void RasterizerSceneGLES3::_post_process(Environment *env, const CameraMatrix &p_cam_projection) {
+GLuint RasterizerSceneGLES3::_light_shafts(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_source_color) {
+	RasterizerStorageGLES3::RenderTarget *rt = storage->frame.current_rt;
+
+	if (!rt) {
+		return p_source_color;
+	}
+	if (!rt->buffers.active || rt->effects.light_shaft.fbo[0] == 0) {
+		rt->effects.light_shaft.prev_valid = false;
+		return p_source_color;
+	}
+
+	// Skip overlay / secondary viewports (e.g. a transparent first-person weapon
+	// layer). Compositing a full-screen effect there would force its alpha opaque
+	// and cover the main view. The engine disables MRT here for the same reason.
+	if (rt->flags[RasterizerStorage::RENDER_TARGET_TRANSPARENT] || rt->flags[RasterizerStorage::RENDER_TARGET_NO_3D]) {
+		rt->effects.light_shaft.prev_valid = false;
+		return p_source_color;
+	}
+
+	// Find the first directional light that wants shafts.
+	RasterizerStorageGLES3::Light *sun = nullptr;
+	LightInstance *sun_li = nullptr;
+	for (int i = 0; i < state.directional_light_count; i++) {
+		RasterizerStorageGLES3::Light *l = directional_lights[i]->light_ptr;
+		if (l && l->light_shaft.enabled && (l->light_shaft.bloom_intensity > 0.0 || l->light_shaft.occlusion_darkness > 0.0)) {
+			sun = l;
+			sun_li = directional_lights[i];
+			break;
+		}
+	}
+
+	if (!sun) {
+		rt->effects.light_shaft.prev_valid = false;
+		return p_source_color;
+	}
+
+	const RasterizerStorageGLES3::Light::LightShaft &ls = sun->light_shaft;
+
+	// Project the sun onto the screen (it sits at infinity opposite its aim).
+	Vector3 dir_world = -sun_li->transform.basis.get_axis(2).normalized();
+	Vector3 far_point = p_cam_transform.origin - dir_world * 100000.0;
+	Vector3 view_pos = p_cam_transform.affine_inverse().xform(far_point);
+	Plane clip = p_cam_projection.xform4(Plane(view_pos, 1.0));
+
+	// clip.d is the clip-space w: > 0 when the sun is in front of the camera,
+	// crossing 0 exactly at the grazing plane where the projection is singular.
+	// A single smooth ramp on it removes any hard on/off at that boundary.
+	float front_fade = Math::smoothstep(0.0f, 0.20f, clip.d);
+	if (front_fade <= 0.0f) {
+		rt->effects.light_shaft.prev_valid = false;
+		return p_source_color;
+	}
+
+	float w = MAX(clip.d, 0.0001f);
+	Vector2 light_uv(clip.normal.x / w * 0.5f + 0.5f, clip.normal.y / w * 0.5f + 0.5f);
+	light_uv.x = CLAMP(light_uv.x, -4.0f, 5.0f);
+	light_uv.y = CLAMP(light_uv.y, -4.0f, 5.0f);
+
+	// Chebyshev distance of the sun from screen centre: 0 at centre, 0.5 at the
+	// screen edge. Long smooth taper as the sun leaves the frame.
+	float edge = MAX(Math::abs(light_uv.x - 0.5f), Math::abs(light_uv.y - 0.5f));
+	float effect_fade = (1.0f - Math::smoothstep(0.5f, 2.0f, edge)) * front_fade;
+
+	if (effect_fade <= 0.0f) {
+		rt->effects.light_shaft.prev_valid = false;
+		return p_source_color;
+	}
+
+	// Camera-motion rejection for the temporal filter. Any real camera movement
+	// collapses the history blend to zero so a moving sun can't leave a ghost.
+	float motion_reject = 0.0;
+	Vector2 uv_reproject(0, 0);
+	if (rt->effects.light_shaft.prev_valid) {
+		float pos_delta = p_cam_transform.origin.distance_to(rt->effects.light_shaft.prev_cam_transform.origin);
+		Vector3 f0 = -p_cam_transform.basis.get_axis(2);
+		Vector3 f1 = -rt->effects.light_shaft.prev_cam_transform.basis.get_axis(2);
+		float rot_delta = Math::acos(CLAMP(f0.dot(f1), -1.0f, 1.0f));
+		float uv_shift = (rt->effects.light_shaft.prev_light_uv - light_uv).length();
+		motion_reject = CLAMP(rot_delta * 40.0f + pos_delta * 2.0f + uv_shift * 12.0f, 0.0f, 1.0f);
+		// Only reproject for tiny residual motion; clamp so it can't fetch a
+		// wildly displaced history sample.
+		uv_reproject = (rt->effects.light_shaft.prev_light_uv - light_uv);
+		float mag = uv_reproject.length();
+		if (mag > 0.05f) {
+			uv_reproject *= 0.05f / mag;
+		}
+	}
+
+	int lw = rt->effects.light_shaft.width;
+	int lh = rt->effects.light_shaft.height;
+
+	glDepthMask(GL_FALSE);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_BLEND);
+	glViewport(0, 0, lw, lh);
+
+	// --- Pass 1: downsample + build bloom / occlusion masks ---
+	_prepare_depth_texture();
+
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_DOWNSAMPLE_MASK, true);
+	state.light_shaft_shader.bind();
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::BLOOM_THRESHOLD, ls.bloom_threshold);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::HAS_DEPTH, 1.0f);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::LIGHT_UV, light_uv);
+	// Radius (UV units) around the sun within which bright pixels feed the shaft.
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::SOURCE_RADIUS, 0.45f);
+
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, rt->depth);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, p_source_color);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, rt->effects.light_shaft.fbo[0]);
+	_copy_screen();
+
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_DOWNSAMPLE_MASK, false);
+
+	// --- Pass 2: single accumulating radial blur toward the sun ---
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_RADIAL_BLUR, true);
+	state.light_shaft_shader.bind();
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::LIGHT_UV, light_uv);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::DENSITY, ls.density);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::DECAY, ls.decay);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::NUM_SAMPLES, ls.samples);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::WEIGHT, ls.weight);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::BLUR_SCALE, 1.0f);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, rt->effects.light_shaft.color[0]);
+	glBindFramebuffer(GL_FRAMEBUFFER, rt->effects.light_shaft.fbo[1]);
+	_copy_screen();
+	int src = 1;
+
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_RADIAL_BLUR, false);
+
+	// --- Pass 2b: two tent-blur passes to erase the jitter grain ---
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_SMOOTH, true);
+	state.light_shaft_shader.bind();
+	for (int i = 0; i < 2; i++) {
+		state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::BLUR_SCALE, i == 0 ? 2.5f : 1.0f);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, rt->effects.light_shaft.color[src]);
+		glBindFramebuffer(GL_FRAMEBUFFER, rt->effects.light_shaft.fbo[1 - src]);
+		_copy_screen();
+		src = 1 - src;
+	}
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_SMOOTH, false);
+
+	// --- Pass 3: temporal filter against the reprojected history ---
+	GLuint shaft_tex = rt->effects.light_shaft.color[src];
+
+	if (rt->effects.light_shaft.prev_valid && rt->effects.light_shaft.history_valid && ls.temporal_blend > 0.0) {
+		int dst = 1 - src;
+		state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_TEMPORAL, true);
+		state.light_shaft_shader.bind();
+		state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::UV_REPROJECT, uv_reproject);
+		state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::BLEND, ls.temporal_blend);
+		state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::MOTION_REJECT, motion_reject);
+
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, rt->effects.light_shaft.history);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, rt->effects.light_shaft.color[src]);
+		glBindFramebuffer(GL_FRAMEBUFFER, rt->effects.light_shaft.fbo[dst]);
+		_copy_screen();
+
+		state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_TEMPORAL, false);
+		shaft_tex = rt->effects.light_shaft.color[dst];
+		src = dst;
+	}
+
+	// Stash this frame's shaft buffer as next frame's history.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->effects.light_shaft.fbo[src]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->effects.light_shaft.history_fbo);
+	glBlitFramebuffer(0, 0, lw, lh, 0, 0, lw, lh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	rt->effects.light_shaft.history_valid = true;
+
+	// --- Pass 4: composite over the scene at full resolution ---
+	glViewport(0, 0, rt->width, rt->height);
+
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_COMPOSITE, true);
+	state.light_shaft_shader.bind();
+
+	if (!state.light_shaft_shader.is_version_valid()) {
+		// Composite variant still compiling (async) or failed: skip cleanly this
+		// frame, leaving the scene untouched.
+		state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_COMPOSITE, false);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glViewport(0, 0, rt->width, rt->height);
+		return p_source_color;
+	}
+
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::LIGHT_UV, light_uv);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::BLOOM_TINT, Vector3(ls.bloom_tint.r, ls.bloom_tint.g, ls.bloom_tint.b));
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::BLOOM_INTENSITY, ls.bloom_intensity);
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::OCCLUSION_DARKNESS, ls.occlusion_darkness);
+	// Single master fade: the composite lerps between the untouched scene and the
+	// full effect by this, so as the sun leaves the frame the output continuously
+	// returns to the original image — no step when the effect finally switches off.
+	state.light_shaft_shader.set_uniform(LightShaftShaderGLES3::EFFECT_FADE, effect_fade);
+
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, shaft_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, p_source_color);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+	_copy_screen();
+
+	state.light_shaft_shader.set_conditional(LightShaftShaderGLES3::MODE_COMPOSITE, false);
+
+	// Copy the composited result back into the effect buffer (both RGBA16F, same
+	// size) with a plain blit so the rest of the post chain picks it up.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->effects.mip_maps[0].sizes[0].fbo);
+	glBlitFramebuffer(0, 0, rt->width, rt->height, 0, 0, rt->width, rt->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, rt->effects.mip_maps[0].color);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, rt->width, rt->height);
+
+	// Remember this frame's camera for next frame's temporal reprojection.
+	rt->effects.light_shaft.prev_light_uv = light_uv;
+	rt->effects.light_shaft.prev_cam_transform = p_cam_transform;
+	rt->effects.light_shaft.prev_valid = true;
+
+	return rt->effects.mip_maps[0].color;
+}
+
+// Route C volumetric fog: a single half-res raymarch of the view ray that
+// samples the sun's PSSM shadow map per step, applies a Henyey-Greenstein
+// phase function and an exponential height-density profile, temporally
+// filters the result, and composites it over the scene. No froxel buffer and
+// no compute -- the Fallout 4 / Wronski model done as one fullscreen pass.
+GLuint RasterizerSceneGLES3::_volumetric_fog(Environment *env, const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_source_color) {
+	RasterizerStorageGLES3::RenderTarget *rt = storage->frame.current_rt;
+
+	if (!rt) {
+		return p_source_color;
+	}
+	if (!env || !env->volumetric_fog_enabled || env->volumetric_fog_density <= 0.0) {
+		rt->effects.volumetric_fog.prev_valid = false;
+		return p_source_color;
+	}
+	if (!rt->buffers.active || rt->effects.volumetric_fog.fbo[0] == 0) {
+		rt->effects.volumetric_fog.prev_valid = false;
+		return p_source_color;
+	}
+	if (rt->flags[RasterizerStorage::RENDER_TARGET_TRANSPARENT] || rt->flags[RasterizerStorage::RENDER_TARGET_NO_3D]) {
+		rt->effects.volumetric_fog.prev_valid = false;
+		return p_source_color;
+	}
+
+	// The first directional light drives the shafts. Without one the fog is
+	// still drawn, just evenly lit by the ambient term.
+	LightInstance *sun_li = nullptr;
+	for (int i = 0; i < state.directional_light_count; i++) {
+		if (directional_lights[i] && directional_lights[i]->light_ptr) {
+			sun_li = directional_lights[i];
+			break;
+		}
+	}
+
+	Transform cam_inverse = p_cam_transform.affine_inverse();
+
+	Vector3 sun_dir_view(0, 1, 0);
+	Vector3 sun_color(0, 0, 0);
+	CameraMatrix shadow_mtx;
+	Rect2 atlas_clamp(0, 0, 1, 1);
+	int shadow_splits = 0;
+
+	if (sun_li) {
+		Vector3 light_travel_view = cam_inverse.basis.xform(sun_li->transform.basis.xform(Vector3(0, 0, -1))).normalized();
+		sun_dir_view = -light_travel_view;
+
+		Color sun_lin = sun_li->light_ptr->color.to_linear();
+		float sun_e = sun_li->light_ptr->param[VS::LIGHT_PARAM_ENERGY] * env->volumetric_fog_sun_energy * Math_PI;
+		sun_color = Vector3(sun_lin.r * sun_e, sun_lin.g * sun_e, sun_lin.b * sun_e);
+
+		int shadow_count = 1;
+		switch (sun_li->light_ptr->directional_shadow_mode) {
+			case VS::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL:
+				shadow_count = 1;
+				break;
+			case VS::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_2_SPLITS:
+				shadow_count = 2;
+				break;
+			case VS::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS:
+				shadow_count = 4;
+				break;
+		}
+
+		bool has_shadow = sun_li->light_ptr->shadow && directional_shadow.fbo != 0 && sun_li->directional_rect.size.x > 0;
+
+		if (has_shadow) {
+			// The fog march samples only the last (widest) cascade, so there are
+			// no cascade seams across the shafts. Its atlas sub-rect and matrix
+			// are built exactly as _setup_directional_light does for the scene
+			// shader.
+			int j = shadow_count - 1;
+			uint32_t x = sun_li->directional_rect.position.x;
+			uint32_t y = sun_li->directional_rect.position.y;
+			uint32_t width = sun_li->directional_rect.size.x;
+			uint32_t height = sun_li->directional_rect.size.y;
+
+			if (shadow_count == 4) {
+				width /= 2;
+				height /= 2;
+				if (j == 1) {
+					x += width;
+				} else if (j == 2) {
+					y += height;
+				} else if (j == 3) {
+					x += width;
+					y += height;
+				}
+			} else if (shadow_count == 2) {
+				height /= 2;
+				if (j != 0) {
+					y += height;
+				}
+			}
+
+			Transform modelview = (cam_inverse * sun_li->shadow_transform[j].transform).affine_inverse();
+			CameraMatrix bias;
+			bias.set_light_bias();
+			CameraMatrix rectm;
+			Rect2 atlas_rect(float(x) / directional_shadow.size, float(y) / directional_shadow.size, float(width) / directional_shadow.size, float(height) / directional_shadow.size);
+			rectm.set_light_atlas_rect(atlas_rect);
+			shadow_mtx = rectm * bias * sun_li->shadow_transform[j].camera * modelview;
+			atlas_clamp = atlas_rect;
+			shadow_splits = 1;
+		}
+	}
+
+	int vw = rt->effects.volumetric_fog.width;
+	int vh = rt->effects.volumetric_fog.height;
+
+	glDepthMask(GL_FALSE);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_BLEND);
+	glViewport(0, 0, vw, vh);
+
+	_prepare_depth_texture();
+
+	// --- Pass 1: raymarch (half-res) ---
+	CameraMatrix inv_proj = p_cam_projection.inverse();
+
+	state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_RAYMARCH, true);
+	state.volumetric_fog_shader.bind();
+
+	if (!state.volumetric_fog_shader.is_version_valid()) {
+		// Still compiling (async) or failed: leave the scene untouched.
+		state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_RAYMARCH, false);
+		glViewport(0, 0, rt->width, rt->height);
+		rt->effects.volumetric_fog.prev_valid = false;
+		return p_source_color;
+	}
+
+	Color albedo = env->volumetric_fog_albedo.to_linear();
+	Color ambient = env->volumetric_fog_ambient.to_linear();
+
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::INV_PROJECTION, inv_proj);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::CAM_MATRIX, p_cam_transform);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::SHADOW_MATRIX1, shadow_mtx);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::LIGHT_CLAMP, atlas_clamp.position.x, atlas_clamp.position.y, atlas_clamp.size.x, atlas_clamp.size.y);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::SHADOW_SPLITS, shadow_splits);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::SUN_DIRECTION, sun_dir_view);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::SUN_COLOR, sun_color);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::FOG_ALBEDO, Vector3(albedo.r, albedo.g, albedo.b));
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::AMBIENT_COLOR, Vector3(ambient.r, ambient.g, ambient.b));
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::FOG_DENSITY, env->volumetric_fog_density);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::HEIGHT_FALLOFF, env->volumetric_fog_height_falloff);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::HEIGHT_REF, env->volumetric_fog_height_ref);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::ANISOTROPY, env->volumetric_fog_anisotropy);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::FOG_LENGTH, env->volumetric_fog_length);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::CAM_NEAR, p_cam_projection.get_z_near());
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::EXTINCTION_SCALE, env->volumetric_fog_extinction);
+	state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::NUM_SAMPLES, env->volumetric_fog_samples);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, rt->depth);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	if (directional_shadow.depth != 0) {
+		glActiveTexture(GL_TEXTURE0 + 2);
+		glBindTexture(GL_TEXTURE_2D, directional_shadow.depth);
+	} else {
+		// No sun shadow map this frame: the shader guards on shadow_splits == 0,
+		// but keep unit 2 pointed at a complete texture so the draw is valid.
+		glActiveTexture(GL_TEXTURE0 + 2);
+		glBindTexture(GL_TEXTURE_2D, rt->depth);
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, rt->effects.volumetric_fog.fbo[0]);
+	_copy_screen();
+
+	state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_RAYMARCH, false);
+	int src = 0;
+
+	// --- Pass 2: temporal filter against last frame's fog ---
+	GLuint fog_tex = rt->effects.volumetric_fog.color[0];
+
+	float motion_reject = 0.0;
+	if (rt->effects.volumetric_fog.prev_valid) {
+		float pos_delta = p_cam_transform.origin.distance_to(rt->effects.volumetric_fog.prev_cam_transform.origin);
+		Vector3 f0 = -p_cam_transform.basis.get_axis(2);
+		Vector3 f1 = -rt->effects.volumetric_fog.prev_cam_transform.basis.get_axis(2);
+		float rot_delta = Math::acos(CLAMP(f0.dot(f1), -1.0f, 1.0f));
+		motion_reject = CLAMP(rot_delta * 30.0f + pos_delta * 1.5f, 0.0f, 1.0f);
+	}
+
+	if (rt->effects.volumetric_fog.prev_valid && rt->effects.volumetric_fog.history_valid && env->volumetric_fog_temporal_blend > 0.0) {
+		state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_TEMPORAL, true);
+		state.volumetric_fog_shader.bind();
+		state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::UV_REPROJECT, Vector2(0, 0));
+		state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::BLEND, env->volumetric_fog_temporal_blend);
+		state.volumetric_fog_shader.set_uniform(VolumetricFogShaderGLES3::MOTION_REJECT, motion_reject);
+
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, rt->effects.volumetric_fog.history);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, rt->effects.volumetric_fog.color[0]);
+		glBindFramebuffer(GL_FRAMEBUFFER, rt->effects.volumetric_fog.fbo[1]);
+		_copy_screen();
+
+		state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_TEMPORAL, false);
+		fog_tex = rt->effects.volumetric_fog.color[1];
+		src = 1;
+	}
+
+	// Stash this frame's fog as next frame's history.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->effects.volumetric_fog.fbo[src]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->effects.volumetric_fog.history_fbo);
+	glBlitFramebuffer(0, 0, vw, vh, 0, 0, vw, vh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	rt->effects.volumetric_fog.history_valid = true;
+
+	// --- Pass 3: composite over the scene at full resolution ---
+	glViewport(0, 0, rt->width, rt->height);
+
+	state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_COMPOSITE, true);
+	state.volumetric_fog_shader.bind();
+
+	if (!state.volumetric_fog_shader.is_version_valid()) {
+		state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_COMPOSITE, false);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glViewport(0, 0, rt->width, rt->height);
+		return p_source_color;
+	}
+
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, fog_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, p_source_color);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+	_copy_screen();
+
+	state.volumetric_fog_shader.set_conditional(VolumetricFogShaderGLES3::MODE_COMPOSITE, false);
+
+	// Copy the composited result back into the effect buffer so the rest of the
+	// post chain (glow, tonemap) picks it up. Same dance as _light_shafts.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rt->effects.mip_maps[0].sizes[0].fbo);
+	glBlitFramebuffer(0, 0, rt->width, rt->height, 0, 0, rt->width, rt->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, rt->effects.mip_maps[0].color);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, rt->width, rt->height);
+
+	rt->effects.volumetric_fog.prev_cam_transform = p_cam_transform;
+	rt->effects.volumetric_fog.prev_valid = true;
+
+	return rt->effects.mip_maps[0].color;
+}
+
+void RasterizerSceneGLES3::_post_process(Environment *env, const CameraMatrix &p_cam_projection, const Transform &p_cam_transform) {
 	//copy to front buffer
 
 	glDepthMask(GL_FALSE);
@@ -3863,6 +4616,10 @@ void RasterizerSceneGLES3::_post_process(Environment *env, const CameraMatrix &p
 		VisualServerRaster::redraw_request(); //if using auto exposure, redraw must happen
 	}
 
+	// Route C volumetric fog. Before glow so a WorldEnvironment glow pass can
+	// bloom the shafts, matching the light-shaft ordering below.
+	composite_from = _volumetric_fog(env, p_cam_transform, p_cam_projection, composite_from);
+
 	int max_glow_level = -1;
 	int glow_mask = 0;
 
@@ -3941,6 +4698,12 @@ void RasterizerSceneGLES3::_post_process(Environment *env, const CameraMatrix &p
 
 		glViewport(0, 0, storage->frame.current_rt->width, storage->frame.current_rt->height);
 	}
+
+	// Unreal-style light shafts. Run AFTER the glow blur (which has already
+	// sampled the pre-shaft image into mip_maps[0] levels 1+), so the shaft adds
+	// its own soft light to the base image without the glow HDR-bleed pass
+	// amplifying it into a whole-frame flash.
+	composite_from = _light_shafts(p_cam_transform, p_cam_projection, composite_from);
 
 	if (storage->frame.current_rt->external.fbo != 0) {
 		glBindFramebuffer(GL_FRAMEBUFFER, storage->frame.current_rt->external.fbo);
@@ -4226,6 +4989,15 @@ void RasterizerSceneGLES3::render_scene(const Transform &p_cam_transform, const 
 	_setup_lights(p_light_cull_result, p_light_cull_count, p_cam_transform.affine_inverse(), p_cam_projection, p_shadow_atlas);
 	_setup_reflections(p_reflection_probe_cull_result, p_reflection_probe_cull_count, p_cam_transform.affine_inverse(), p_cam_projection, p_reflection_atlas, env);
 
+	// Shader-driven skies are baked into their panorama before being sampled for
+	// background, radiance and reflections below.
+	if (env && (env->bg_mode == VS::ENV_BG_SKY || env->bg_mode == VS::ENV_BG_COLOR_SKY)) {
+		RasterizerStorageGLES3::Sky *shader_sky = storage->sky_owner.getornull(env->sky);
+		if (shader_sky && shader_sky->shader_material.is_valid()) {
+			_update_sky_shader(shader_sky, p_cam_transform);
+		}
+	}
+
 	bool use_mrt = false;
 
 	render_list.clear();
@@ -4510,7 +5282,7 @@ void RasterizerSceneGLES3::render_scene(const Transform &p_cam_transform, const 
 			glBindFramebuffer(GL_FRAMEBUFFER,storage->frame.current_rt->buffers.fbo); //switch to alpha fbo for sky, only diffuse/ambient matters
 		*/
 
-		if (sky && sky->panorama.is_valid()) {
+		if (sky && (sky->panorama.is_valid() || sky->shader_material.is_valid())) {
 			_draw_sky(sky, p_cam_projection, p_cam_transform, false, env->sky_custom_fov, env->bg_energy, env->sky_orientation);
 		}
 	}
@@ -4623,7 +5395,7 @@ void RasterizerSceneGLES3::render_scene(const Transform &p_cam_transform, const 
 	if (env && (env->dof_blur_far_enabled || env->dof_blur_near_enabled) && storage->frame.current_rt && storage->frame.current_rt->buffers.active) {
 		_prepare_depth_texture();
 	}
-	_post_process(env, p_cam_projection);
+	_post_process(env, p_cam_projection, p_cam_transform);
 	// Needed only for debugging
 	/*	if (shadow_atlas && storage->frame.current_rt) {
 
@@ -5259,9 +6031,12 @@ void RasterizerSceneGLES3::initialize() {
 
 #endif
 
+	state.sky_shader.init();
 	state.resolve_shader.init();
 	state.ssr_shader.init();
 	state.effect_blur_shader.init();
+	state.light_shaft_shader.init();
+	state.volumetric_fog_shader.init();
 	state.sss_shader.init();
 	state.ssao_minify_shader.init();
 	state.ssao_shader.init();

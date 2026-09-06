@@ -1141,6 +1141,12 @@ RID RasterizerStorageGLES2::sky_create() {
 	return sky_owner.make_rid(sky);
 }
 
+void RasterizerStorageGLES2::sky_set_material(RID p_sky, RID p_material, int p_panorama_size, int p_radiance_size, int p_process_mode) {
+	// Shader skies are only supported by the GLES3 backend. On GLES2 this is a no-op;
+	// use a PanoramaSky/ProceduralSky instead.
+	WARN_PRINT_ONCE("ShaderSky (sky_set_material) is not supported by the GLES2 renderer; the sky will be left unchanged.");
+}
+
 void RasterizerStorageGLES2::sky_set_texture(RID p_sky, RID p_panorama, int p_radiance_size) {
 	Sky *sky = sky_owner.getornull(p_sky);
 	ERR_FAIL_COND(!sky);
@@ -1332,6 +1338,9 @@ void RasterizerStorageGLES2::shader_set_code(RID p_shader, const String &p_code)
 		mode = VS::SHADER_CANVAS_ITEM;
 	} else if (mode_string == "particles") {
 		mode = VS::SHADER_PARTICLES;
+	} else if (mode_string == "sky") {
+		// Sky shaders are GLES3-only; leave the shader invalid on GLES2.
+		mode = VS::SHADER_SKY;
 	} else {
 		mode = VS::SHADER_SPATIAL;
 	}
@@ -4322,6 +4331,10 @@ void RasterizerStorageGLES2::light_directional_set_shadow_depth_range_mode(RID p
 	ERR_FAIL_COND(!light);
 
 	light->directional_range_mode = p_range_mode;
+}
+
+void RasterizerStorageGLES2::light_directional_set_light_shafts(RID p_light, bool p_enabled, float p_bloom_intensity, float p_bloom_threshold, const Color &p_bloom_tint, float p_occlusion_darkness, int p_samples, float p_density, float p_decay, float p_weight, float p_temporal_blend) {
+	// Light shafts are a GLES3-only post-process; no-op on the GLES2 backend.
 }
 
 VS::LightDirectionalShadowDepthRangeMode RasterizerStorageGLES2::light_directional_get_shadow_depth_range_mode(RID p_light) const {

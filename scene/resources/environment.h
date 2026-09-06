@@ -178,6 +178,21 @@ private:
 	float fog_height_max;
 	float fog_height_curve;
 
+	bool volumetric_fog_enabled;
+	float volumetric_fog_density;
+	float volumetric_fog_height_falloff;
+	float volumetric_fog_height_ref;
+	Color volumetric_fog_albedo;
+	Color volumetric_fog_ambient;
+	float volumetric_fog_sun_energy;
+	float volumetric_fog_anisotropy;
+	float volumetric_fog_length;
+	float volumetric_fog_extinction;
+	int volumetric_fog_samples;
+	float volumetric_fog_temporal_blend;
+
+	void _update_volumetric_fog();
+
 protected:
 	static void _bind_methods();
 	virtual void _validate_property(PropertyInfo &property) const;
@@ -408,6 +423,31 @@ public:
 
 	void set_fog_height_curve(float p_distance);
 	float get_fog_height_curve() const;
+
+	void set_volumetric_fog_enabled(bool p_enabled);
+	bool is_volumetric_fog_enabled() const;
+	void set_volumetric_fog_density(float p_density);
+	float get_volumetric_fog_density() const;
+	void set_volumetric_fog_height_falloff(float p_falloff);
+	float get_volumetric_fog_height_falloff() const;
+	void set_volumetric_fog_height_ref(float p_ref);
+	float get_volumetric_fog_height_ref() const;
+	void set_volumetric_fog_albedo(const Color &p_albedo);
+	Color get_volumetric_fog_albedo() const;
+	void set_volumetric_fog_ambient(const Color &p_ambient);
+	Color get_volumetric_fog_ambient() const;
+	void set_volumetric_fog_sun_energy(float p_energy);
+	float get_volumetric_fog_sun_energy() const;
+	void set_volumetric_fog_anisotropy(float p_anisotropy);
+	float get_volumetric_fog_anisotropy() const;
+	void set_volumetric_fog_length(float p_length);
+	float get_volumetric_fog_length() const;
+	void set_volumetric_fog_extinction(float p_extinction);
+	float get_volumetric_fog_extinction() const;
+	void set_volumetric_fog_samples(int p_samples);
+	int get_volumetric_fog_samples() const;
+	void set_volumetric_fog_temporal_blend(float p_blend);
+	float get_volumetric_fog_temporal_blend() const;
 
 	virtual RID get_rid() const;
 

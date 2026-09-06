@@ -1310,6 +1310,34 @@ ShaderCompilerGLES3::ShaderCompilerGLES3() {
 	actions[VS::SHADER_PARTICLES].render_mode_defines["disable_velocity"] = "#define DISABLE_VELOCITY\n";
 	actions[VS::SHADER_PARTICLES].render_mode_defines["keep_data"] = "#define ENABLE_KEEP_DATA\n";
 
+	/* SKY SHADER */
+
+	actions[VS::SHADER_SKY].renames["COLOR"] = "color";
+	actions[VS::SHADER_SKY].renames["ALPHA"] = "alpha";
+	actions[VS::SHADER_SKY].renames["EYEDIR"] = "cube_normal";
+	actions[VS::SHADER_SKY].renames["SKY_COORDS"] = "panorama_coords";
+	actions[VS::SHADER_SKY].renames["POSITION"] = "sky_position";
+	actions[VS::SHADER_SKY].renames["TIME"] = "time";
+	actions[VS::SHADER_SKY].renames["AT_CUBEMAP_PASS"] = "at_cubemap_pass";
+	actions[VS::SHADER_SKY].renames["OUTPUT_IS_SRGB"] = "SKY_OUTPUT_IS_SRGB";
+
+	actions[VS::SHADER_SKY].renames["LIGHT0_ENABLED"] = "sky_light0_enabled";
+	actions[VS::SHADER_SKY].renames["LIGHT0_DIRECTION"] = "sky_light0_direction";
+	actions[VS::SHADER_SKY].renames["LIGHT0_ENERGY"] = "sky_light0_energy";
+	actions[VS::SHADER_SKY].renames["LIGHT0_COLOR"] = "sky_light0_color";
+	actions[VS::SHADER_SKY].renames["LIGHT1_ENABLED"] = "sky_light1_enabled";
+	actions[VS::SHADER_SKY].renames["LIGHT1_DIRECTION"] = "sky_light1_direction";
+	actions[VS::SHADER_SKY].renames["LIGHT1_ENERGY"] = "sky_light1_energy";
+	actions[VS::SHADER_SKY].renames["LIGHT1_COLOR"] = "sky_light1_color";
+	actions[VS::SHADER_SKY].renames["LIGHT2_ENABLED"] = "sky_light2_enabled";
+	actions[VS::SHADER_SKY].renames["LIGHT2_DIRECTION"] = "sky_light2_direction";
+	actions[VS::SHADER_SKY].renames["LIGHT2_ENERGY"] = "sky_light2_energy";
+	actions[VS::SHADER_SKY].renames["LIGHT2_COLOR"] = "sky_light2_color";
+	actions[VS::SHADER_SKY].renames["LIGHT3_ENABLED"] = "sky_light3_enabled";
+	actions[VS::SHADER_SKY].renames["LIGHT3_DIRECTION"] = "sky_light3_direction";
+	actions[VS::SHADER_SKY].renames["LIGHT3_ENERGY"] = "sky_light3_energy";
+	actions[VS::SHADER_SKY].renames["LIGHT3_COLOR"] = "sky_light3_color";
+
 	vertex_name = "vertex";
 	fragment_name = "fragment";
 	light_name = "light";

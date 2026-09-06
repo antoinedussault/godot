@@ -807,6 +807,107 @@ float Environment::get_fog_height_curve() const {
 	return fog_height_curve;
 }
 
+void Environment::_update_volumetric_fog() {
+	VS::get_singleton()->environment_set_volumetric_fog(environment, volumetric_fog_enabled, volumetric_fog_density, volumetric_fog_height_falloff, volumetric_fog_height_ref, volumetric_fog_albedo, volumetric_fog_ambient, volumetric_fog_sun_energy, volumetric_fog_anisotropy, volumetric_fog_length, volumetric_fog_extinction, volumetric_fog_samples, volumetric_fog_temporal_blend);
+}
+
+void Environment::set_volumetric_fog_enabled(bool p_enabled) {
+	volumetric_fog_enabled = p_enabled;
+	_update_volumetric_fog();
+	_change_notify();
+}
+bool Environment::is_volumetric_fog_enabled() const {
+	return volumetric_fog_enabled;
+}
+
+void Environment::set_volumetric_fog_density(float p_density) {
+	volumetric_fog_density = p_density;
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_density() const {
+	return volumetric_fog_density;
+}
+
+void Environment::set_volumetric_fog_height_falloff(float p_falloff) {
+	volumetric_fog_height_falloff = p_falloff;
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_height_falloff() const {
+	return volumetric_fog_height_falloff;
+}
+
+void Environment::set_volumetric_fog_height_ref(float p_ref) {
+	volumetric_fog_height_ref = p_ref;
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_height_ref() const {
+	return volumetric_fog_height_ref;
+}
+
+void Environment::set_volumetric_fog_albedo(const Color &p_albedo) {
+	volumetric_fog_albedo = p_albedo;
+	_update_volumetric_fog();
+}
+Color Environment::get_volumetric_fog_albedo() const {
+	return volumetric_fog_albedo;
+}
+
+void Environment::set_volumetric_fog_ambient(const Color &p_ambient) {
+	volumetric_fog_ambient = p_ambient;
+	_update_volumetric_fog();
+}
+Color Environment::get_volumetric_fog_ambient() const {
+	return volumetric_fog_ambient;
+}
+
+void Environment::set_volumetric_fog_sun_energy(float p_energy) {
+	volumetric_fog_sun_energy = p_energy;
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_sun_energy() const {
+	return volumetric_fog_sun_energy;
+}
+
+void Environment::set_volumetric_fog_anisotropy(float p_anisotropy) {
+	volumetric_fog_anisotropy = CLAMP(p_anisotropy, -0.95, 0.95);
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_anisotropy() const {
+	return volumetric_fog_anisotropy;
+}
+
+void Environment::set_volumetric_fog_length(float p_length) {
+	volumetric_fog_length = MAX(p_length, 0.0);
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_length() const {
+	return volumetric_fog_length;
+}
+
+void Environment::set_volumetric_fog_extinction(float p_extinction) {
+	volumetric_fog_extinction = MAX(p_extinction, 0.0);
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_extinction() const {
+	return volumetric_fog_extinction;
+}
+
+void Environment::set_volumetric_fog_samples(int p_samples) {
+	volumetric_fog_samples = CLAMP(p_samples, 8, 128);
+	_update_volumetric_fog();
+}
+int Environment::get_volumetric_fog_samples() const {
+	return volumetric_fog_samples;
+}
+
+void Environment::set_volumetric_fog_temporal_blend(float p_blend) {
+	volumetric_fog_temporal_blend = CLAMP(p_blend, 0.0, 0.98);
+	_update_volumetric_fog();
+}
+float Environment::get_volumetric_fog_temporal_blend() const {
+	return volumetric_fog_temporal_blend;
+}
+
 void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_background", "mode"), &Environment::set_background);
 	ClassDB::bind_method(D_METHOD("set_sky", "sky"), &Environment::set_sky);
@@ -911,6 +1012,45 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "fog_height_min", PROPERTY_HINT_RANGE, "-4000,4000,0.1,or_lesser,or_greater"), "set_fog_height_min", "get_fog_height_min");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "fog_height_max", PROPERTY_HINT_RANGE, "-4000,4000,0.1,or_lesser,or_greater"), "set_fog_height_max", "get_fog_height_max");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "fog_height_curve", PROPERTY_HINT_EXP_EASING), "set_fog_height_curve", "get_fog_height_curve");
+
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_enabled", "enabled"), &Environment::set_volumetric_fog_enabled);
+	ClassDB::bind_method(D_METHOD("is_volumetric_fog_enabled"), &Environment::is_volumetric_fog_enabled);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_density", "density"), &Environment::set_volumetric_fog_density);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_density"), &Environment::get_volumetric_fog_density);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_height_falloff", "falloff"), &Environment::set_volumetric_fog_height_falloff);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_height_falloff"), &Environment::get_volumetric_fog_height_falloff);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_height_ref", "ref_height"), &Environment::set_volumetric_fog_height_ref);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_height_ref"), &Environment::get_volumetric_fog_height_ref);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_albedo", "albedo"), &Environment::set_volumetric_fog_albedo);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_albedo"), &Environment::get_volumetric_fog_albedo);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_ambient", "ambient"), &Environment::set_volumetric_fog_ambient);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_ambient"), &Environment::get_volumetric_fog_ambient);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_sun_energy", "energy"), &Environment::set_volumetric_fog_sun_energy);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_sun_energy"), &Environment::get_volumetric_fog_sun_energy);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_anisotropy", "anisotropy"), &Environment::set_volumetric_fog_anisotropy);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_anisotropy"), &Environment::get_volumetric_fog_anisotropy);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_length", "length"), &Environment::set_volumetric_fog_length);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_length"), &Environment::get_volumetric_fog_length);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_extinction", "extinction"), &Environment::set_volumetric_fog_extinction);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_extinction"), &Environment::get_volumetric_fog_extinction);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_samples", "samples"), &Environment::set_volumetric_fog_samples);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_samples"), &Environment::get_volumetric_fog_samples);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_temporal_blend", "blend"), &Environment::set_volumetric_fog_temporal_blend);
+	ClassDB::bind_method(D_METHOD("get_volumetric_fog_temporal_blend"), &Environment::get_volumetric_fog_temporal_blend);
+
+	ADD_GROUP("Volumetric Fog", "volumetric_fog_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "volumetric_fog_enabled"), "set_volumetric_fog_enabled", "is_volumetric_fog_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_density", PROPERTY_HINT_RANGE, "0,1,0.0001"), "set_volumetric_fog_density", "get_volumetric_fog_density");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_height_falloff", PROPERTY_HINT_RANGE, "0,2,0.001,or_greater"), "set_volumetric_fog_height_falloff", "get_volumetric_fog_height_falloff");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_height_ref", PROPERTY_HINT_RANGE, "-4000,4000,0.1,or_lesser,or_greater"), "set_volumetric_fog_height_ref", "get_volumetric_fog_height_ref");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "volumetric_fog_albedo"), "set_volumetric_fog_albedo", "get_volumetric_fog_albedo");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "volumetric_fog_ambient"), "set_volumetric_fog_ambient", "get_volumetric_fog_ambient");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_sun_energy", PROPERTY_HINT_RANGE, "0,16,0.01,or_greater"), "set_volumetric_fog_sun_energy", "get_volumetric_fog_sun_energy");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_anisotropy", PROPERTY_HINT_RANGE, "-0.95,0.95,0.01"), "set_volumetric_fog_anisotropy", "get_volumetric_fog_anisotropy");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_length", PROPERTY_HINT_RANGE, "1,4000,0.1,or_greater"), "set_volumetric_fog_length", "get_volumetric_fog_length");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_extinction", PROPERTY_HINT_RANGE, "0,4,0.01,or_greater"), "set_volumetric_fog_extinction", "get_volumetric_fog_extinction");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "volumetric_fog_samples", PROPERTY_HINT_RANGE, "8,128,1"), "set_volumetric_fog_samples", "get_volumetric_fog_samples");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_temporal_blend", PROPERTY_HINT_RANGE, "0,0.98,0.01"), "set_volumetric_fog_temporal_blend", "get_volumetric_fog_temporal_blend");
 
 	ClassDB::bind_method(D_METHOD("set_tonemapper", "mode"), &Environment::set_tonemapper);
 	ClassDB::bind_method(D_METHOD("get_tonemapper"), &Environment::get_tonemapper);
@@ -1276,8 +1416,22 @@ Environment::Environment() :
 	fog_height_max = 0;
 	fog_height_curve = 1;
 
+	volumetric_fog_enabled = false;
+	volumetric_fog_density = 0.03;
+	volumetric_fog_height_falloff = 0.1;
+	volumetric_fog_height_ref = 0.0;
+	volumetric_fog_albedo = Color(1, 1, 1);
+	volumetric_fog_ambient = Color(0.05, 0.06, 0.08);
+	volumetric_fog_sun_energy = 1.0;
+	volumetric_fog_anisotropy = 0.3;
+	volumetric_fog_length = 160.0;
+	volumetric_fog_extinction = 1.0;
+	volumetric_fog_samples = 48;
+	volumetric_fog_temporal_blend = 0.9;
+
 	set_fog_color(Color(0.5, 0.6, 0.7));
 	set_fog_sun_color(Color(1.0, 0.9, 0.7));
+	_update_volumetric_fog();
 }
 
 Environment::~Environment() {

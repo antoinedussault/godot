@@ -85,6 +85,107 @@ static Ref<StyleBoxLine> make_line_stylebox(Color p_color, int p_thickness = 1, 
 	return style;
 }
 
+// Solid-color stylebox with a 1px-style border and square, non-antialiased corners.
+// Used by the "Windows 7" preset to mimic classic desktop-app widgets.
+static Ref<StyleBoxFlat> make_win_stylebox(Color p_bg, Color p_border, int p_border_width, float p_margin_left, float p_margin_top, float p_margin_right, float p_margin_bottom) {
+	Ref<StyleBoxFlat> style = make_flat_stylebox(p_bg, p_margin_left, p_margin_top, p_margin_right, p_margin_bottom);
+	style->set_border_width_all(p_border_width);
+	style->set_border_color(p_border);
+	style->set_corner_radius_all(0);
+	style->set_anti_aliased(false);
+	return style;
+}
+
+// Vertical-gradient 9-patch stylebox with a baked 1px border and a top gloss line.
+// Used by the "Windows 7" preset for glossy Aero-style buttons and dropdowns.
+static Ref<StyleBoxTexture> make_aero_stylebox(Color p_top, Color p_mid_top, Color p_mid_bot, Color p_bot, Color p_border, float p_gloss, float p_margin_h, float p_margin_v) {
+	const int w = 8;
+	const int h = 28;
+
+	Ref<Image> img;
+	img.instance();
+	img->create(w, h, false, Image::FORMAT_RGBA8);
+	img->lock();
+	for (int y = 0; y < h; y++) {
+		const float t = float(y) / float(h - 1);
+		const Color c = (t < 0.5) ? p_top.linear_interpolate(p_mid_top, t * 2.0) : p_mid_bot.linear_interpolate(p_bot, (t - 0.5) * 2.0);
+		for (int x = 0; x < w; x++) {
+			img->set_pixel(x, y, c);
+		}
+	}
+	// Inner gloss highlight just below the top border.
+	for (int x = 1; x < w - 1; x++) {
+		img->set_pixel(x, 1, img->get_pixel(x, 1).linear_interpolate(Color(1, 1, 1), p_gloss));
+	}
+	// 1px outer border.
+	for (int x = 0; x < w; x++) {
+		img->set_pixel(x, 0, p_border);
+		img->set_pixel(x, h - 1, p_border);
+	}
+	for (int y = 0; y < h; y++) {
+		img->set_pixel(0, y, p_border);
+		img->set_pixel(w - 1, y, p_border);
+	}
+	img->unlock();
+
+	Ref<ImageTexture> tex;
+	tex.instance();
+	tex->create_from_image(img, Texture::FLAG_FILTER);
+
+	Ref<StyleBoxTexture> style;
+	style.instance();
+	style->set_texture(tex);
+	style->set_margin_size(MARGIN_LEFT, 3);
+	style->set_margin_size(MARGIN_RIGHT, 3);
+	style->set_margin_size(MARGIN_TOP, 3);
+	style->set_margin_size(MARGIN_BOTTOM, 3);
+	style->set_default_margin(MARGIN_LEFT, p_margin_h * EDSCALE);
+	style->set_default_margin(MARGIN_RIGHT, p_margin_h * EDSCALE);
+	style->set_default_margin(MARGIN_TOP, p_margin_v * EDSCALE);
+	style->set_default_margin(MARGIN_BOTTOM, p_margin_v * EDSCALE);
+	return style;
+}
+
+// Transparent-centre 9-patch with just a 1px coloured border, for a focus ring
+// that overlays the state stylebox without hiding it.
+static Ref<StyleBoxTexture> make_aero_focus_stylebox(Color p_border, float p_margin_h, float p_margin_v) {
+	const int w = 8;
+	const int h = 28;
+
+	Ref<Image> img;
+	img.instance();
+	img->create(w, h, false, Image::FORMAT_RGBA8);
+	img->fill(Color(0, 0, 0, 0));
+	img->lock();
+	for (int x = 0; x < w; x++) {
+		img->set_pixel(x, 0, p_border);
+		img->set_pixel(x, h - 1, p_border);
+	}
+	for (int y = 0; y < h; y++) {
+		img->set_pixel(0, y, p_border);
+		img->set_pixel(w - 1, y, p_border);
+	}
+	img->unlock();
+
+	Ref<ImageTexture> tex;
+	tex.instance();
+	tex->create_from_image(img, Texture::FLAG_FILTER);
+
+	Ref<StyleBoxTexture> style;
+	style.instance();
+	style->set_texture(tex);
+	style->set_margin_size(MARGIN_LEFT, 2);
+	style->set_margin_size(MARGIN_RIGHT, 2);
+	style->set_margin_size(MARGIN_TOP, 2);
+	style->set_margin_size(MARGIN_BOTTOM, 2);
+	style->set_default_margin(MARGIN_LEFT, p_margin_h * EDSCALE);
+	style->set_default_margin(MARGIN_RIGHT, p_margin_h * EDSCALE);
+	style->set_default_margin(MARGIN_TOP, p_margin_v * EDSCALE);
+	style->set_default_margin(MARGIN_BOTTOM, p_margin_v * EDSCALE);
+	style->set_draw_center(false);
+	return style;
+}
+
 static Ref<Texture> flip_icon(Ref<Texture> p_texture, bool p_flip_y = false, bool p_flip_x = false) {
 	if (!p_flip_y && !p_flip_x) {
 		return p_texture;
@@ -344,6 +445,16 @@ Ref<Theme> create_editor_theme(const Ref<Theme> p_theme) {
 		preset_accent_color = Color(0.15, 0.55, 0.82);
 		preset_base_color = Color(0.99, 0.96, 0.89);
 		preset_contrast = 0.06;
+	} else if (preset == "Windows 7") {
+		// Light blue-grey window backdrop with a classic Windows accent blue.
+		preset_accent_color = Color(0.18, 0.46, 0.74);
+		preset_base_color = Color(0.90, 0.93, 0.97);
+		preset_contrast = 0.08;
+	} else if (preset == "Windows 7 Dark") {
+		// Dark charcoal backdrop, same Aero widget feel, muted blue accent.
+		preset_accent_color = Color(0.33, 0.56, 0.82);
+		preset_base_color = Color(0.19, 0.20, 0.22);
+		preset_contrast = 0.2;
 	} else { // Default
 		preset_accent_color = Color(0.41, 0.61, 0.91);
 		preset_base_color = Color(0.2, 0.23, 0.31);
@@ -1314,6 +1425,172 @@ Ref<Theme> create_editor_theme(const Ref<Theme> p_theme) {
 	theme_preview_picker_label_bg_color.set_hsv(theme_preview_picker_label_bg_color.get_h(), theme_preview_picker_label_bg_color.get_s(), 0.5);
 	Ref<StyleBoxFlat> theme_preview_picker_label_sb = make_flat_stylebox(theme_preview_picker_label_bg_color, 4.0, 1.0, 4.0, 3.0);
 	theme->set_stylebox("preview_picker_label", "ThemeEditor", theme_preview_picker_label_sb);
+
+	// Windows 7 / classic desktop-app skin, in light and dark variants.
+	// StyleBoxFlat cannot draw gradients, so buttons use a baked-texture Aero fill;
+	// everything else is solid colors with thin borders and square corners.
+	if (preset == "Windows 7" || preset == "Windows 7 Dark") {
+		const bool win_dark = (preset == "Windows 7 Dark");
+		const int win_bw = MAX(1, EDSCALE);
+
+		const Color win_window_bg = win_dark ? Color(0.13, 0.135, 0.15) : Color(0.75, 0.83, 0.92);
+		const Color win_field_bg = win_dark ? Color(0.165, 0.17, 0.185) : Color(1, 1, 1);
+		const Color win_control_hover = win_dark ? Color(0.22, 0.28, 0.36) : Color(0.86, 0.94, 0.99);
+		const Color win_control_disabled = win_dark ? Color(0.15, 0.155, 0.17) : Color(0.94, 0.94, 0.94);
+		const Color win_border = win_dark ? Color(0.34, 0.35, 0.38) : Color(0.50, 0.62, 0.73);
+		const Color win_border_accent = win_dark ? Color(0.33, 0.56, 0.82) : Color(0.24, 0.55, 0.80);
+		const Color win_border_disabled = win_dark ? Color(0.24, 0.245, 0.26) : Color(0.72, 0.73, 0.75);
+		const Color win_selection = win_dark ? Color(0.20, 0.36, 0.55) : Color(0.80, 0.91, 0.98);
+		const Color win_selection_border = win_dark ? Color(0.33, 0.52, 0.75) : Color(0.49, 0.64, 0.81);
+		const Color win_text = win_dark ? Color(0.88, 0.89, 0.91) : Color(0, 0, 0);
+		const Color win_popup_bg = win_dark ? Color(0.17, 0.175, 0.19) : Color(1, 1, 1);
+		const Color win_popup_border = win_dark ? Color(0.36, 0.37, 0.40) : Color(0.55, 0.58, 0.63);
+		const Color win_popup_hover = win_dark ? Color(0.24, 0.34, 0.48) : Color(0.78, 0.88, 0.98);
+
+		// Unscaled margins (make_*_stylebox multiplies by EDSCALE internally).
+		const float wm_h = extra_spacing + 6;
+		const float wm_v = extra_spacing + default_margin_size;
+
+		// Editor backdrop (area around docks and viewports).
+		theme->set_stylebox("Background", "EditorStyles", make_flat_stylebox(win_window_bg, default_margin_size, default_margin_size, default_margin_size, default_margin_size));
+
+		// Buttons and dropdowns: glossy vertical-gradient Aero fill (baked texture).
+		Ref<StyleBoxTexture> wb_normal, wb_hover, wb_pressed, wb_disabled, wb_focus;
+		if (win_dark) {
+			wb_normal = make_aero_stylebox(Color(0.32, 0.33, 0.36), Color(0.28, 0.29, 0.32), Color(0.22, 0.23, 0.26), Color(0.18, 0.19, 0.22), Color(0.10, 0.10, 0.11), 0.14, wm_h, wm_v);
+			wb_hover = make_aero_stylebox(Color(0.30, 0.37, 0.46), Color(0.27, 0.34, 0.44), Color(0.21, 0.30, 0.42), Color(0.17, 0.26, 0.38), Color(0.33, 0.56, 0.82), 0.16, wm_h, wm_v);
+			wb_pressed = make_aero_stylebox(Color(0.14, 0.17, 0.21), Color(0.16, 0.20, 0.25), Color(0.19, 0.24, 0.30), Color(0.22, 0.28, 0.35), Color(0.25, 0.42, 0.62), 0.05, wm_h, wm_v);
+			wb_disabled = make_aero_stylebox(Color(0.20, 0.205, 0.22), Color(0.19, 0.195, 0.21), Color(0.18, 0.185, 0.20), Color(0.17, 0.175, 0.19), Color(0.24, 0.245, 0.26), 0.04, wm_h, wm_v);
+			wb_focus = make_aero_focus_stylebox(Color(0.30, 0.60, 0.95), wm_h, wm_v);
+		} else {
+			// Normal is the neutral grey Win7 button; hover/pressed pick up the Aero
+			// blue; focus gets the gold "default button" border from the screenshot.
+			wb_normal = make_aero_stylebox(Color(0.953, 0.953, 0.953), Color(0.925, 0.925, 0.925), Color(0.859, 0.859, 0.859), Color(0.804, 0.804, 0.804), Color(0.44, 0.44, 0.44), 0.5, wm_h, wm_v);
+			wb_hover = make_aero_stylebox(Color(0.918, 0.965, 0.992), Color(0.851, 0.941, 0.988), Color(0.745, 0.902, 0.992), Color(0.655, 0.851, 0.961), Color(0.235, 0.498, 0.694), 0.5, wm_h, wm_v);
+			wb_pressed = make_aero_stylebox(Color(0.612, 0.792, 0.902), Color(0.678, 0.843, 0.933), Color(0.792, 0.906, 0.965), Color(0.882, 0.949, 0.984), Color(0.173, 0.384, 0.545), 0.35, wm_h, wm_v);
+			wb_disabled = make_aero_stylebox(Color(0.949, 0.949, 0.949), Color(0.937, 0.937, 0.937), Color(0.925, 0.925, 0.925), Color(0.914, 0.914, 0.914), Color(0.70, 0.70, 0.70), 0.3, wm_h, wm_v);
+			wb_focus = make_aero_focus_stylebox(Color(0.87, 0.62, 0.16), wm_h, wm_v);
+		}
+
+		static const char *wb_classes[] = { "Button", "OptionButton" };
+		for (int i = 0; i < 2; i++) {
+			theme->set_stylebox("normal", wb_classes[i], wb_normal);
+			theme->set_stylebox("hover", wb_classes[i], wb_hover);
+			theme->set_stylebox("pressed", wb_classes[i], wb_pressed);
+			theme->set_stylebox("focus", wb_classes[i], wb_focus);
+			theme->set_stylebox("disabled", wb_classes[i], wb_disabled);
+			theme->set_color("font_color_pressed", wb_classes[i], win_text);
+		}
+
+		// Text fields (LineEdit / TextEdit / SpinBox).
+		Ref<StyleBoxFlat> wf_normal = make_win_stylebox(win_field_bg, win_border, win_bw, wm_h, wm_v, wm_h, wm_v);
+		Ref<StyleBoxFlat> wf_focus = make_win_stylebox(win_field_bg, win_border_accent, win_bw, wm_h, wm_v, wm_h, wm_v);
+		Ref<StyleBoxFlat> wf_readonly = make_win_stylebox(win_control_disabled, win_border_disabled, win_bw, wm_h, wm_v, wm_h, wm_v);
+		theme->set_stylebox("normal", "LineEdit", wf_normal);
+		theme->set_stylebox("focus", "LineEdit", wf_focus);
+		theme->set_stylebox("read_only", "LineEdit", wf_readonly);
+		theme->set_stylebox("normal", "TextEdit", wf_normal);
+		theme->set_stylebox("focus", "TextEdit", wf_focus);
+		theme->set_stylebox("read_only", "TextEdit", wf_readonly);
+
+		// Trees & item lists: TreeView / ListBox surfaces with a blue selection.
+		Ref<StyleBoxFlat> wl_bg = make_win_stylebox(win_field_bg, win_border, win_bw, default_margin_size, default_margin_size, default_margin_size, default_margin_size);
+
+		Ref<StyleBoxFlat> wl_selected = make_flat_stylebox(win_selection, 4, 4, 4, 4);
+		wl_selected->set_border_width_all(win_bw);
+		wl_selected->set_border_color(win_selection_border);
+		wl_selected->set_corner_radius_all(0);
+		wl_selected->set_anti_aliased(false);
+
+		Ref<StyleBoxFlat> wl_hover = make_flat_stylebox(win_control_hover, 4, 4, 4, 4);
+		wl_hover->set_border_width_all(win_bw);
+		wl_hover->set_border_color(win_selection_border);
+		wl_hover->set_corner_radius_all(0);
+		wl_hover->set_anti_aliased(false);
+
+		theme->set_stylebox("bg", "Tree", wl_bg);
+		theme->set_stylebox("selected", "Tree", wl_selected);
+		theme->set_stylebox("selected_focus", "Tree", wl_selected);
+		theme->set_stylebox("hover", "Tree", wl_hover);
+		theme->set_stylebox("bg", "ItemList", wl_bg);
+		theme->set_stylebox("selected", "ItemList", wl_selected);
+		theme->set_stylebox("selected_focus", "ItemList", wl_selected);
+		theme->set_color("font_color_selected", "Tree", win_dark ? Color(1, 1, 1) : Color(0, 0, 0));
+		theme->set_color("font_color_selected", "ItemList", win_dark ? Color(1, 1, 1) : Color(0, 0, 0));
+		theme->set_stylebox("normal", "RichTextLabel", wl_bg);
+
+		// Tab content area matches the window backdrop.
+		theme->set_stylebox("panel", "TabContainer", make_win_stylebox(win_window_bg, win_border, win_bw, margin_size_extra, margin_size_extra, margin_size_extra, margin_size_extra));
+
+		// ProgressBar: dark/light trough with the classic Windows green fill.
+		theme->set_stylebox("bg", "ProgressBar", make_win_stylebox(win_dark ? Color(0.13, 0.135, 0.15) : Color(0.96, 0.96, 0.96), win_border, win_bw, 1, 1, 1, 1));
+		Ref<StyleBoxFlat> wpb_fg = make_flat_stylebox(win_dark ? Color(0.10, 0.62, 0.18) : Color(0.024, 0.690, 0.145), 1, 1, 1, 1);
+		wpb_fg->set_corner_radius_all(0);
+		wpb_fg->set_anti_aliased(false);
+		theme->set_stylebox("fg", "ProgressBar", wpb_fg);
+		theme->set_color("font_color", "ProgressBar", win_text);
+
+		// Scrollbars: flat Windows-style track and grabber. StyleBoxFlat reports no
+		// center size, so the bar's thickness has to come from the track's cross-axis
+		// content margins -- otherwise ScrollBar::get_minimum_size() is 0 and the bar
+		// collapses to nothing. Hence separate H/V tracks.
+		const Color wsc_track_col = win_dark ? Color(0.11, 0.115, 0.13) : Color(0.94, 0.95, 0.97);
+		const Color wsc_track_border = win_dark ? Color(0.24, 0.25, 0.27) : Color(0.80, 0.82, 0.86);
+		const Color wsc_grab_border = win_dark ? Color(0.20, 0.21, 0.23) : Color(0.60, 0.63, 0.68);
+		const int wsc_half = 7; // both content margins sum to a ~14px bar
+
+		Ref<StyleBoxFlat> wsc_track_h = make_flat_stylebox(wsc_track_col, 2, wsc_half, 2, wsc_half);
+		Ref<StyleBoxFlat> wsc_track_v = make_flat_stylebox(wsc_track_col, wsc_half, 2, wsc_half, 2);
+		wsc_track_h->set_border_width_all(win_bw);
+		wsc_track_h->set_border_color(wsc_track_border);
+		wsc_track_h->set_corner_radius_all(0);
+		wsc_track_h->set_anti_aliased(false);
+		wsc_track_v->set_border_width_all(win_bw);
+		wsc_track_v->set_border_color(wsc_track_border);
+		wsc_track_v->set_corner_radius_all(0);
+		wsc_track_v->set_anti_aliased(false);
+
+		Ref<StyleBoxFlat> wsc_grab = make_flat_stylebox(win_dark ? Color(0.28, 0.29, 0.32) : Color(0.80, 0.83, 0.88), 2, 2, 2, 2);
+		wsc_grab->set_border_width_all(win_bw);
+		wsc_grab->set_border_color(wsc_grab_border);
+		wsc_grab->set_corner_radius_all(0);
+		wsc_grab->set_anti_aliased(false);
+		Ref<StyleBoxFlat> wsc_grab_hl = wsc_grab->duplicate();
+		wsc_grab_hl->set_bg_color(win_dark ? Color(0.35, 0.45, 0.58) : Color(0.66, 0.80, 0.94));
+		wsc_grab_hl->set_border_color(win_border_accent);
+
+		theme->set_stylebox("scroll", "HScrollBar", wsc_track_h);
+		theme->set_stylebox("scroll_focus", "HScrollBar", wsc_track_h);
+		theme->set_stylebox("scroll", "VScrollBar", wsc_track_v);
+		theme->set_stylebox("scroll_focus", "VScrollBar", wsc_track_v);
+		static const char *wsc_classes[] = { "HScrollBar", "VScrollBar" };
+		for (int i = 0; i < 2; i++) {
+			theme->set_stylebox("grabber", wsc_classes[i], wsc_grab);
+			theme->set_stylebox("grabber_highlight", wsc_classes[i], wsc_grab_hl);
+			theme->set_stylebox("grabber_pressed", wsc_classes[i], wsc_grab_hl);
+		}
+
+		// Popups and menus: solid surface, thin frame, blue hover.
+		Ref<StyleBoxFlat> wpop = make_flat_stylebox(win_popup_bg, default_margin_size * 2, default_margin_size * 2, default_margin_size * 2, default_margin_size * 2);
+		wpop->set_border_width_all(win_bw);
+		wpop->set_border_color(win_popup_border);
+		wpop->set_corner_radius_all(0);
+		wpop->set_anti_aliased(false);
+		theme->set_stylebox("panel", "PopupMenu", wpop);
+		theme->set_stylebox("panel", "PopupPanel", wpop);
+		theme->set_stylebox("panel", "PopupDialog", wpop);
+
+		Ref<StyleBoxFlat> wpop_hover = make_flat_stylebox(win_popup_hover, 2, 2, 2, 2);
+		wpop_hover->set_border_width_all(win_bw);
+		wpop_hover->set_border_color(win_border_accent);
+		wpop_hover->set_corner_radius_all(0);
+		wpop_hover->set_anti_aliased(false);
+		theme->set_stylebox("hover", "PopupMenu", wpop_hover);
+		theme->set_stylebox("hover", "MenuButton", wpop_hover);
+		theme->set_color("font_color", "PopupMenu", win_text);
+		theme->set_color("font_color_hover", "PopupMenu", win_text);
+		theme->set_color("font_color_hover", "MenuButton", win_text);
+	}
 
 	// adaptive script theme constants
 	// for comments and elements with lower relevance

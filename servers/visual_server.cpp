@@ -1869,6 +1869,7 @@ void VisualServer::_bind_methods() {
 #ifndef _3D_DISABLED
 	ClassDB::bind_method(D_METHOD("sky_create"), &VisualServer::sky_create);
 	ClassDB::bind_method(D_METHOD("sky_set_texture", "sky", "cube_map", "radiance_size"), &VisualServer::sky_set_texture);
+	ClassDB::bind_method(D_METHOD("sky_set_material", "sky", "material", "panorama_size", "radiance_size", "process_mode"), &VisualServer::sky_set_material);
 #endif
 	ClassDB::bind_method(D_METHOD("shader_create"), &VisualServer::shader_create);
 	ClassDB::bind_method(D_METHOD("shader_set_code", "shader", "code"), &VisualServer::shader_set_code);
@@ -1978,6 +1979,7 @@ void VisualServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("light_directional_set_shadow_mode", "light", "mode"), &VisualServer::light_directional_set_shadow_mode);
 	ClassDB::bind_method(D_METHOD("light_directional_set_blend_splits", "light", "enable"), &VisualServer::light_directional_set_blend_splits);
 	ClassDB::bind_method(D_METHOD("light_directional_set_shadow_depth_range_mode", "light", "range_mode"), &VisualServer::light_directional_set_shadow_depth_range_mode);
+	ClassDB::bind_method(D_METHOD("light_directional_set_light_shafts", "light", "enabled", "bloom_intensity", "bloom_threshold", "bloom_tint", "occlusion_darkness", "samples", "density", "decay", "weight", "temporal_blend"), &VisualServer::light_directional_set_light_shafts);
 
 	ClassDB::bind_method(D_METHOD("reflection_probe_create"), &VisualServer::reflection_probe_create);
 	ClassDB::bind_method(D_METHOD("reflection_probe_set_update_mode", "probe", "mode"), &VisualServer::reflection_probe_set_update_mode);
@@ -2121,6 +2123,8 @@ void VisualServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("environment_set_fog_depth", "env", "enable", "depth_begin", "depth_end", "depth_curve", "transmit", "transmit_curve"), &VisualServer::environment_set_fog_depth);
 
 	ClassDB::bind_method(D_METHOD("environment_set_fog_height", "env", "enable", "min_height", "max_height", "height_curve"), &VisualServer::environment_set_fog_height);
+
+	ClassDB::bind_method(D_METHOD("environment_set_volumetric_fog", "env", "enable", "density", "height_falloff", "height_ref", "albedo", "ambient", "sun_energy", "anisotropy", "length", "extinction", "samples", "temporal_blend"), &VisualServer::environment_set_volumetric_fog);
 
 	ClassDB::bind_method(D_METHOD("scenario_create"), &VisualServer::scenario_create);
 	ClassDB::bind_method(D_METHOD("scenario_set_debug", "scenario", "debug_mode"), &VisualServer::scenario_set_debug);
@@ -2294,7 +2298,11 @@ void VisualServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(SHADER_SPATIAL);
 	BIND_ENUM_CONSTANT(SHADER_CANVAS_ITEM);
 	BIND_ENUM_CONSTANT(SHADER_PARTICLES);
+	BIND_ENUM_CONSTANT(SHADER_SKY);
 	BIND_ENUM_CONSTANT(SHADER_MAX);
+
+	BIND_ENUM_CONSTANT(SKY_PROCESS_MODE_BAKE_ONCE);
+	BIND_ENUM_CONSTANT(SKY_PROCESS_MODE_REALTIME);
 
 	BIND_ENUM_CONSTANT(ARRAY_VERTEX);
 	BIND_ENUM_CONSTANT(ARRAY_NORMAL);

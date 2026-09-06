@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SpatialCable" inherits="Spatial" version="3.5">
+	<brief_description>
+		A procedurally meshed, wind-driven cable strung between two points.
+	</brief_description>
+	<description>
+		Runs one or more parallel strands between endpoint A (this node's origin plus [member start_position], or the node at [member attach_start]) and endpoint B ([member end_position], or [member attach_end]). Each strand is a Verlet particle chain: pinned at both anchors, pulled by [member gravity], pushed by a gusting wind vector and given a subtle idle sway.
+		The visible geometry is a round tube ([member cable_sides] around, [member cable_segments] along) rebuilt every frame into an internal [ImmediateGeometry]; it takes an ordinary [member material] and honours [member cast_shadow].
+		When [member collision_enabled] is set the cable owns an internal [StaticBody] of capsule segments on [member collision_layer], so hitscan rays collide with it — call [method hit] with the collision point to sever it. With [member detect_shots] the cable also watches the [member projectile_group] node group itself and severs on contact. A severed segment splits the strand; each half keeps hanging from the anchor it still holds. The node is fully live in the editor (static resting curve, no dynamics).
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_point_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Number of simulated particles per strand ([member cable_segments] + 1).
+			</description>
+		</method>
+		<method name="get_point_position" qualifiers="const">
+			<return type="Vector3" />
+			<argument index="0" name="cable_index" type="int" />
+			<argument index="1" name="point_index" type="int" />
+			<description>
+				World-space position of one simulated particle. Useful for attaching effects or a hanging object to the cable.
+			</description>
+		</method>
+		<method name="hit">
+			<return type="void" />
+			<argument index="0" name="global_position" type="Vector3" />
+			<description>
+				Registers a hit at a world-space point. Emits [signal cable_hit]; when [member breakable] is set, also cuts the nearest strand segment and emits [signal cable_severed]. Call this from your weapon code with the raycast's collision point.
+			</description>
+		</method>
+		<method name="is_severed" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if any strand segment is currently cut.
+			</description>
+		</method>
+		<method name="rebuild">
+			<return type="void" />
+			<description>
+				Rebuilds strand and collision topology immediately. Only needed after changing [member cable_count] or [member cable_segments] from a tool script mid-frame; the Inspector does it automatically.
+			</description>
+		</method>
+		<method name="reset_cable">
+			<return type="void" />
+			<description>
+				Rejoins every cut and snaps all strands back to their resting curve.
+			</description>
+		</method>
+		<method name="sever">
+			<return type="void" />
+			<argument index="0" name="cable_index" type="int" />
+			<argument index="1" name="segment_index" type="int" />
+			<description>
+				Cuts one specific strand segment directly. [code]segment_index[/code] runs [code]0[/code] to [member cable_segments] [code]- 1[/code].
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="attach_end" type="NodePath" setter="set_attach_end" getter="get_attach_end" default="NodePath(&quot;&quot;)">
+			If set to a valid [Spatial], endpoint B tracks that node's global origin and [member end_position] is ignored.
+		</member>
+		<member name="attach_start" type="NodePath" setter="set_attach_start" getter="get_attach_start" default="NodePath(&quot;&quot;)">
+			If set to a valid [Spatial], endpoint A tracks that node's global origin and [member start_position] is ignored.
+		</member>
+		<member name="breakable" type="bool" setter="set_breakable" getter="get_breakable" default="true">
+			If [code]false[/code], [method hit] and shot detection still emit [signal cable_hit] but never cut the cable.
+		</member>
+		<member name="cable_count" type="int" setter="set_cable_count" getter="get_cable_count" default="1">
+			Number of parallel strands run between the two endpoints. Changing this rebuilds the simulation.
+		</member>
+		<member name="cable_radius" type="float" setter="set_cable_radius" getter="get_cable_radius" default="0.03">
+			Tube radius of each strand, in metres.
+		</member>
+		<member name="cable_segments" type="int" setter="set_cable_segments" getter="get_cable_segments" default="24">
+			Number of segments along each strand — more segments give a smoother curve and finer breaks, at higher cost. Changing this rebuilds the simulation.
+		</member>
+		<member name="cable_sides" type="int" setter="set_cable_sides" getter="get_cable_sides" default="6">
+			Number of sides around the tube cross-section.
+		</member>
+		<member name="cable_slack" type="float" setter="set_slack" getter="get_slack" default="0.2">
+			Extra strand length as a fraction of the straight-line distance between endpoints. [code]0[/code] is taut; higher sags more.
+		</member>
+		<member name="cable_spacing" type="float" setter="set_cable_spacing" getter="get_cable_spacing" default="0.2">
+			Distance between adjacent parallel strands. They are spread along the horizontal axis perpendicular to the line between the endpoints.
+		</member>
+		<member name="cast_shadow" type="bool" setter="set_cast_shadow" getter="get_cast_shadow" default="true">
+			Whether the cable mesh casts shadows.
+		</member>
+		<member name="collision_enabled" type="bool" setter="set_collision_enabled" getter="get_collision_enabled" default="true">
+			Builds an internal [StaticBody] of capsule segments that follow the cable, so raycasts and physics bodies collide with it.
+		</member>
+		<member name="collision_layer" type="int" setter="set_collision_layer" getter="get_collision_layer" default="1">
+			Physics layer of the internal collision body.
+		</member>
+		<member name="collision_mask" type="int" setter="set_collision_mask" getter="get_collision_mask" default="0">
+			Physics mask of the internal collision body.
+		</member>
+		<member name="damping" type="float" setter="set_damping" getter="get_damping" default="0.02">
+			Velocity lost per step. Higher settles the cable faster and kills jitter; too high looks like it moves through syrup.
+		</member>
+		<member name="detect_shots" type="bool" setter="set_detect_shots" getter="get_detect_shots" default="true">
+			If set, each physics frame the cable checks every node in [member projectile_group] against its strands (sweeping the node's motion since last frame so fast rounds do not tunnel) and calls [method hit] on contact. No weapon-side code needed.
+		</member>
+		<member name="end_position" type="Vector3" setter="set_end_position" getter="get_end_position" default="Vector3( 3, 0, 0 )">
+			Endpoint B, in this node's local space. Ignored when [member attach_end] resolves to a node.
+		</member>
+		<member name="gravity" type="float" setter="set_gravity" getter="get_gravity" default="9.8">
+			Downward acceleration on the strand particles.
+		</member>
+		<member name="hit_radius" type="float" setter="set_hit_radius" getter="get_hit_radius" default="0.2">
+			Extra distance (added to [member cable_radius]) within which a [member projectile_group] node counts as hitting the cable.
+		</member>
+		<member name="material" type="Material" setter="set_material" getter="get_material">
+			Material applied to the cable mesh (as a material override). [code]UV.x[/code] wraps around the tube, [code]UV.y[/code] runs along its length.
+		</member>
+		<member name="projectile_group" type="String" setter="set_projectile_group" getter="get_projectile_group" default="&quot;bullet&quot;">
+			Node group scanned when [member detect_shots] is set. Put your bullets / pellets in this group.
+		</member>
+		<member name="simulate" type="bool" setter="set_simulate" getter="get_simulate" default="true">
+			Runs the Verlet dynamics at runtime. When [code]false[/code] the cable holds its resting curve (still follows moving endpoints, still breakable). Always [code]false[/code] in the editor.
+		</member>
+		<member name="solver_iterations" type="int" setter="set_solver_iterations" getter="get_solver_iterations" default="10">
+			Distance-constraint relaxation passes per step. Higher is stiffer and less stretchy.
+		</member>
+		<member name="start_position" type="Vector3" setter="set_start_position" getter="get_start_position" default="Vector3( 0, 0, 0 )">
+			Endpoint A, in this node's local space. Ignored when [member attach_start] resolves to a node.
+		</member>
+		<member name="stiffness" type="float" setter="set_stiffness" getter="get_stiffness" default="1.0">
+			Strength of each constraint correction, [code]0[/code] to [code]1[/code]. Lower makes a stretchier, more elastic cable.
+		</member>
+		<member name="substeps" type="int" setter="set_substeps" getter="get_substeps" default="2">
+			Physics substeps per frame. Raise for very long or very taut cables that jitter.
+		</member>
+		<member name="sway_amount" type="float" setter="set_sway_amount" getter="get_sway_amount" default="0.15">
+			Amplitude of the built-in idle sway — a gentle sideways oscillation applied even with no wind. Set to [code]0[/code] to disable.
+		</member>
+		<member name="sway_enabled" type="bool" setter="set_sway_enabled" getter="get_sway_enabled" default="true">
+			Enables the built-in idle sway.
+		</member>
+		<member name="sway_speed" type="float" setter="set_sway_speed" getter="get_sway_speed" default="1.2">
+			Frequency of the idle sway.
+		</member>
+		<member name="wind_affect" type="float" setter="set_wind_affect" getter="get_wind_affect" default="1.0">
+			Per-cable multiplier on how strongly this cable responds to the wind — a light wire flutters more than a heavy hawser. [code]0[/code] ignores wind entirely.
+		</member>
+		<member name="wind_direction" type="Vector3" setter="set_wind_direction" getter="get_wind_direction" default="Vector3( 1, 0, 0 )">
+			World-space direction the wind blows. Normalised internally.
+		</member>
+		<member name="wind_enabled" type="bool" setter="set_wind_enabled" getter="get_wind_enabled" default="true">
+			Enables the wind force on the strands.
+		</member>
+		<member name="wind_force" type="float" setter="set_wind_force" getter="get_wind_force" default="1.5">
+			Base wind acceleration before gusts and [member wind_affect].
+		</member>
+		<member name="wind_turbulence" type="float" setter="set_wind_turbulence" getter="get_wind_turbulence" default="1.0">
+			Gustiness. [code]0[/code] is a steady wind; higher swings the wind force up and down over time, each strand slightly out of phase.
+		</member>
+	</members>
+	<signals>
+		<signal name="cable_hit">
+			<argument index="0" name="position" type="Vector3" />
+			<argument index="1" name="cable_index" type="int" />
+			<description>
+				Emitted by [method hit] and by shot detection whenever the cable is struck, whether or not it breaks.
+			</description>
+		</signal>
+		<signal name="cable_severed">
+			<argument index="0" name="cable_index" type="int" />
+			<argument index="1" name="segment_index" type="int" />
+			<argument index="2" name="position" type="Vector3" />
+			<description>
+				Emitted when a strand segment is cut (by [method hit], [method sever] or shot detection).
+			</description>
+		</signal>
+	</signals>
+	<constants>
+	</constants>
+</class>

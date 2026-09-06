@@ -183,6 +183,15 @@ public:
 	virtual RID sky_create() = 0;
 	virtual void sky_set_texture(RID p_sky, RID p_cube_map, int p_radiance_size) = 0;
 
+	enum SkyShaderProcessMode {
+		SKY_PROCESS_MODE_BAKE_ONCE,
+		SKY_PROCESS_MODE_REALTIME,
+	};
+
+	// Bake a "sky" shader material into an equirectangular panorama that feeds the
+	// regular sky/radiance pipeline. Pass an invalid material to clear it.
+	virtual void sky_set_material(RID p_sky, RID p_material, int p_panorama_size, int p_radiance_size, int p_process_mode) = 0;
+
 	/* SHADER API */
 
 	enum ShaderMode {
@@ -190,6 +199,7 @@ public:
 		SHADER_SPATIAL,
 		SHADER_CANVAS_ITEM,
 		SHADER_PARTICLES,
+		SHADER_SKY,
 		SHADER_MAX
 	};
 
@@ -502,6 +512,9 @@ public:
 	};
 
 	virtual void light_directional_set_shadow_depth_range_mode(RID p_light, LightDirectionalShadowDepthRangeMode p_range_mode) = 0;
+
+	// Unreal-style light shafts (screen-space volumetric scattering + depth occlusion).
+	virtual void light_directional_set_light_shafts(RID p_light, bool p_enabled, float p_bloom_intensity, float p_bloom_threshold, const Color &p_bloom_tint, float p_occlusion_darkness, int p_samples, float p_density, float p_decay, float p_weight, float p_temporal_blend) = 0;
 
 	/* PROBE API */
 
@@ -819,6 +832,7 @@ public:
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_color, const Color &p_sun_color, float p_sun_amount) = 0;
 	virtual void environment_set_fog_depth(RID p_env, bool p_enable, float p_depth_begin, float p_depth_end, float p_depth_curve, bool p_transmit, float p_transmit_curve) = 0;
 	virtual void environment_set_fog_height(RID p_env, bool p_enable, float p_min_height, float p_max_height, float p_height_curve) = 0;
+	virtual void environment_set_volumetric_fog(RID p_env, bool p_enable, float p_density, float p_height_falloff, float p_height_ref, const Color &p_albedo, const Color &p_ambient, float p_sun_energy, float p_anisotropy, float p_length, float p_extinction, int p_samples, float p_temporal_blend) = 0;
 
 	/* INTERPOLATION API */
 
@@ -1224,6 +1238,7 @@ VARIANT_ENUM_CAST(VisualServer::ViewportMSAA);
 VARIANT_ENUM_CAST(VisualServer::ViewportUsage);
 VARIANT_ENUM_CAST(VisualServer::ViewportRenderInfo);
 VARIANT_ENUM_CAST(VisualServer::ViewportDebugDraw);
+VARIANT_ENUM_CAST(VisualServer::SkyShaderProcessMode);
 VARIANT_ENUM_CAST(VisualServer::ScenarioDebugMode);
 VARIANT_ENUM_CAST(VisualServer::InstanceType);
 VARIANT_ENUM_CAST(VisualServer::InstancePortalMode);

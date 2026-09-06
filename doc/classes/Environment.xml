@@ -299,6 +299,42 @@
 		<member name="tonemap_white" type="float" setter="set_tonemap_white" getter="get_tonemap_white" default="1.0">
 			The white reference value for tonemapping. Only effective if the [member tonemap_mode] isn't set to [constant TONE_MAPPER_LINEAR].
 		</member>
+		<member name="volumetric_fog_albedo" type="Color" setter="set_volumetric_fog_albedo" getter="get_volumetric_fog_albedo" default="Color( 1, 1, 1, 1 )">
+			Tint of the light scattered by the volumetric fog. Multiplies both the sun and ambient contributions.
+		</member>
+		<member name="volumetric_fog_ambient" type="Color" setter="set_volumetric_fog_ambient" getter="get_volumetric_fog_ambient" default="Color( 0.05, 0.06, 0.08, 1 )">
+			Constant light added to the volumetric fog regardless of sun visibility, so shadowed fog is not fully black. Approximates sky/ambient in-scattering.
+		</member>
+		<member name="volumetric_fog_anisotropy" type="float" setter="set_volumetric_fog_anisotropy" getter="get_volumetric_fog_anisotropy" default="0.3">
+			Henyey-Greenstein phase anisotropy of the volumetric fog. Values near [code]1[/code] scatter light forward (bright halo around the sun), values near [code]-1[/code] scatter backward, [code]0[/code] is isotropic.
+		</member>
+		<member name="volumetric_fog_density" type="float" setter="set_volumetric_fog_density" getter="get_volumetric_fog_density" default="0.03">
+			Base density of the volumetric fog at [member volumetric_fog_height_ref]. This is the master thickness control.
+		</member>
+		<member name="volumetric_fog_enabled" type="bool" setter="set_volumetric_fog_enabled" getter="is_volumetric_fog_enabled" default="false">
+			If [code]true[/code], enables the volumetric fog pass: a half-resolution raymarch of the view ray that samples the [DirectionalLight] shadow map per step for volumetric shafts and shadowed height fog. GLES3 only; requires the directional light to cast shadows for shafts to appear.
+		</member>
+		<member name="volumetric_fog_extinction" type="float" setter="set_volumetric_fog_extinction" getter="get_volumetric_fog_extinction" default="1.0">
+			Multiplier on how quickly the volumetric fog attenuates light passing through it. Lower values make thick fog that still reads as airy; higher values occlude faster.
+		</member>
+		<member name="volumetric_fog_height_falloff" type="float" setter="set_volumetric_fog_height_falloff" getter="get_volumetric_fog_height_falloff" default="0.1">
+			Exponential vertical falloff of the volumetric fog density. Larger values keep fog closer to [member volumetric_fog_height_ref]; smaller values let it rise higher.
+		</member>
+		<member name="volumetric_fog_height_ref" type="float" setter="set_volumetric_fog_height_ref" getter="get_volumetric_fog_height_ref" default="0.0">
+			World-space Y where the volumetric fog density equals [member volumetric_fog_density] (its "sea level").
+		</member>
+		<member name="volumetric_fog_length" type="float" setter="set_volumetric_fog_length" getter="get_volumetric_fog_length" default="160.0">
+			Maximum distance from the camera the volumetric fog is marched to. Beyond this, pixels (including the sky) receive no volumetric contribution. Keep it as short as the scene allows for quality and performance.
+		</member>
+		<member name="volumetric_fog_samples" type="int" setter="set_volumetric_fog_samples" getter="get_volumetric_fog_samples" default="48">
+			Number of raymarch steps per pixel. Higher is less noisy at a linear cost. The temporal filter ([member volumetric_fog_temporal_blend]) hides most of the noise from low counts.
+		</member>
+		<member name="volumetric_fog_sun_energy" type="float" setter="set_volumetric_fog_sun_energy" getter="get_volumetric_fog_sun_energy" default="1.0">
+			Extra multiplier on the [DirectionalLight]'s contribution to the volumetric fog, on top of the light's own energy.
+		</member>
+		<member name="volumetric_fog_temporal_blend" type="float" setter="set_volumetric_fog_temporal_blend" getter="get_volumetric_fog_temporal_blend" default="0.9">
+			How much of the previous frame's volumetric fog is blended into the current one to suppress noise. Higher is smoother but ghosts more behind moving objects and the camera. [code]0[/code] disables temporal filtering.
+		</member>
 	</members>
 	<constants>
 		<constant name="BG_KEEP" value="5" enum="BGMode">

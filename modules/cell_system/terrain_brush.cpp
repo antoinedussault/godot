@@ -4,32 +4,30 @@
 #include "cell_terrain_manager.h"
 #include "core/undo_redo.h"
 
-int TerrainBrush::_floordiv(int a, int b) {
-	int d = a / b;
-	int m = a % b;
-	if (m != 0 && ((m < 0) != (b < 0))) d--;
-	return d;
+// Cheap hashed value-noise (no dependency on the opensimplex module, keeps
+// cell_system buildable standalone). Not fractal/multi-octave on purpose —
+// the brush is dragged repeatedly to build up detail, same as Unreal's noise brush.
+float TerrainBrush::_hash_noise(float x, float z, int seed) {
+	int ix = (int)Math::floor(x);
+	int iz = (int)Math::floor(z);
+	float fx = x - ix;
+	float fz = z - iz;
+
+	auto hash = [seed](int xi, int zi) -> float {
+		uint32_t h = (uint32_t)xi * 374761393u + (uint32_t)zi * 668265263u + (uint32_t)seed * 2654435761u;
+		h = (h ^ (h >> 13)) * 1274126177u;
+		h ^= (h >> 16);
+		return (float)(h & 0xffffff) / (float)0xffffff * 2.0f - 1.0f;
+	};
+
+	float v00 = hash(ix, iz), v10 = hash(ix + 1, iz);
+	float v01 = hash(ix, iz + 1), v11 = hash(ix + 1, iz + 1);
+	float sx = fx * fx * (3.0f - 2.0f * fx);
+	float sz = fz * fz * (3.0f - 2.0f * fz);
+	return Math::lerp(Math::lerp(v00, v10, sx), Math::lerp(v01, v11, sx), sz);
 }
 
-// For a global vertex index g on an axis with `seg` (= verts_per_side - 1)
-// vertices per cell, return which cell(s) and local index reference it.
-// Interior vertices map to one cell; vertices on a cell boundary are shared
-// by two adjacent cells (east edge of one == west edge of the next).
-int TerrainBrush::_axis_cells(int g, int seg, int *cell_out, int *local_out) {
-	int q = _floordiv(g, seg);
-	int rem = g - q * seg;
-	if (rem == 0) {
-		cell_out[0] = q - 1; local_out[0] = seg; // previous cell, far edge
-		cell_out[1] = q;     local_out[1] = 0;   // this cell, near edge
-		return 2;
-	}
-	cell_out[0] = q; local_out[0] = rem;
-	return 1;
-}
-
-void TerrainBrush::begin_stroke() {
-	_stroke_before.clear();
-}
+void TerrainBrush::begin_stroke() { _stroke_before.clear(); }
 
 void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float strength, int mode) {
 	if (!manager || radius <= 0.0f) return;
@@ -39,25 +37,31 @@ void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float str
 	const float cell_size = manager->get_cell_size();
 	const float spacing = cell_size / (float)seg;
 
-	// Global vertex index window covered by the brush footprint.
 	int gx0 = (int)Math::floor((world_pos.x - radius) / spacing);
 	int gx1 = (int)Math::ceil((world_pos.x + radius) / spacing);
 	int gz0 = (int)Math::floor((world_pos.z - radius) / spacing);
 	int gz1 = (int)Math::ceil((world_pos.z + radius) / spacing);
 
-	// Flatten target: height directly under the brush centre.
 	float flat_target = 0.0f;
 	if (mode == MODE_FLATTEN) {
-		int gx = (int)Math::round(world_pos.x / spacing);
-		int gz = (int)Math::round(world_pos.z / spacing);
-		int cxs[2], lxs[2], czs[2], lzs[2];
-		_axis_cells(gx, seg, cxs, lxs);
-		_axis_cells(gz, seg, czs, lzs);
-		CellTerrain *t = manager->get_cell(cxs[0], czs[0]);
-		if (t) flat_target = t->get_height_at(lxs[0], lzs[0]);
+		if (force_flatten_height) {
+			flat_target = flatten_height;
+		} else {
+			int gx = (int)Math::round(world_pos.x / spacing);
+			int gz = (int)Math::round(world_pos.z / spacing);
+			int cxs[2], lxs[2], czs[2], lzs[2];
+			terrain_axis_cells(gx, seg, cxs, lxs);
+			terrain_axis_cells(gz, seg, czs, lzs);
+			CellTerrain *t = manager->get_cell(cxs[0], czs[0]);
+			if (t) flat_target = t->get_height_at(lxs[0], lzs[0]);
+		}
 	}
 
 	Set<int64_t> touched;
+
+	// Lock the brush image once for the whole stroke, not per vertex.
+	const bool use_brush_img = brush_image.is_valid() && brush_image->get_width() > 0;
+	if (use_brush_img) brush_image->lock();
 
 	for (int gz = gz0; gz <= gz1; gz++) {
 		for (int gx = gx0; gx <= gx1; gx++) {
@@ -68,15 +72,23 @@ void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float str
 			float dist = Math::sqrt(dx * dx + dz * dz);
 			if (dist > radius) continue;
 
-			// Smoothstep falloff, 1 at centre -> 0 at the rim.
+			// Radial falloff curve always applies; an optional alpha-stamp brush
+			// texture multiplies on top of it (matches how Unreal combines a
+			// brush's falloff shape with its alpha pattern).
 			float t01 = 1.0f - (dist / radius);
-			float fo = t01 * t01 * (3.0f - 2.0f * t01);
+			float fo = terrain_falloff(t01, falloff_type);
+			if (use_brush_img) {
+				float u = (dx / radius) * 0.5f + 0.5f;
+				float v = (dz / radius) * 0.5f + 0.5f;
+				int px = CLAMP((int)(u * brush_image->get_width()), 0, brush_image->get_width() - 1);
+				int py = CLAMP((int)(v * brush_image->get_height()), 0, brush_image->get_height() - 1);
+				fo *= brush_image->get_pixel(px, py).r; // red channel as intensity
+			}
 
 			int cxs[2], lxs[2], czs[2], lzs[2];
-			int nx = _axis_cells(gx, seg, cxs, lxs);
-			int nz = _axis_cells(gz, seg, czs, lzs);
+			int nx = terrain_axis_cells(gx, seg, cxs, lxs);
+			int nz = terrain_axis_cells(gz, seg, czs, lzs);
 
-			// Write the SAME new height to every cell sharing this vertex.
 			for (int ix = 0; ix < nx; ix++) {
 				for (int iz = 0; iz < nz; iz++) {
 					int cx = cxs[ix], lx = lxs[ix];
@@ -84,31 +96,102 @@ void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float str
 					CellTerrain *cell = manager->get_cell(cx, cz);
 					if (!cell) continue;
 
-					// Snapshot this cell once, before its first edit this stroke.
 					int64_t key = ((int64_t)(uint32_t)cx << 32) | (uint32_t)cz;
-					if (!_stroke_before.has(key)) {
-						_stroke_before[key] = cell->get_heights(); // COW, cheap
-					}
 
-					float cur = cell->get_height_at(lx, lz);
-					float nh = cur;
-					switch (mode) {
-						case MODE_RAISE:   nh = cur + strength * fo; break;
-						case MODE_LOWER:   nh = cur - strength * fo; break;
-						case MODE_FLATTEN: nh = Math::lerp(cur, flat_target, strength * fo); break;
+					if (mode == MODE_PAINT) {
+						// Texture painting: write to splatmap.
+						cell->paint_layer(lx, lz, paint_layer, strength * fo);
+					} else if (mode == MODE_NAV_MASK) {
+						// Navmesh mask painting: blend toward 0 (excluded) or 1
+						// (navigable) — leaves a hole in the baked navmesh, same
+						// as an over-steep slope (see CellTerrain::_mask_at_s).
+						float target = nav_mask_erase ? 1.0f : 0.0f;
+						float cur = cell->get_nav_mask_at(lx, lz);
+						cell->set_nav_mask_at(lx, lz, Math::lerp(cur, target, CLAMP(strength * fo, 0.0f, 1.0f)));
+					} else {
+						// Height sculpting: snapshot for undo.
+						if (!_stroke_before.has(key))
+							_stroke_before[key] = cell->get_heights();
+
+						float cur = cell->get_height_at(lx, lz);
+						float nh = cur;
+						switch (mode) {
+							case MODE_RAISE:   nh = cur + strength * fo; break;
+							case MODE_LOWER:   nh = cur - strength * fo; break;
+							case MODE_FLATTEN: nh = Math::lerp(cur, flat_target, strength * fo); break;
+							case MODE_SMOOTH: {
+								// Average heights from a ±2-vertex kernel around this point.
+								const int kernel = 2;
+								float sum = 0.0f;
+								int cnt = 0;
+								for (int dkz = -kernel; dkz <= kernel; dkz++) {
+									for (int dkx = -kernel; dkx <= kernel; dkx++) {
+										int s_cxs[2], s_lxs[2], s_czs[2], s_lzs[2];
+										int snx = terrain_axis_cells(gx + dkx, seg, s_cxs, s_lxs);
+										int snz = terrain_axis_cells(gz + dkz, seg, s_czs, s_lzs);
+										for (int six = 0; six < snx; six++) {
+											for (int siz = 0; siz < snz; siz++) {
+												CellTerrain *nc = manager->get_cell(s_cxs[six], s_czs[siz]);
+												if (nc) { sum += nc->get_height_at(s_lxs[six], s_lzs[siz]); cnt++; }
+											}
+										}
+									}
+								}
+								if (cnt > 0) nh = Math::lerp(cur, sum / (float)cnt, strength * fo);
+							} break;
+							case MODE_NOISE: {
+								float n = _hash_noise(vx / noise_scale, vz / noise_scale, noise_seed);
+								nh = cur + n * strength * fo;
+							} break;
+							case MODE_ERODE: {
+								// Simplified single-pass thermal erosion: slump material
+								// toward the lowest of the 4 axis neighbors whenever the
+								// slope exceeds erosion_talus. Not a hydraulic simulation —
+								// dragging the brush repeatedly builds up the effect, same
+								// as the other stroke-based modes.
+								static const int dxs[4] = { 1, -1, 0, 0 };
+								static const int dzs[4] = { 0, 0, 1, -1 };
+								float lowest = cur;
+								for (int ni = 0; ni < 4; ni++) {
+									int s_cxs[2], s_lxs[2], s_czs[2], s_lzs[2];
+									terrain_axis_cells(gx + dxs[ni], seg, s_cxs, s_lxs);
+									terrain_axis_cells(gz + dzs[ni], seg, s_czs, s_lzs);
+									CellTerrain *nc = manager->get_cell(s_cxs[0], s_czs[0]);
+									if (nc) {
+										float h = nc->get_height_at(s_lxs[0], s_lzs[0]);
+										if (h < lowest) lowest = h;
+									}
+								}
+								float slope = cur - lowest;
+								if (slope > erosion_talus) {
+									float excess = slope - erosion_talus;
+									nh = cur - excess * CLAMP(strength * fo, 0.0f, 1.0f) * 0.5f;
+								}
+							} break;
+						}
+						cell->set_height_at(lx, lz, nh);
 					}
-					cell->set_height_at(lx, lz, nh);
 					touched.insert(key);
 				}
 			}
 		}
 	}
 
-	// Live preview: re-derive mesh + seam edges for everything we touched.
-	for (Set<int64_t>::Element *E = touched.front(); E; E = E->next()) {
-		int cx = (int32_t)(E->get() >> 32);
-		int cz = (int32_t)(E->get() & 0xffffffff);
-		manager->rebuild_at(cx, cz);
+	if (use_brush_img) brush_image->unlock();
+
+	if (mode == MODE_PAINT) {
+		// Painting only changes splatmaps; update those textures in place. No mesh
+		// or collision rebuild is needed (the material already binds the textures).
+		for (Set<int64_t>::Element *E = touched.front(); E; E = E->next()) {
+			int cx = (int32_t)(E->get() >> 32);
+			int cz = (int32_t)(E->get() & 0xffffffff);
+			CellTerrain *cell = manager->get_cell(cx, cz);
+			if (cell) cell->update_splatmap_textures();
+			manager->mark_dirty(cx, cz);
+		}
+	} else {
+		// Rebuild every touched cell (and its neighbors) exactly once.
+		manager->rebuild_region(touched);
 	}
 }
 
@@ -117,21 +200,20 @@ void TerrainBrush::end_stroke(UndoRedo *undo_redo) {
 		_stroke_before.clear();
 		return;
 	}
-
 	undo_redo->create_action("Sculpt Terrain");
 	for (Map<int64_t, PoolRealArray>::Element *E = _stroke_before.front(); E; E = E->next()) {
 		int cx = (int32_t)(E->key() >> 32);
 		int cz = (int32_t)(E->key() & 0xffffffff);
 		CellTerrain *cell = manager->get_cell(cx, cz);
 		if (!cell) continue;
-
 		PoolRealArray after = cell->get_heights();
 		const PoolRealArray &before = E->get();
-
 		undo_redo->add_do_method(cell, "set_heights", after);
 		undo_redo->add_do_method(manager, "rebuild_at", cx, cz);
+		undo_redo->add_do_method(manager, "mark_dirty", cx, cz);
 		undo_redo->add_undo_method(cell, "set_heights", before);
 		undo_redo->add_undo_method(manager, "rebuild_at", cx, cz);
+		undo_redo->add_undo_method(manager, "mark_dirty", cx, cz);
 	}
 	undo_redo->commit_action();
 	_stroke_before.clear();
@@ -140,8 +222,28 @@ void TerrainBrush::end_stroke(UndoRedo *undo_redo) {
 void TerrainBrush::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("begin_stroke"), &TerrainBrush::begin_stroke);
 	ClassDB::bind_method(D_METHOD("apply_brush", "world_pos", "radius", "strength", "mode"), &TerrainBrush::apply_brush);
-
+	ClassDB::bind_method(D_METHOD("set_paint_layer", "l"), &TerrainBrush::set_paint_layer);
+	ClassDB::bind_method(D_METHOD("get_paint_layer"), &TerrainBrush::get_paint_layer);
+	ClassDB::bind_method(D_METHOD("set_falloff_type", "t"), &TerrainBrush::set_falloff_type);
+	ClassDB::bind_method(D_METHOD("get_falloff_type"), &TerrainBrush::get_falloff_type);
+	ClassDB::bind_method(D_METHOD("set_noise_scale", "s"), &TerrainBrush::set_noise_scale);
+	ClassDB::bind_method(D_METHOD("get_noise_scale"), &TerrainBrush::get_noise_scale);
+	ClassDB::bind_method(D_METHOD("set_noise_seed", "s"), &TerrainBrush::set_noise_seed);
+	ClassDB::bind_method(D_METHOD("get_noise_seed"), &TerrainBrush::get_noise_seed);
+	ClassDB::bind_method(D_METHOD("set_erosion_talus", "t"), &TerrainBrush::set_erosion_talus);
+	ClassDB::bind_method(D_METHOD("get_erosion_talus"), &TerrainBrush::get_erosion_talus);
+	ClassDB::bind_method(D_METHOD("set_nav_mask_erase", "e"), &TerrainBrush::set_nav_mask_erase);
+	ClassDB::bind_method(D_METHOD("get_nav_mask_erase"), &TerrainBrush::get_nav_mask_erase);
 	BIND_ENUM_CONSTANT(MODE_RAISE);
 	BIND_ENUM_CONSTANT(MODE_LOWER);
 	BIND_ENUM_CONSTANT(MODE_FLATTEN);
+	BIND_ENUM_CONSTANT(MODE_PAINT);
+	BIND_ENUM_CONSTANT(MODE_SMOOTH);
+	BIND_ENUM_CONSTANT(MODE_NOISE);
+	BIND_ENUM_CONSTANT(MODE_ERODE);
+	BIND_ENUM_CONSTANT(MODE_NAV_MASK);
+	BIND_ENUM_CONSTANT(FALLOFF_SMOOTH);
+	BIND_ENUM_CONSTANT(FALLOFF_LINEAR);
+	BIND_ENUM_CONSTANT(FALLOFF_SPHERICAL);
+	BIND_ENUM_CONSTANT(FALLOFF_TIP);
 }

@@ -848,6 +848,25 @@
 				Sets the variables to be used with the fog height effect. See [Environment] for more details.
 			</description>
 		</method>
+		<method name="environment_set_volumetric_fog">
+			<return type="void" />
+			<argument index="0" name="env" type="RID" />
+			<argument index="1" name="enable" type="bool" />
+			<argument index="2" name="density" type="float" />
+			<argument index="3" name="height_falloff" type="float" />
+			<argument index="4" name="height_ref" type="float" />
+			<argument index="5" name="albedo" type="Color" />
+			<argument index="6" name="ambient" type="Color" />
+			<argument index="7" name="sun_energy" type="float" />
+			<argument index="8" name="anisotropy" type="float" />
+			<argument index="9" name="length" type="float" />
+			<argument index="10" name="extinction" type="float" />
+			<argument index="11" name="samples" type="int" />
+			<argument index="12" name="temporal_blend" type="float" />
+			<description>
+				Sets the variables to be used with the volumetric fog pass (GLES3 only). See [Environment] for details on each parameter.
+			</description>
+		</method>
 		<method name="environment_set_glow">
 			<return type="void" />
 			<argument index="0" name="env" type="RID" />
@@ -1519,6 +1538,23 @@
 			<argument index="1" name="enable" type="bool" />
 			<description>
 				If [code]true[/code], this directional light will blend between shadow map splits resulting in a smoother transition between them. Equivalent to [member DirectionalLight.directional_shadow_blend_splits].
+			</description>
+		</method>
+		<method name="light_directional_set_light_shafts">
+			<return type="void" />
+			<argument index="0" name="light" type="RID" />
+			<argument index="1" name="enabled" type="bool" />
+			<argument index="2" name="bloom_intensity" type="float" />
+			<argument index="3" name="bloom_threshold" type="float" />
+			<argument index="4" name="bloom_tint" type="Color" />
+			<argument index="5" name="occlusion_darkness" type="float" />
+			<argument index="6" name="samples" type="int" />
+			<argument index="7" name="density" type="float" />
+			<argument index="8" name="decay" type="float" />
+			<argument index="9" name="weight" type="float" />
+			<argument index="10" name="temporal_blend" type="float" />
+			<description>
+				Enables and configures Unreal-style light shafts ("god rays") for this directional light. GLES3 only; see [DirectionalLightShaft]. Pass [code]bloom_intensity[/code] or [code]occlusion_darkness[/code] as [code]0[/code] to disable that half of the effect.
 			</description>
 		</method>
 		<method name="light_directional_set_shadow_depth_range_mode">
@@ -2667,6 +2703,17 @@
 			<description>
 				Creates an empty sky and adds it to the VisualServer. It can be accessed with the RID that is returned. This RID will be used in all [code]sky_*[/code] VisualServer functions.
 				Once finished with your RID, you will want to free the RID using the VisualServer's [method free_rid] static method.
+			</description>
+		</method>
+		<method name="sky_set_material">
+			<return type="void" />
+			<argument index="0" name="sky" type="RID" />
+			<argument index="1" name="material" type="RID" />
+			<argument index="2" name="panorama_size" type="int" />
+			<argument index="3" name="radiance_size" type="int" />
+			<argument index="4" name="process_mode" type="int" />
+			<description>
+				Drives a sky from a [code]shader_type sky;[/code] [ShaderMaterial]. The shader is baked into a [code]panorama_size[/code]-wide equirectangular panorama and then fed through the regular radiance pipeline (so it also lights the scene). [code]process_mode[/code] is one of the [code]SKY_PROCESS_MODE_*[/code] values. Pass an invalid [code]material[/code] to clear it. GLES3 only; see [ShaderSky].
 			</description>
 		</method>
 		<method name="sky_set_texture">

@@ -392,6 +392,7 @@ public:
 
 	virtual RID sky_create();
 	virtual void sky_set_texture(RID p_sky, RID p_panorama, int p_radiance_size);
+	virtual void sky_set_material(RID p_sky, RID p_material, int p_panorama_size, int p_radiance_size, int p_process_mode);
 
 	/* SHADER API */
 
@@ -986,6 +987,7 @@ public:
 
 	virtual void light_directional_set_shadow_depth_range_mode(RID p_light, VS::LightDirectionalShadowDepthRangeMode p_range_mode);
 	virtual VS::LightDirectionalShadowDepthRangeMode light_directional_get_shadow_depth_range_mode(RID p_light) const;
+	virtual void light_directional_set_light_shafts(RID p_light, bool p_enabled, float p_bloom_intensity, float p_bloom_threshold, const Color &p_bloom_tint, float p_occlusion_darkness, int p_samples, float p_density, float p_decay, float p_weight, float p_temporal_blend);
 
 	virtual bool light_has_shadow(RID p_light) const;
 

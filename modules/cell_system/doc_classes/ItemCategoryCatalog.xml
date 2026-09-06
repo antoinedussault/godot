@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="ItemCategoryCatalog" inherits="Resource" version="3.5">
+	<brief_description>
+		Project-wide list of item categories plus the item &#8594; (main, sub) mapping.
+	</brief_description>
+	<description>
+		Items store only an [code]id[/code]; their categorisation lives here so the item scripts stay untouched. Saved as a [code].tres[/code] at the path in [code]cell_system/items/category_catalog[/code] (Project Settings) and edited from the Categories sub-tab of the Items &amp; Recipes editor. At runtime, query it with [method get_item_main] / [method get_item_sub].
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_main_category">
+			<return type="bool" />
+			<argument index="0" name="name" type="String" />
+			<description>
+				Adds a main category. Returns [code]false[/code] if the name is empty or already present.
+			</description>
+		</method>
+		<method name="add_subcategory">
+			<return type="bool" />
+			<argument index="0" name="main" type="String" />
+			<argument index="1" name="sub" type="String" />
+			<description>
+				Adds a subcategory under an existing main category.
+			</description>
+		</method>
+		<method name="clear_item">
+			<return type="void" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				Removes any category assignment for the given item id.
+			</description>
+		</method>
+		<method name="get_assigned_ids" qualifiers="const">
+			<return type="PoolStringArray" />
+			<description>
+				Every item id that currently has a category assignment.
+			</description>
+		</method>
+		<method name="get_item_main" qualifiers="const">
+			<return type="String" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				Main category assigned to the item id, or [code]""[/code].
+			</description>
+		</method>
+		<method name="get_item_sub" qualifiers="const">
+			<return type="String" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				Subcategory assigned to the item id, or [code]""[/code].
+			</description>
+		</method>
+		<method name="get_main_categories" qualifiers="const">
+			<return type="PoolStringArray" />
+			<description>
+				Names of every main category, in order.
+			</description>
+		</method>
+		<method name="get_subcategories" qualifiers="const">
+			<return type="PoolStringArray" />
+			<argument index="0" name="main" type="String" />
+			<description>
+				Subcategory names under the given main category.
+			</description>
+		</method>
+		<method name="remove_main_category">
+			<return type="bool" />
+			<argument index="0" name="name" type="String" />
+			<description>
+				Removes a main category and any assignments that referenced it.
+			</description>
+		</method>
+		<method name="remove_subcategory">
+			<return type="bool" />
+			<argument index="0" name="main" type="String" />
+			<argument index="1" name="sub" type="String" />
+			<description>
+				Removes a subcategory; assignments that used it fall back to the main category only.
+			</description>
+		</method>
+		<method name="rename_main_category">
+			<return type="bool" />
+			<argument index="0" name="old_name" type="String" />
+			<argument index="1" name="new_name" type="String" />
+			<description>
+				Renames a main category and updates every assignment that referenced it.
+			</description>
+		</method>
+		<method name="set_item_category">
+			<return type="void" />
+			<argument index="0" name="id" type="String" />
+			<argument index="1" name="main" type="String" />
+			<argument index="2" name="sub" type="String" />
+			<description>
+				Assigns an item id to a main category and optional subcategory. An empty [code]main[/code] clears the assignment.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="assignments" type="Dictionary" setter="set_assignments" getter="get_assignments" default="{}">
+			Raw item id &#8594; [code]{ "main": String, "sub": String }[/code] map. Edit through the methods instead.
+		</member>
+		<member name="categories" type="Array" setter="set_categories" getter="get_categories" default="[  ]">
+			Raw array of [ItemCategory]. Edit through the methods instead.
+		</member>
+	</members>
+	<constants>
+	</constants>
+</class>

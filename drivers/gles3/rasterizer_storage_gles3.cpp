@@ -1673,7 +1673,40 @@ RID RasterizerStorageGLES3::sky_create() {
 	Sky *sky = memnew(Sky);
 	sky->radiance = 0;
 	sky->irradiance = 0;
-	return sky_owner.make_rid(sky);
+	RID rid = sky_owner.make_rid(sky);
+	sky->self = rid;
+	return rid;
+}
+
+void RasterizerStorageGLES3::sky_set_material(RID p_sky, RID p_material, int p_panorama_size, int p_radiance_size, int p_process_mode) {
+	Sky *sky = sky_owner.getornull(p_sky);
+	ERR_FAIL_COND(!sky);
+
+	if (!p_material.is_valid()) {
+		// Clearing the shader sky: drop the baked panorama + its radiance.
+		sky->shader_material = RID();
+		if (sky->bake_fbo != 0) {
+			glDeleteFramebuffers(1, &sky->bake_fbo);
+			sky->bake_fbo = 0;
+		}
+		_sky_free_rad_bake(sky);
+		if (sky->baked_panorama.is_valid()) {
+			if (sky->panorama == sky->baked_panorama) {
+				sky_set_texture(p_sky, RID(), p_radiance_size); // frees radiance, clears panorama
+			}
+			free(sky->baked_panorama);
+			sky->baked_panorama = RID();
+		}
+		return;
+	}
+
+	sky->shader_material = p_material;
+	// The panorama is only used to derive radiance/ambient now (the visible sky is
+	// drawn per screen pixel), so it can stay small.
+	sky->panorama_size = p_panorama_size > 0 ? p_panorama_size : 128;
+	sky->radiance_size = p_radiance_size > 0 ? p_radiance_size : 128;
+	sky->process_mode = p_process_mode;
+	sky->shader_dirty = true;
 }
 
 void RasterizerStorageGLES3::sky_set_texture(RID p_sky, RID p_panorama, int p_radiance_size) {
@@ -2088,6 +2121,234 @@ void RasterizerStorageGLES3::sky_set_texture(RID p_sky, RID p_panorama, int p_ra
 	}
 }
 
+void RasterizerStorageGLES3::_sky_free_rad_bake(Sky *p_sky) {
+	if (p_sky->rad_bake.fb) {
+		glDeleteFramebuffers(1, &p_sky->rad_bake.fb);
+	}
+	if (p_sky->rad_bake.tmp_fb) {
+		glDeleteFramebuffers(1, &p_sky->rad_bake.tmp_fb);
+	}
+	if (p_sky->rad_bake.tmp_tex) {
+		glDeleteTextures(1, &p_sky->rad_bake.tmp_tex);
+	}
+	if (p_sky->rad_bake.irr_fb) {
+		glDeleteFramebuffers(1, &p_sky->rad_bake.irr_fb);
+	}
+	if (p_sky->rad_bake.irr_tmp_fb) {
+		glDeleteFramebuffers(1, &p_sky->rad_bake.irr_tmp_fb);
+	}
+	if (p_sky->rad_bake.irr_tmp_tex) {
+		glDeleteTextures(1, &p_sky->rad_bake.irr_tmp_tex);
+	}
+	p_sky->rad_bake = Sky::RadBake();
+	p_sky->rad_alloc_size = 0;
+}
+
+bool RasterizerStorageGLES3::sky_shader_bake_radiance(Sky *sky) {
+	// Only the texture-array radiance path is handled here; the plain-2D path (mobile)
+	// falls back to the full sky_set_texture().
+	if (!config.use_texture_array_environment) {
+		return false;
+	}
+
+	Texture *texture = texture_owner.getornull(sky->panorama);
+	if (!texture) {
+		return false;
+	}
+	texture = texture->get_ptr();
+
+	const int size = sky->radiance_size;
+	const int array_level = 6;
+	const int irr_size = 32;
+	const bool use_float = config.framebuffer_half_float_supported;
+	const GLenum internal_format = use_float ? GL_RGBA16F : GL_RGB10_A2;
+	const GLenum format = GL_RGBA;
+	const GLenum type = use_float ? GL_HALF_FLOAT : GL_UNSIGNED_INT_2_10_10_10_REV;
+
+	int irradiance_max = GLOBAL_GET("rendering/quality/reflections/irradiance_max_size");
+	int upscale_size = MIN(int(previous_power_of_2(irradiance_max)), size);
+	if (upscale_size < 1) {
+		upscale_size = 1;
+	}
+
+	// (Re)allocate the persistent textures + framebuffers only when the size changes.
+	if (sky->rad_alloc_size != size) {
+		_sky_free_rad_bake(sky);
+		if (sky->radiance) {
+			glDeleteTextures(1, &sky->radiance);
+			sky->radiance = 0;
+		}
+		if (sky->irradiance) {
+			glDeleteTextures(1, &sky->irradiance);
+			sky->irradiance = 0;
+		}
+
+		glActiveTexture(GL_TEXTURE0);
+
+		glGenTextures(1, &sky->radiance);
+		glBindTexture(GL_TEXTURE_2D_ARRAY, sky->radiance);
+		glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, internal_format, size, size * 2, array_level, 0, format, type, nullptr);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glGenerateMipmap(GL_TEXTURE_2D_ARRAY); // allocate the mip pyramid once
+
+		glGenTextures(1, &sky->irradiance);
+		glBindTexture(GL_TEXTURE_2D, sky->irradiance);
+		glTexImage2D(GL_TEXTURE_2D, 0, internal_format, irr_size, irr_size * 2, 0, format, type, nullptr);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+		glGenTextures(1, &sky->rad_bake.tmp_tex);
+		glBindTexture(GL_TEXTURE_2D, sky->rad_bake.tmp_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, internal_format, size, size * 2, 0, format, type, nullptr);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+		glGenTextures(1, &sky->rad_bake.irr_tmp_tex);
+		glBindTexture(GL_TEXTURE_2D, sky->rad_bake.irr_tmp_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, internal_format, upscale_size, upscale_size * 2, 0, format, type, nullptr);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glGenerateMipmap(GL_TEXTURE_2D);
+
+		glGenFramebuffers(1, &sky->rad_bake.fb);
+		glGenFramebuffers(1, &sky->rad_bake.tmp_fb);
+		glGenFramebuffers(1, &sky->rad_bake.irr_fb);
+		glGenFramebuffers(1, &sky->rad_bake.irr_tmp_fb);
+
+		sky->rad_alloc_size = size;
+	}
+
+	glBindVertexArray(0);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_BLEND);
+	glDepthMask(GL_FALSE);
+	glColorMask(1, 1, 1, 1);
+
+	// Regenerate the panorama's mip chain (it was just re-rendered).
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(texture->target, texture->tex_id);
+	glTexParameteri(texture->target, GL_TEXTURE_BASE_LEVEL, 0);
+	glTexParameteri(texture->target, GL_TEXTURE_MAX_LEVEL, int(Math::floor(Math::log(float(texture->width)) / Math::log(2.0f))));
+	glGenerateMipmap(texture->target);
+	glTexParameterf(texture->target, GL_TEXTURE_WRAP_S, GL_REPEAT);
+	glTexParameterf(texture->target, GL_TEXTURE_WRAP_T, GL_REPEAT);
+	glTexParameterf(texture->target, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+	glTexParameterf(texture->target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+	const float panorama_lod = MAX(Math::floor(Math::log(float(texture->width)) / Math::log(2.0f)) - 10.0f, 0.0f);
+
+	// ---- Irradiance ----
+	{
+		glBindFramebuffer(GL_FRAMEBUFFER, sky->rad_bake.irr_tmp_fb);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sky->rad_bake.irr_tmp_tex, 0);
+
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_DUAL_PARABOLOID, true);
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_PANORAMA, true);
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::COMPUTE_IRRADIANCE, true);
+		shaders.cubemap_filter.bind();
+		shaders.cubemap_filter.set_uniform(CubemapFilterShaderGLES3::SOURCE_MIP_LEVEL, panorama_lod);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(texture->target, texture->tex_id);
+
+		for (int i = 0; i < 2; i++) {
+			glViewport(0, i * upscale_size, upscale_size, upscale_size);
+			glBindVertexArray(resources.quadie_array);
+			shaders.cubemap_filter.set_uniform(CubemapFilterShaderGLES3::Z_FLIP, i > 0);
+			glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+			glBindVertexArray(0);
+		}
+
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, sky->rad_bake.irr_tmp_tex);
+		glGenerateMipmap(GL_TEXTURE_2D);
+
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_DUAL_PARABOLOID, false);
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_PANORAMA, false);
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::COMPUTE_IRRADIANCE, false);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, sky->rad_bake.irr_fb);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sky->irradiance, 0);
+		shaders.copy.set_conditional(CopyShaderGLES3::USE_LOD, true);
+		shaders.copy.bind();
+		shaders.copy.set_uniform(CopyShaderGLES3::MIP_LEVEL, MAX(Math::floor(Math::log(float(upscale_size)) / Math::log(2.0f)) - 5.0f, 0.0f));
+		glViewport(0, 0, irr_size, irr_size * 2);
+		glBindVertexArray(resources.quadie_array);
+		glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+		glBindVertexArray(0);
+		shaders.copy.set_conditional(CopyShaderGLES3::USE_LOD, false);
+	}
+
+	// ---- Radiance (6 array layers, increasing roughness) ----
+	{
+		for (int j = 0; j < array_level; j++) {
+			glBindFramebuffer(GL_FRAMEBUFFER, sky->rad_bake.tmp_fb);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sky->rad_bake.tmp_tex, 0);
+
+#ifdef GLES_OVER_GL
+			bool from_panorama = j < 3;
+#else
+			bool from_panorama = j == 0;
+#endif
+			if (from_panorama) {
+				shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_DUAL_PARABOLOID, true);
+				shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_PANORAMA, true);
+				shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_DUAL_PARABOLOID_ARRAY, false);
+				shaders.cubemap_filter.bind();
+				glActiveTexture(GL_TEXTURE0);
+				glBindTexture(texture->target, texture->tex_id);
+				shaders.cubemap_filter.set_uniform(CubemapFilterShaderGLES3::SOURCE_RESOLUTION, float(texture->width / 4));
+			} else {
+				shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_DUAL_PARABOLOID, true);
+				shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_PANORAMA, false);
+				shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_DUAL_PARABOLOID_ARRAY, true);
+				shaders.cubemap_filter.bind();
+				glActiveTexture(GL_TEXTURE0);
+				glBindTexture(GL_TEXTURE_2D_ARRAY, sky->radiance);
+				shaders.cubemap_filter.set_uniform(CubemapFilterShaderGLES3::SOURCE_ARRAY_INDEX, j - 1);
+			}
+
+			for (int i = 0; i < 2; i++) {
+				glViewport(0, i * size, size, size);
+				glBindVertexArray(resources.quadie_array);
+				shaders.cubemap_filter.set_uniform(CubemapFilterShaderGLES3::Z_FLIP, i > 0);
+				shaders.cubemap_filter.set_uniform(CubemapFilterShaderGLES3::ROUGHNESS, j / float(array_level - 1));
+				glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+				glBindVertexArray(0);
+			}
+
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sky->rad_bake.fb);
+			glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, sky->radiance, 0, j);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, sky->rad_bake.tmp_fb);
+			glReadBuffer(GL_COLOR_ATTACHMENT0);
+			glBlitFramebuffer(0, 0, size, size * 2, 0, 0, size, size * 2, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		}
+
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_PANORAMA, false);
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_DUAL_PARABOLOID, false);
+		shaders.cubemap_filter.set_conditional(CubemapFilterShaderGLES3::USE_SOURCE_DUAL_PARABOLOID_ARRAY, false);
+
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D_ARRAY, sky->radiance);
+		glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameterf(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
+
+	glBindFramebuffer(GL_FRAMEBUFFER, RasterizerStorageGLES3::system_fbo);
+	return true;
+}
+
 /* SHADER API */
 
 RID RasterizerStorageGLES3::shader_create() {
@@ -2122,6 +2383,8 @@ void RasterizerStorageGLES3::shader_set_code(RID p_shader, const String &p_code)
 		mode = VS::SHADER_CANVAS_ITEM;
 	} else if (mode_string == "particles") {
 		mode = VS::SHADER_PARTICLES;
+	} else if (mode_string == "sky") {
+		mode = VS::SHADER_SKY;
 	} else {
 		mode = VS::SHADER_SPATIAL;
 	}
@@ -2137,6 +2400,7 @@ void RasterizerStorageGLES3::shader_set_code(RID p_shader, const String &p_code)
 		&scene->state.scene_shader,
 		&canvas->state.canvas_shader,
 		&this->shaders.particles,
+		&scene->state.sky_shader,
 
 	};
 
@@ -2288,6 +2552,21 @@ void RasterizerStorageGLES3::_update_shader(Shader *p_shader) const {
 		} break;
 		case VS::SHADER_PARTICLES: {
 			actions = &shaders.actions_particles;
+			actions->uniforms = &p_shader->uniforms;
+		} break;
+		case VS::SHADER_SKY: {
+			p_shader->sky.uses_time = false;
+			p_shader->sky.uses_position = false;
+			p_shader->sky.uses_light = false;
+
+			shaders.actions_sky.usage_flag_pointers["TIME"] = &p_shader->sky.uses_time;
+			shaders.actions_sky.usage_flag_pointers["POSITION"] = &p_shader->sky.uses_position;
+			shaders.actions_sky.usage_flag_pointers["LIGHT0_ENABLED"] = &p_shader->sky.uses_light;
+			shaders.actions_sky.usage_flag_pointers["LIGHT0_DIRECTION"] = &p_shader->sky.uses_light;
+			shaders.actions_sky.usage_flag_pointers["LIGHT0_COLOR"] = &p_shader->sky.uses_light;
+			shaders.actions_sky.usage_flag_pointers["LIGHT0_ENERGY"] = &p_shader->sky.uses_light;
+
+			actions = &shaders.actions_sky;
 			actions->uniforms = &p_shader->uniforms;
 		} break;
 		case VS::SHADER_MAX:
@@ -5522,6 +5801,24 @@ bool RasterizerStorageGLES3::light_directional_get_blend_splits(RID p_light) con
 	return light->directional_blend_splits;
 }
 
+void RasterizerStorageGLES3::light_directional_set_light_shafts(RID p_light, bool p_enabled, float p_bloom_intensity, float p_bloom_threshold, const Color &p_bloom_tint, float p_occlusion_darkness, int p_samples, float p_density, float p_decay, float p_weight, float p_temporal_blend) {
+	Light *light = light_owner.getornull(p_light);
+	ERR_FAIL_COND(!light);
+
+	// Read fresh by the scene post-process each frame, so no version bump / shader
+	// recompile is needed here.
+	light->light_shaft.enabled = p_enabled;
+	light->light_shaft.bloom_intensity = MAX(p_bloom_intensity, 0.0f);
+	light->light_shaft.bloom_threshold = p_bloom_threshold;
+	light->light_shaft.bloom_tint = p_bloom_tint;
+	light->light_shaft.occlusion_darkness = CLAMP(p_occlusion_darkness, 0.0f, 1.0f);
+	light->light_shaft.samples = CLAMP(p_samples, 4, 128);
+	light->light_shaft.density = CLAMP(p_density, 0.01f, 1.0f);
+	light->light_shaft.decay = CLAMP(p_decay, 0.0f, 1.0f);
+	light->light_shaft.weight = MAX(p_weight, 0.0f);
+	light->light_shaft.temporal_blend = CLAMP(p_temporal_blend, 0.0f, 0.95f);
+}
+
 VS::LightDirectionalShadowMode RasterizerStorageGLES3::light_directional_get_shadow_mode(RID p_light) {
 	const Light *light = light_owner.getornull(p_light);
 	ERR_FAIL_COND_V(!light, VS::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL);
@@ -6864,6 +7161,40 @@ void RasterizerStorageGLES3::_render_target_clear(RenderTarget *rt) {
 		rt->exposure.fbo = 0;
 	}
 
+	if (rt->effects.light_shaft.fbo[0]) {
+		glDeleteFramebuffers(2, rt->effects.light_shaft.fbo);
+		glDeleteTextures(2, rt->effects.light_shaft.color);
+		glDeleteFramebuffers(1, &rt->effects.light_shaft.history_fbo);
+		glDeleteTextures(1, &rt->effects.light_shaft.history);
+		rt->effects.light_shaft.fbo[0] = 0;
+		rt->effects.light_shaft.fbo[1] = 0;
+		rt->effects.light_shaft.color[0] = 0;
+		rt->effects.light_shaft.color[1] = 0;
+		rt->effects.light_shaft.history_fbo = 0;
+		rt->effects.light_shaft.history = 0;
+		rt->effects.light_shaft.width = 0;
+		rt->effects.light_shaft.height = 0;
+		rt->effects.light_shaft.history_valid = false;
+		rt->effects.light_shaft.prev_valid = false;
+	}
+
+	if (rt->effects.volumetric_fog.fbo[0]) {
+		glDeleteFramebuffers(2, rt->effects.volumetric_fog.fbo);
+		glDeleteTextures(2, rt->effects.volumetric_fog.color);
+		glDeleteFramebuffers(1, &rt->effects.volumetric_fog.history_fbo);
+		glDeleteTextures(1, &rt->effects.volumetric_fog.history);
+		rt->effects.volumetric_fog.fbo[0] = 0;
+		rt->effects.volumetric_fog.fbo[1] = 0;
+		rt->effects.volumetric_fog.color[0] = 0;
+		rt->effects.volumetric_fog.color[1] = 0;
+		rt->effects.volumetric_fog.history_fbo = 0;
+		rt->effects.volumetric_fog.history = 0;
+		rt->effects.volumetric_fog.width = 0;
+		rt->effects.volumetric_fog.height = 0;
+		rt->effects.volumetric_fog.history_valid = false;
+		rt->effects.volumetric_fog.prev_valid = false;
+	}
+
 	Texture *tex = texture_owner.get(rt->texture);
 	tex->alloc_height = 0;
 	tex->alloc_width = 0;
@@ -7200,6 +7531,110 @@ void RasterizerStorageGLES3::_render_target_allocate(RenderTarget *rt) {
 			if (status != GL_FRAMEBUFFER_COMPLETE) {
 				_render_target_clear(rt);
 				ERR_FAIL_COND(status != GL_FRAMEBUFFER_COMPLETE);
+			}
+
+			////// Light shafts (half-res ping-pong + temporal history)
+
+			{
+				int ls_w = MAX(rt->width / 2, 1);
+				int ls_h = MAX(rt->height / 2, 1);
+				rt->effects.light_shaft.width = ls_w;
+				rt->effects.light_shaft.height = ls_h;
+				rt->effects.light_shaft.history_valid = false;
+
+				GLenum ls_internal = GL_RGBA8;
+				GLenum ls_type = GL_UNSIGNED_BYTE;
+				if (config.framebuffer_float_supported) {
+					ls_internal = GL_RGBA16F;
+					ls_type = GL_FLOAT;
+				} else if (config.framebuffer_half_float_supported) {
+					ls_internal = GL_RGBA16F;
+					ls_type = GL_HALF_FLOAT;
+				}
+
+				GLuint ls_tex[3];
+				GLuint ls_fbo[3];
+				glGenTextures(3, ls_tex);
+				glGenFramebuffers(3, ls_fbo);
+
+				for (int i = 0; i < 3; i++) {
+					glBindTexture(GL_TEXTURE_2D, ls_tex[i]);
+					glTexImage2D(GL_TEXTURE_2D, 0, ls_internal, ls_w, ls_h, 0, GL_RGBA, ls_type, nullptr);
+					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+					glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+					glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+					glBindFramebuffer(GL_FRAMEBUFFER, ls_fbo[i]);
+					glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ls_tex[i], 0);
+
+					status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+					if (status != GL_FRAMEBUFFER_COMPLETE) {
+						glDeleteTextures(3, ls_tex);
+						glDeleteFramebuffers(3, ls_fbo);
+						_render_target_clear(rt);
+						ERR_FAIL_COND(status != GL_FRAMEBUFFER_COMPLETE);
+					}
+				}
+
+				rt->effects.light_shaft.color[0] = ls_tex[0];
+				rt->effects.light_shaft.color[1] = ls_tex[1];
+				rt->effects.light_shaft.history = ls_tex[2];
+				rt->effects.light_shaft.fbo[0] = ls_fbo[0];
+				rt->effects.light_shaft.fbo[1] = ls_fbo[1];
+				rt->effects.light_shaft.history_fbo = ls_fbo[2];
+			}
+
+			////// Volumetric fog (half-res raymarch ping-pong + temporal history)
+
+			{
+				int vf_w = MAX(rt->width / 2, 1);
+				int vf_h = MAX(rt->height / 2, 1);
+				rt->effects.volumetric_fog.width = vf_w;
+				rt->effects.volumetric_fog.height = vf_h;
+				rt->effects.volumetric_fog.history_valid = false;
+
+				GLenum vf_internal = GL_RGBA8;
+				GLenum vf_type = GL_UNSIGNED_BYTE;
+				if (config.framebuffer_float_supported) {
+					vf_internal = GL_RGBA16F;
+					vf_type = GL_FLOAT;
+				} else if (config.framebuffer_half_float_supported) {
+					vf_internal = GL_RGBA16F;
+					vf_type = GL_HALF_FLOAT;
+				}
+
+				GLuint vf_tex[3];
+				GLuint vf_fbo[3];
+				glGenTextures(3, vf_tex);
+				glGenFramebuffers(3, vf_fbo);
+
+				for (int i = 0; i < 3; i++) {
+					glBindTexture(GL_TEXTURE_2D, vf_tex[i]);
+					glTexImage2D(GL_TEXTURE_2D, 0, vf_internal, vf_w, vf_h, 0, GL_RGBA, vf_type, nullptr);
+					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+					glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+					glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+					glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+					glBindFramebuffer(GL_FRAMEBUFFER, vf_fbo[i]);
+					glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, vf_tex[i], 0);
+
+					status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+					if (status != GL_FRAMEBUFFER_COMPLETE) {
+						glDeleteTextures(3, vf_tex);
+						glDeleteFramebuffers(3, vf_fbo);
+						_render_target_clear(rt);
+						ERR_FAIL_COND(status != GL_FRAMEBUFFER_COMPLETE);
+					}
+				}
+
+				rt->effects.volumetric_fog.color[0] = vf_tex[0];
+				rt->effects.volumetric_fog.color[1] = vf_tex[1];
+				rt->effects.volumetric_fog.history = vf_tex[2];
+				rt->effects.volumetric_fog.fbo[0] = vf_fbo[0];
+				rt->effects.volumetric_fog.fbo[1] = vf_fbo[1];
+				rt->effects.volumetric_fog.history_fbo = vf_fbo[2];
 			}
 		} else {
 			rt->buffers.effects_active = false;
@@ -7721,6 +8156,16 @@ bool RasterizerStorageGLES3::free(RID p_rid) {
 		// delete the sky
 		Sky *sky = sky_owner.get(p_rid);
 		sky_set_texture(p_rid, RID(), 256);
+		_sky_free_rad_bake(sky);
+		if (sky->bake_fbo != 0) {
+			glDeleteFramebuffers(1, &sky->bake_fbo);
+			sky->bake_fbo = 0;
+		}
+		if (sky->baked_panorama.is_valid()) {
+			RID bp = sky->baked_panorama;
+			sky->baked_panorama = RID();
+			free(bp);
+		}
 		sky_owner.free(p_rid);
 		memdelete(sky);
 

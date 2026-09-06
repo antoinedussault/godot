@@ -135,6 +135,7 @@ public:
 		ShaderCompilerGLES3::IdentifierActions actions_canvas;
 		ShaderCompilerGLES3::IdentifierActions actions_scene;
 		ShaderCompilerGLES3::IdentifierActions actions_particles;
+		ShaderCompilerGLES3::IdentifierActions actions_sky;
 	} shaders;
 
 	struct Resources {
@@ -395,16 +396,63 @@ public:
 	/* SKY API */
 
 	struct Sky : public RID_Data {
+		RID self;
 		RID panorama;
 		GLuint radiance;
 		GLuint irradiance;
 		int radiance_size;
+
+		// Shader sky support: a "sky" ShaderMaterial baked into an equirectangular
+		// panorama (stored in `panorama` via an internally owned texture) that then
+		// feeds the regular radiance pipeline.
+		RID shader_material;
+		RID baked_panorama; // internally owned Texture RID that `panorama` points at
+		GLuint bake_fbo;
+		int panorama_size;
+		int process_mode; // VS::SkyShaderProcessMode
+		bool shader_dirty; // material/params changed -> radiance must be re-baked
+		uint64_t last_bake_frame;
+		double last_bake_time;
+
+		// Persistent scratch for the fast radiance re-bake (see sky_shader_bake_radiance),
+		// so re-baking every ~0.5s doesn't reallocate GL textures + framebuffers.
+		struct RadBake {
+			GLuint fb, tmp_fb, tmp_tex, irr_fb, irr_tmp_fb, irr_tmp_tex;
+		} rad_bake;
+		int rad_alloc_size;
+
+		Sky() {
+			radiance = 0;
+			irradiance = 0;
+			radiance_size = 0;
+			bake_fbo = 0;
+			panorama_size = 0;
+			process_mode = 0;
+			shader_dirty = false;
+			last_bake_frame = 0;
+			last_bake_time = -1000.0;
+			rad_bake.fb = 0;
+			rad_bake.tmp_fb = 0;
+			rad_bake.tmp_tex = 0;
+			rad_bake.irr_fb = 0;
+			rad_bake.irr_tmp_fb = 0;
+			rad_bake.irr_tmp_tex = 0;
+			rad_alloc_size = 0;
+		}
 	};
 
 	mutable RID_Owner<Sky> sky_owner;
 
 	virtual RID sky_create();
 	virtual void sky_set_texture(RID p_sky, RID p_panorama, int p_radiance_size);
+	virtual void sky_set_material(RID p_sky, RID p_material, int p_panorama_size, int p_radiance_size, int p_process_mode);
+
+	// Re-derive sky->radiance + sky->irradiance from sky->panorama, reusing persistent
+	// GL resources (no per-call texture/FBO allocation). Returns false when it can't
+	// handle the current config (2D radiance path) so the caller falls back to
+	// sky_set_texture(). Array-radiance path only.
+	bool sky_shader_bake_radiance(Sky *p_sky);
+	void _sky_free_rad_bake(Sky *p_sky);
 
 	/* SHADER API */
 
@@ -526,6 +574,12 @@ public:
 
 		struct Particles {
 		} particles;
+
+		struct Sky {
+			bool uses_time;
+			bool uses_position;
+			bool uses_light;
+		} sky;
 
 		bool uses_vertex_time;
 		bool uses_fragment_time;
@@ -971,6 +1025,20 @@ public:
 		VS::LightDirectionalShadowDepthRangeMode directional_range_mode;
 		bool directional_blend_splits;
 		uint64_t version;
+
+		// Unreal-style light shafts (directional lights only, GLES3 post-process).
+		struct LightShaft {
+			bool enabled = false;
+			float bloom_intensity = 0.6;
+			float bloom_threshold = 1.0;
+			Color bloom_tint = Color(1, 1, 1);
+			float occlusion_darkness = 0.35;
+			int samples = 48;
+			float density = 0.7;
+			float decay = 0.9;
+			float weight = 1.0;
+			float temporal_blend = 0.0;
+		} light_shaft;
 	};
 
 	mutable RID_Owner<Light> light_owner;
@@ -994,6 +1062,7 @@ public:
 	virtual void light_directional_set_shadow_mode(RID p_light, VS::LightDirectionalShadowMode p_mode);
 	virtual void light_directional_set_blend_splits(RID p_light, bool p_enable);
 	virtual bool light_directional_get_blend_splits(RID p_light) const;
+	virtual void light_directional_set_light_shafts(RID p_light, bool p_enabled, float p_bloom_intensity, float p_bloom_threshold, const Color &p_bloom_tint, float p_occlusion_darkness, int p_samples, float p_density, float p_decay, float p_weight, float p_temporal_blend);
 
 	virtual VS::LightDirectionalShadowMode light_directional_get_shadow_mode(RID p_light);
 	virtual VS::LightOmniShadowMode light_omni_get_shadow_mode(RID p_light);
@@ -1371,6 +1440,62 @@ public:
 					blur_fbo[1] = 0;
 				}
 			} ssao;
+
+			// Unreal-style light shafts: half-res ping-pong + temporal history.
+			struct LightShaft {
+				GLuint fbo[2];
+				GLuint color[2];
+				GLuint history_fbo;
+				GLuint history;
+				int width;
+				int height;
+				bool history_valid;
+
+				// Per-target temporal-reprojection state (multi-viewport safe).
+				Vector2 prev_light_uv;
+				Transform prev_cam_transform;
+				bool prev_valid;
+
+				LightShaft() :
+						history_fbo(0),
+						history(0),
+						width(0),
+						height(0),
+						history_valid(false),
+						prev_valid(false) {
+					fbo[0] = 0;
+					fbo[1] = 0;
+					color[0] = 0;
+					color[1] = 0;
+				}
+			} light_shaft;
+
+			// Route C volumetric fog: half-res raymarch ping-pong + temporal history.
+			struct VolumetricFog {
+				GLuint fbo[2];
+				GLuint color[2];
+				GLuint history_fbo;
+				GLuint history;
+				int width;
+				int height;
+				bool history_valid;
+
+				Transform prev_cam_transform;
+				bool prev_valid;
+
+				VolumetricFog() :
+						history_fbo(0),
+						history(0),
+						width(0),
+						height(0),
+						history_valid(false),
+						prev_valid(false) {
+					fbo[0] = 0;
+					fbo[1] = 0;
+					color[0] = 0;
+					color[1] = 0;
+				}
+			} volumetric_fog;
 
 			Effects() {}
 

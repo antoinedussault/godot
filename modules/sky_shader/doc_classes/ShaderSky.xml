@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="ShaderSky" inherits="Sky" version="3.5">
+	<brief_description>
+		A [Sky] whose contents come from a custom [code]shader_type sky;[/code] shader.
+	</brief_description>
+	<description>
+		Assign a [ShaderMaterial] whose shader begins with [code]shader_type sky;[/code] to [member sky_material] and drop this resource on a [WorldEnvironment]'s sky slot ([member Environment.background_sky], with [member Environment.background_mode] set to [b]Sky[/b] or [b]Color+Sky[/b]).
+		The visible sky is drawn by running the shader once per screen pixel (sharp, full resolution, no projection distortion). Separately, a small equirectangular panorama is baked from the shader and fed through the regular radiance pipeline so the sky also lights the scene and appears in reflections, like a [PanoramaSky]. That radiance bake is [b]coalesced to at most ~2 Hz[/b] no matter how often the material or its parameters change (rebuilding it is expensive), so a per-frame day/night script won't stall the frame rate. Ambient light updates a little behind the visible sky as a result.
+		All [code]uniform[/code] parameters declared by the shader are editable on the [ShaderMaterial] (in the inspector and at runtime via [method ShaderMaterial.set_shader_param]).
+		[b]Note:[/b] Shader skies require the GLES3 renderer. Under GLES2 the sky is left unchanged.
+		The sky [code]fragment()[/code] function receives [code]EYEDIR[/code] (world-space view direction), [code]SKY_COORDS[/code] (equirect UV, [code].y[/code] 0 = up, 1 = down), [code]POSITION[/code] (camera position), [code]TIME[/code], [code]AT_CUBEMAP_PASS[/code] (true only during the radiance bake), and [code]LIGHT0..3_ENABLED/DIRECTION/COLOR/ENERGY[/code] for the scene's [DirectionalLight]s. Write [code]COLOR[/code] (and optionally [code]ALPHA[/code]).
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+	</methods>
+	<members>
+		<member name="radiance_panorama_size" type="int" setter="set_panorama_size" getter="get_panorama_size" default="256">
+			Width in pixels of the internal panorama baked for radiance/ambient only (height is half). This does [i]not[/i] affect the visible sky, which is drawn per screen pixel — keep it small (256 is plenty for lighting).
+		</member>
+		<member name="process_mode" type="int" setter="set_process_mode" getter="get_process_mode" enum="ShaderSky.ProcessMode" default="0">
+			When the radiance/ambient bake is refreshed. The visible sky always animates every frame regardless. See [enum ProcessMode].
+		</member>
+		<member name="sky_material" type="ShaderMaterial" setter="set_sky_material" getter="get_sky_material">
+			The [ShaderMaterial] providing the sky. Its shader must start with [code]shader_type sky;[/code].
+		</member>
+	</members>
+	<constants>
+		<constant name="PROCESS_MODE_ON_CHANGE" value="0" enum="ProcessMode">
+			Refresh the radiance bake only when [member sky_material] or one of its parameters changes. Best when the sky animates visually but its lighting is roughly constant (day scene, slow clouds).
+		</constant>
+		<constant name="PROCESS_MODE_REALTIME" value="1" enum="ProcessMode">
+			Also refresh the radiance bake a few times per second, so ambient light and reflections follow the animation (sunset, aurora, fast weather).
+		</constant>
+	</constants>
+</class>

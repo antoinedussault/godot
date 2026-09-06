@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="ExpHeightFog" inherits="VisualInstance" version="3.5">
+	<brief_description>
+		Unreal-style exponential height fog as a screen-space pass.
+	</brief_description>
+	<description>
+		Applies exponential height fog by reconstructing world position from the
+		depth buffer and integrating density = [member density] * exp(-[member falloff] * (h - [member ref_height])) along each view ray. Add it anywhere in a 3D scene; it draws a fullscreen pass over the viewport. For correct results the active [Camera] environment must keep the depth buffer available (the default forward GLES3 path does).
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+	</methods>
+	<members>
+		<member name="fog_enabled" type="bool" setter="set_fog_enabled" getter="is_fog_enabled" default="true">
+			Master on/off. When false the pass outputs zero alpha (no cost beyond a transparent draw).
+		</member>
+		<member name="density" type="float" setter="set_density" getter="get_density" default="0.04">
+			Fog density at [member ref_height]. Higher is thicker. UE "Fog Density".
+		</member>
+		<member name="falloff" type="float" setter="set_falloff" getter="get_falloff" default="0.15">
+			Height falloff. Larger values confine fog closer to [member ref_height]; smaller values let it rise higher. UE "Fog Height Falloff".
+		</member>
+		<member name="ref_height" type="float" setter="set_ref_height" getter="get_ref_height" default="0.0">
+			World-space Y where density equals [member density] (the fog "sea level").
+		</member>
+		<member name="start_distance" type="float" setter="set_start_distance" getter="get_start_distance" default="0.0">
+			Distance from the camera before fog begins. UE "Start Distance".
+		</member>
+		<member name="max_opacity" type="float" setter="set_max_opacity" getter="get_max_opacity" default="1.0">
+			Upper clamp on fog opacity. UE "Fog Max Opacity".
+		</member>
+		<member name="inscatter" type="Color" setter="set_inscatter" getter="get_inscatter" default="Color( 0.55, 0.62, 0.72, 1 )">
+			Base fog color. UE "Fog Inscattering Color".
+		</member>
+		<member name="directional_enabled" type="bool" setter="set_directional_enabled" getter="is_directional_enabled" default="false">
+			Enables sun-tinted glow when looking toward [member directional_light_direction].
+		</member>
+		<member name="directional_color" type="Color" setter="set_directional_color" getter="get_directional_color" default="Color( 1, 0.9, 0.7, 1 )">
+			Color of the directional inscattering glow.
+		</member>
+		<member name="directional_light_direction" type="Vector3" setter="set_light_direction" getter="get_light_direction" default="Vector3( 0, -1, 0 )">
+			Direction the light travels. Set this to your DirectionalLight's forward (-Z) vector.
+		</member>
+		<member name="directional_exponent" type="float" setter="set_directional_exponent" getter="get_directional_exponent" default="4.0">
+			Tightness of the glow. Higher concentrates it nearer the light vector.
+		</member>
+	</members>
+	<constants>
+	</constants>
+</class>

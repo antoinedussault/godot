@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SceneTransition" inherits="CanvasLayer" version="3.5">
+	<brief_description>
+		The loading-screen overlay driven by [SceneManager].
+	</brief_description>
+	<description>
+		Created automatically by [SceneManager] under the root viewport; you do not place one in a scene. It shows a configured loading-screen scene (or a plain colour fill) over a fade, forwards load progress to that scene's [code]set_progress[/code] method if it has one, and keeps the screen up for at least [member min_display_time] so fast loads do not flash.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="hide_loading">
+			<return type="void" />
+			<description>
+				Requests the fade back to the game. Honours [member min_display_time].
+			</description>
+		</method>
+		<method name="is_busy" qualifiers="const">
+			<return type="bool" />
+			<description>
+				True while the transition is anything other than fully hidden.
+			</description>
+		</method>
+		<method name="is_covered" qualifiers="const">
+			<return type="bool" />
+			<description>
+				True once the screen fully covers the viewport. [SceneManager] waits for this before swapping scenes.
+			</description>
+		</method>
+		<method name="set_progress">
+			<return type="void" />
+			<argument index="0" name="ratio" type="float" />
+			<description>
+			</description>
+		</method>
+		<method name="show_loading">
+			<return type="void" />
+			<argument index="0" name="scene_path" type="String" />
+			<description>
+				Fades the screen up. If [code]scene_path[/code] is non-empty it is instanced on top of the backdrop.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="fade_color" type="Color" setter="set_fade_color" getter="get_fade_color" default="Color( 0, 0, 0, 1 )">
+			Backdrop colour behind the loading scene, and the fill used when no loading scene is set.
+		</member>
+		<member name="fade_time" type="float" setter="set_fade_time" getter="get_fade_time" default="0.35">
+			Seconds for the fade in and the fade out.
+		</member>
+		<member name="min_display_time" type="float" setter="set_min_display_time" getter="get_min_display_time" default="0.4">
+			Minimum seconds the fully-covered screen stays up once loading is done.
+		</member>
+	</members>
+	<constants>
+		<constant name="STATE_HIDDEN" value="0" enum="State">
+		</constant>
+		<constant name="STATE_IN" value="1" enum="State">
+		</constant>
+		<constant name="STATE_COVERED" value="2" enum="State">
+		</constant>
+		<constant name="STATE_OUT" value="3" enum="State">
+		</constant>
+	</constants>
+</class>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SceneSpawnPoint" inherits="Spatial" version="3.5">
+	<brief_description>
+		A named arrival marker inside a scene.
+	</brief_description>
+	<description>
+		When [SceneManager] finishes loading a scene it looks for the [SceneSpawnPoint] whose [member spawn_id] matches the requested spawn (searching the [code]scene_spawn_points[/code] group) and reports that node's global transform so the player can be placed there. Drop one just inside each door.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_spawn_transform" qualifiers="const">
+			<return type="Transform" />
+			<description>
+				The global transform the player should be moved to. With [member use_flat_orientation] the basis is a pure yaw rotation.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="spawn_id" type="String" setter="set_spawn_id" getter="get_spawn_id" default="&quot;&quot;">
+			Identifier a [SceneDoor.target_spawn] or [method SceneManager.travel_to] refers to.
+		</member>
+		<member name="use_flat_orientation" type="bool" setter="set_use_flat_orientation" getter="get_use_flat_orientation" default="true">
+			Drop pitch and roll from the reported transform, keeping only yaw — usually what an upright character body wants.
+		</member>
+	</members>
+	<constants>
+	</constants>
+</class>

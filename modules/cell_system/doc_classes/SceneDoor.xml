@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SceneDoor" inherits="Area" version="3.5">
+	<brief_description>
+		A linked load door that triggers [SceneManager] travel.
+	</brief_description>
+	<description>
+		Place a [SceneDoor] as an [Area] with a collision shape in a doorway. When a body in [member body_filter] enters (mode [constant ON_BODY_ENTER]), or when [method activate] is called (mode [constant ON_INTERACT]), it calls [method SceneManager.travel_to] with [member target_scene] and [member target_spawn].
+		Triggers are ignored while [SceneManager] is already travelling, during [member cooldown], and after the first fire if [member one_shot] is set. The node is inert in the editor.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="activate">
+			<return type="void" />
+			<description>
+				Triggers the door regardless of [member trigger_mode] and [member body_filter], for use by an interaction system. Still subject to the cooldown / travelling / one-shot guards.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="body_filter" type="String" setter="set_body_filter" getter="get_body_filter" default="&quot;player&quot;">
+			Group the entering body must belong to. Empty means any body.
+		</member>
+		<member name="cooldown" type="float" setter="set_cooldown" getter="get_cooldown" default="1.0">
+			Seconds after a trigger before the door can fire again.
+		</member>
+		<member name="one_shot" type="bool" setter="set_one_shot" getter="get_one_shot" default="false">
+			If set, the door fires only once per run.
+		</member>
+		<member name="target_scene" type="String" setter="set_target_scene" getter="get_target_scene" default="&quot;&quot;">
+			[SceneCatalog] id of the destination scene.
+		</member>
+		<member name="target_spawn" type="String" setter="set_target_spawn" getter="get_target_spawn" default="&quot;&quot;">
+			[member SceneSpawnPoint.spawn_id] in the destination scene to place the player at. Empty uses the entry's default spawn.
+		</member>
+		<member name="trigger_mode" type="int" setter="set_trigger_mode" getter="get_trigger_mode" enum="SceneDoor.TriggerMode" default="0">
+			How the door fires.
+		</member>
+	</members>
+	<constants>
+		<constant name="ON_BODY_ENTER" value="0" enum="TriggerMode">
+			Fires when a body in [member body_filter] enters the Area.
+		</constant>
+		<constant name="ON_INTERACT" value="1" enum="TriggerMode">
+			Inert until [method activate] is called.
+		</constant>
+	</constants>
+</class>

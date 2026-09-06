@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="CellItemBody" inherits="RigidBody" version="3.5">
+	<brief_description>
+		A [RigidBody] that represents one dropped item in the world.
+	</brief_description>
+	<description>
+		Point [member item] at an item resource (a [code].tres[/code] whose script extends [code]ItemResource[/code], authored in the Items &amp; Recipes editor tab). On entering the tree the body instances the item's [code]scene_path[/code] for visuals, and — when [member auto_build] is on — generates a single box [CollisionShape] sized to that scene's combined visual bounds, taking its mass from the item's [code]weight[/code].
+		[CellWorld] already routes any [RigidBody] into its [code]DynamicObjects[/code] container, so a [CellItemBody] streams with the rest of the cell. A [CellPlayerBody] walking into it shoves it (scaled by the player's speed and [member push_strength]); [method push] does the same from code and [method pickup] removes it.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_item_id" qualifiers="const">
+			<return type="String" />
+			<description>
+				The [code]id[/code] of the referenced [member item], or [code]""[/code]. Used to look the body up in the [ItemCategoryCatalog].
+			</description>
+		</method>
+		<method name="pickup">
+			<return type="void" />
+			<description>
+				Emits [signal picked_up] with [member item] and frees the node.
+			</description>
+		</method>
+		<method name="push">
+			<return type="void" />
+			<argument index="0" name="impulse" type="Vector3" />
+			<description>
+				Applies a central impulse in world space — a manual shove for interaction or explosion systems.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="auto_build" type="bool" setter="set_auto_build" getter="get_auto_build" default="true">
+			When on, the visual scene and a generated box collision shape are (re)built whenever [member item] changes. Turn it off to author the body's own [CollisionShape] children by hand.
+		</member>
+		<member name="item" type="Resource" setter="set_item" getter="get_item">
+			The item resource this body represents.
+		</member>
+		<member name="push_strength" type="float" setter="set_push_strength" getter="get_push_strength" default="1.0">
+			Multiplier on the impulse a touching [CellPlayerBody] imparts. [code]0[/code] disables player pushing.
+		</member>
+	</members>
+	<constants>
+	</constants>
+	<signals>
+		<signal name="picked_up">
+			<argument index="0" name="item" type="Resource" />
+			<description>
+				Emitted by [method pickup] just before the node is freed.
+			</description>
+		</signal>
+	</signals>
+</class>

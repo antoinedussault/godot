@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SceneCatalogEntry" inherits="Resource" version="3.5">
+	<brief_description>
+		One travellable scene in a [SceneCatalog].
+	</brief_description>
+	<description>
+		Describes a single location: its id, the scene file to load, and how [SceneManager] should treat it.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+	</methods>
+	<members>
+		<member name="default_spawn" type="String" setter="set_default_spawn" getter="get_default_spawn" default="&quot;&quot;">
+			[member SceneSpawnPoint.spawn_id] used when [method SceneManager.travel_to] is called with no spawn id.
+		</member>
+		<member name="display_name" type="String" setter="set_display_name" getter="get_display_name" default="&quot;&quot;">
+			Human-readable name shown in the [b]Scenes[/b] editor dock.
+		</member>
+		<member name="id" type="String" setter="set_id" getter="get_id" default="&quot;&quot;">
+			Stable identifier. [SceneDoor.target_scene] and [method SceneManager.travel_to] refer to the scene by this string.
+		</member>
+		<member name="keep_loaded" type="bool" setter="set_keep_loaded" getter="get_keep_loaded" default="false">
+			Reserved for a future persistent-hub feature. Not honoured yet.
+		</member>
+		<member name="kind" type="int" setter="set_kind" getter="get_kind" enum="SceneCatalogEntry.Kind" default="0">
+			Whether this location is an interior or an exterior. Informational for now (an exterior scene simply contains its own [code]CellTerrainManager[/code]).
+		</member>
+		<member name="scene_path" type="String" setter="set_scene_path" getter="get_scene_path" default="&quot;&quot;">
+			[code]res://[/code] path to the [PackedScene] ([code].tscn[/code]/[code].scn[/code]) to load.
+		</member>
+	</members>
+	<constants>
+		<constant name="KIND_INTERIOR" value="0" enum="Kind">
+			A self-contained interior space.
+		</constant>
+		<constant name="KIND_EXTERIOR" value="1" enum="Kind">
+			An outdoor area, typically containing a [code]CellTerrainManager[/code].
+		</constant>
+	</constants>
+</class>

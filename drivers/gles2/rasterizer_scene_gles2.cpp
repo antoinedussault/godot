@@ -909,6 +909,11 @@ void RasterizerSceneGLES2::environment_set_fog_height(RID p_env, bool p_enable, 
 	env->fog_height_max = p_max_height;
 	env->fog_height_curve = p_height_curve;
 }
+
+void RasterizerSceneGLES2::environment_set_volumetric_fog(RID p_env, bool p_enable, float p_density, float p_height_falloff, float p_height_ref, const Color &p_albedo, const Color &p_ambient, float p_sun_energy, float p_anisotropy, float p_length, float p_extinction, int p_samples, float p_temporal_blend) {
+	// Not supported on the GLES2 backend (no readable scene depth / shadow atlas).
+}
+
 bool RasterizerSceneGLES2::is_environment(RID p_env) {
 	return environment_owner.owns(p_env);
 }

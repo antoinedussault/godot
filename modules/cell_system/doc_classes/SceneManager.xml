@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="SceneManager" inherits="Object" version="3.5">
+	<brief_description>
+		Engine singleton for Creation-Engine-style scene travel.
+	</brief_description>
+	<description>
+		[SceneManager] loads whole scenes one at a time. [method travel_to] async-loads the target scene behind a loading screen ([SceneTransition]), swaps it in as [member SceneTree.current_scene], then reports a spawn transform so the game's master node can move the player.
+		It is always available in GDScript as [code]SceneManager[/code]. Typical setup, from an autoload's [code]_ready()[/code]:
+		[codeblock]
+		SceneManager.set_catalog_path("res://data/scene_catalog.tres")
+		SceneManager.set_loading_screen("res://ui/loading_screen.tscn")
+		SceneManager.connect("player_spawn_requested", self, "_on_player_spawn")
+
+		func _on_player_spawn(xform, spawn_id):
+		    $Player.global_transform = xform
+		    $Player/Camera.current = true
+		[/codeblock]
+		The scene is pumped from a [SceneTree] idle callback, so loading never blocks a frame for long; raise [member max_polls_per_frame] to load faster, lower it to keep frames smoother.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="bootstrap">
+			<return type="void" />
+			<description>
+				Forces creation of the runtime [SceneTransition] now. Optional — [method travel_to] does this automatically.
+			</description>
+		</method>
+		<method name="can_travel_back" qualifiers="const">
+			<return type="bool" />
+			<description>
+				True if the travel history is non-empty.
+			</description>
+		</method>
+		<method name="get_current_scene_id" qualifiers="const">
+			<return type="String" />
+			<description>
+				Catalog id of the scene currently loaded, or [code]""[/code] before the first travel.
+			</description>
+		</method>
+		<method name="get_progress" qualifiers="const">
+			<return type="float" />
+			<description>
+				Load progress of the in-flight travel, [code]0..1[/code].
+			</description>
+		</method>
+		<method name="is_travelling" qualifiers="const">
+			<return type="bool" />
+			<description>
+				True between [signal travel_started] and [signal travel_finished].
+			</description>
+		</method>
+		<method name="reload_current">
+			<return type="void" />
+			<description>
+				Travels to the current scene again, reusing the last spawn id. Does not push history.
+			</description>
+		</method>
+		<method name="set_catalog">
+			<return type="void" />
+			<argument index="0" name="catalog" type="SceneCatalog" />
+			<description>
+			</description>
+		</method>
+		<method name="set_catalog_path">
+			<return type="void" />
+			<argument index="0" name="path" type="String" />
+			<description>
+				Loads a [SceneCatalog] [code].tres[/code] from this path and uses it.
+			</description>
+		</method>
+		<method name="set_loading_screen">
+			<return type="void" />
+			<argument index="0" name="path" type="String" />
+			<description>
+				[code]res://[/code] path to the loading-screen scene shown during a travel. Its root may implement [code]set_progress(ratio: float)[/code] to drive a bar. Empty falls back to a plain colour fade.
+			</description>
+		</method>
+		<method name="set_player_target">
+			<return type="void" />
+			<argument index="0" name="path" type="NodePath" />
+			<argument index="1" name="method" type="String" />
+			<description>
+				After each load, if a node exists at [code]path[/code] and has this method, the manager calls [code]method(transform, spawn_id)[/code] on it — an alternative to connecting [signal player_spawn_requested]. Defaults to [code]/root/GameMaster[/code] and [code]place_player[/code].
+			</description>
+		</method>
+		<method name="set_max_polls_per_frame">
+			<return type="void" />
+			<argument index="0" name="count" type="int" />
+			<description>
+			</description>
+		</method>
+		<method name="travel_back">
+			<return type="void" />
+			<description>
+				Pops the travel history and returns to the previous scene (at its default spawn).
+			</description>
+		</method>
+		<method name="travel_to">
+			<return type="void" />
+			<argument index="0" name="scene_id" type="String" />
+			<argument index="1" name="spawn_id" type="String" default="&quot;&quot;" />
+			<description>
+				Begins travelling to the catalog scene [code]scene_id[/code]. The player is placed at the [SceneSpawnPoint] whose [member SceneSpawnPoint.spawn_id] matches [code]spawn_id[/code] (or the entry's [member SceneCatalogEntry.default_spawn]). Ignored if a travel is already in flight.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="catalog" type="SceneCatalog" setter="set_catalog" getter="get_catalog">
+			The active [SceneCatalog]. Also settable by path with [method set_catalog_path].
+		</member>
+		<member name="loading_screen" type="String" setter="set_loading_screen" getter="get_loading_screen" default="&quot;&quot;">
+			[code]res://[/code] path to the loading-screen scene. Empty falls back to a colour fade.
+		</member>
+		<member name="max_polls_per_frame" type="int" setter="set_max_polls_per_frame" getter="get_max_polls_per_frame" default="4">
+			How many resource-load steps to run per frame while travelling. Higher loads faster but can hitch.
+		</member>
+	</members>
+	<signals>
+		<signal name="travel_started">
+			<argument index="0" name="scene_id" type="String" />
+			<description>
+				Emitted when [method travel_to] accepts a request and the loading screen begins to show.
+			</description>
+		</signal>
+		<signal name="load_progress">
+			<argument index="0" name="ratio" type="float" />
+			<description>
+				Emitted each frame while loading, [code]0..1[/code].
+			</description>
+		</signal>
+		<signal name="scene_instanced">
+			<argument index="0" name="scene_id" type="String" />
+			<argument index="1" name="scene_root" type="Node" />
+			<description>
+				Emitted right after the new scene becomes the current scene, before the player is placed.
+			</description>
+		</signal>
+		<signal name="player_spawn_requested">
+			<argument index="0" name="transform" type="Transform" />
+			<argument index="1" name="spawn_id" type="String" />
+			<description>
+				Emitted with the global transform the player should be moved to. Connect this from the node that owns the player.
+			</description>
+		</signal>
+		<signal name="travel_finished">
+			<argument index="0" name="scene_id" type="String" />
+			<description>
+				Emitted once the player has been placed and the loading screen begins to hide.
+			</description>
+		</signal>
+		<signal name="travel_failed">
+			<argument index="0" name="scene_id" type="String" />
+			<argument index="1" name="reason" type="String" />
+			<description>
+				Emitted when a travel could not start or complete. The previous scene is left untouched.
+			</description>
+		</signal>
+	</signals>
+	<constants>
+	</constants>
+</class>

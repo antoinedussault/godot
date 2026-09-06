@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="ItemCategory" inherits="Resource" version="3.5">
+	<brief_description>
+		One main item category and the subcategories nested under it.
+	</brief_description>
+	<description>
+		Held in an [ItemCategoryCatalog]. Edit these from the Categories sub-tab of the Items &amp; Recipes editor rather than by hand.
+	</description>
+	<tutorials>
+	</tutorials>
+	<members>
+		<member name="category_name" type="String" setter="set_category_name" getter="get_category_name" default="&quot;&quot;">
+			Display name of the main category.
+		</member>
+		<member name="subcategories" type="PoolStringArray" setter="set_subcategories" getter="get_subcategories" default="PoolStringArray(  )">
+			Names of the subcategories under this main category.
+		</member>
+	</members>
+	<constants>
+	</constants>
+</class>
