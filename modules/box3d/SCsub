@@ -1,0 +1,104 @@
+#!/usr/bin/env python
+
+Import("env")
+Import("env_modules")
+
+env_box3d = env_modules.Clone()
+
+# Thirdparty source files
+
+thirdparty_obj = []
+
+thirdparty_dir = "#thirdparty/box3d/"
+thirdparty_sources = [
+    "aabb.c",
+    "arena_allocator.c",
+    "bitset.c",
+    "block_allocator.c",
+    "body.c",
+    "broad_phase.c",
+    "capsule.c",
+    "compound.c",
+    "constraint_graph.c",
+    "contact.c",
+    "contact_solver.c",
+    "convex_manifold.c",
+    "core.c",
+    "distance.c",
+    "distance_joint.c",
+    "dynamic_tree.c",
+    "height_field.c",
+    "hull.c",
+    "id_pool.c",
+    "island.c",
+    "joint.c",
+    "manifold.c",
+    "math_functions.c",
+    "mesh.c",
+    "mesh_contact.c",
+    "motor_joint.c",
+    "mover.c",
+    "name_cache.c",
+    "parallel_for.c",
+    "parallel_joint.c",
+    "physics_world.c",
+    "prismatic_joint.c",
+    "recording.c",
+    "recording_replay.c",
+    "revolute_joint.c",
+    "scheduler.c",
+    "sensor.c",
+    "shape.c",
+    "simd.c",
+    "solver.c",
+    "solver_set.c",
+    "sphere.c",
+    "spherical_joint.c",
+    "table.c",
+    "timer.c",
+    "triangle_manifold.c",
+    "types.c",
+    "weld_joint.c",
+    "wheel_joint.c",
+    "world_snapshot.c",
+]
+thirdparty_sources = [thirdparty_dir + "src/" + f for f in thirdparty_sources]
+
+# Listed explicitly rather than globbed, so a `git pull` of upstream that adds or
+# drops a file shows up as a build break instead of silently changing what ships.
+
+env_box3d.Prepend(CPPPATH=[thirdparty_dir + "include"])
+
+env_thirdparty = env_box3d.Clone()
+env_thirdparty.disable_warnings()
+
+# Box3D is C17 (it needs _Static_assert and anonymous unions; see its own
+# src/CMakeLists.txt). The standard goes on CFLAGS, never CCFLAGS, so it applies
+# to these .c files and cannot leak onto Godot's C++ translation units.
+#
+# Godot puts /std:c++14 in CCFLAGS (SConstruct:463), and SCons passes CCFLAGS to
+# the C compiler too — so without stripping it here every .c file is handed both
+# standards at once and MSVC rejects the command line outright (D8016). This env
+# compiles only C, so dropping the C++ standard from it is safe.
+#
+# Its atomics do NOT need /experimental:c11atomics: src/platform.h uses the MSVC
+# _Interlocked* intrinsics under _MSC_VER and the __atomic_* builtins elsewhere,
+# so stdatomic.h never enters the picture.
+if env.msvc:
+    env_thirdparty["CCFLAGS"] = [f for f in env_thirdparty["CCFLAGS"] if not str(f).startswith("/std:c++")]
+    env_thirdparty.Append(CFLAGS=["/std:c17"])
+else:
+    env_thirdparty["CCFLAGS"] = [f for f in env_thirdparty["CCFLAGS"] if not str(f).startswith("-std=c++")]
+    env_thirdparty.Append(CFLAGS=["-std=c17"])
+
+# Box3D's own private headers are included unprefixed from within src/.
+env_thirdparty.Prepend(CPPPATH=[thirdparty_dir + "src"])
+
+env_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
+env.modules_sources += thirdparty_obj
+
+# Godot source files
+
+module_obj = []
+env_box3d.add_source_files(module_obj, "*.cpp")
+env.modules_sources += module_obj
