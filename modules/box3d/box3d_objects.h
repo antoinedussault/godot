@@ -48,6 +48,12 @@ public:
 	// NOT cloned — when those land, their buffers must be owned by this object
 	// and outlive every shape built from them.
 	b3ShapeId attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform) const;
+
+	// Builds a point-cloud proxy of this shape for shape casts and overlap
+	// queries, with `p_xform` applied. Points are written into `r_points`, which
+	// the caller owns and must keep alive for the duration of the query.
+	// Returns false for shape types that cannot be proxied.
+	bool build_proxy(Vector<b3Vec3> &r_points, const Transform &p_xform, b3ShapeProxy *r_proxy) const;
 };
 
 class Box3DCollisionObject : public RID_Data {

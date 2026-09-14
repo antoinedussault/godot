@@ -153,3 +153,82 @@ b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Tra
 			return b3_nullShapeId;
 	}
 }
+
+// Point-cloud proxies for shape casts and overlap queries.
+//
+// Box3D expresses every castable convex shape as a point cloud plus an external
+// radius, so a sphere is one point with a radius and a box is eight points with
+// none. Points are world-space: the caller passes the query transform in, which
+// is what keeps the cast precise far from the origin.
+bool Box3DShape::build_proxy(Vector<b3Vec3> &r_points, const Transform &p_xform, b3ShapeProxy *r_proxy) const {
+	r_points.clear();
+
+	switch (type) {
+		case PhysicsServer::SHAPE_SPHERE: {
+			r_points.push_back(b3_from_godot(p_xform.origin));
+			r_proxy->radius = (float)(real_t)data;
+		} break;
+
+		case PhysicsServer::SHAPE_BOX: {
+			Vector3 e = data;
+			for (int i = 0; i < 8; i++) {
+				Vector3 corner(
+						(i & 1) ? e.x : -e.x,
+						(i & 2) ? e.y : -e.y,
+						(i & 4) ? e.z : -e.z);
+				r_points.push_back(b3_from_godot(p_xform.xform(corner)));
+			}
+			r_proxy->radius = 0.0f;
+		} break;
+
+		case PhysicsServer::SHAPE_CAPSULE: {
+			Dictionary d = data;
+			ERR_FAIL_COND_V(!d.has("radius") || !d.has("height"), false);
+			real_t radius = d["radius"];
+			real_t height = d["height"];
+			// Z-aligned, matching CapsuleShapeSW.
+			r_points.push_back(b3_from_godot(p_xform.xform(Vector3(0, 0, height * 0.5))));
+			r_points.push_back(b3_from_godot(p_xform.xform(Vector3(0, 0, -height * 0.5))));
+			r_proxy->radius = (float)radius;
+		} break;
+
+		case PhysicsServer::SHAPE_CYLINDER: {
+			Dictionary d = data;
+			ERR_FAIL_COND_V(!d.has("radius") || !d.has("height"), false);
+			real_t radius = d["radius"];
+			real_t half_h = (real_t)d["height"] * 0.5;
+			const int SIDES = 8; // Half the solid's tessellation; proxies are point-count bound.
+			for (int i = 0; i < SIDES; i++) {
+				real_t a = (Math_TAU * (real_t)i) / (real_t)SIDES;
+				real_t x = Math::cos(a) * radius;
+				real_t z = Math::sin(a) * radius;
+				r_points.push_back(b3_from_godot(p_xform.xform(Vector3(x, half_h, z))));
+				r_points.push_back(b3_from_godot(p_xform.xform(Vector3(x, -half_h, z))));
+			}
+			r_proxy->radius = 0.0f;
+		} break;
+
+		case PhysicsServer::SHAPE_CONVEX_POLYGON: {
+			Vector<Vector3> pts = data;
+			ERR_FAIL_COND_V(pts.size() < 4, false);
+			for (int i = 0; i < pts.size(); i++) {
+				r_points.push_back(b3_from_godot(p_xform.xform(pts[i])));
+			}
+			r_proxy->radius = 0.0f;
+		} break;
+
+		default:
+			// Concave, heightmap, plane and ray are not convex point clouds and
+			// cannot be cast this way — they are only ever cast *against*.
+			return false;
+	}
+
+	// The point budget is a hard limit in Box3D, not a hint: overrunning it
+	// corrupts the cast rather than degrading it.
+	ERR_FAIL_COND_V_MSG(r_points.size() > B3_MAX_SHAPE_CAST_POINTS, false,
+			"Box3D: shape proxy exceeds B3_MAX_SHAPE_CAST_POINTS.");
+
+	r_proxy->points = r_points.ptr();
+	r_proxy->count = r_points.size();
+	return true;
+}

@@ -68,6 +68,10 @@ void Box3DPhysicsServer::_body_enter_world(Box3DBody *p_body, Box3DSpace *p_spac
 	def.enableSleep = p_body->can_sleep;
 	def.isAwake = !p_body->sleeping;
 
+	// Lets a query result walk b3ShapeId -> b3BodyId -> Box3DBody in one hop,
+	// which is how every scene query resolves what it hit.
+	def.userData = p_body;
+
 	// Godot treats a negative damp as "inherit from the area"; Box3D has no such
 	// sentinel, so clamp it to zero here. Area-driven damping is a later pass.
 	def.linearDamping = p_body->linear_damp >= 0 ? (float)p_body->linear_damp : 0.0f;
