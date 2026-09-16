@@ -1369,6 +1369,15 @@ struct Box3DMoverPlaneContext {
 	int count = 0;
 };
 
+static bool b3_mover_filter_callback(b3ShapeId shapeId, void *context) {
+	const Set<RID> *exclude = static_cast<const Set<RID> *>(context);
+	Box3DBody *body = b3_body_from_shape(shapeId, nullptr);
+	if (!body) {
+		return false;
+	}
+	return !(exclude && exclude->has(body->self));
+}
+
 static bool b3_mover_plane_callback(b3ShapeId shapeId, const b3PlaneResult *planes, int planeCount, void *context) {
 	Box3DMoverPlaneContext *ctx = static_cast<Box3DMoverPlaneContext *>(context);
 
@@ -1528,10 +1537,33 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 					b3_mover_plane_callback, &pctx);
 
 			if (pctx.count == 0) {
-				// Nothing in contact any more: the rest of the move is free.
-				total += remaining;
-				remaining = Vector3();
-				break;
+				// Nothing in contact. Resolving planes alone would report the whole
+				// motion as free, which is wrong whenever the move would RUN INTO
+				// something -- and that is the normal case for the downward probe
+				// move_and_slide_with_snap() uses to stick to the ground. A
+				// character cresting or descending a slope leaves the surface for a
+				// frame, so with no sweep there is nothing to snap to: the body
+				// floats, falls, and re-lands, which reads as jitter on descent and
+				// leaves stop_on_slope with no floor contact to act on.
+				//
+				// So sweep the capsule along what is left of the motion and stop at
+				// first contact; the next iteration gathers planes there and slides.
+				const float fraction = b3World_CastMover(space->world_id, world_origin, &step_mover,
+						b3_from_godot(remaining), filter, b3_mover_filter_callback, &exclude);
+
+				if (fraction >= 1.0f) {
+					// Genuinely unobstructed.
+					total += remaining;
+					remaining = Vector3();
+					break;
+				}
+
+				const Vector3 step = remaining * (real_t)fraction;
+				total += step;
+				remaining -= step;
+				current.origin += step;
+				touched = true;
+				continue;
 			}
 
 			touched = true;
