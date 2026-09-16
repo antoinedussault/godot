@@ -357,6 +357,7 @@ void Box3DSpace::step(real_t p_delta) {
 		return;
 	}
 
+	last_step_delta = p_delta;
 	b3World_Step(world_id, (float)p_delta, sub_step_count);
 
 	// Copy solver transforms back into the Godot-side bookkeeping. Static bodies
@@ -375,6 +376,40 @@ void Box3DSpace::step(real_t p_delta) {
 }
 
 void Box3DSpace::call_queries() {
-	// Flush deferred callbacks: body force-integration callbacks, area
-	// monitor/area-monitor enter-exit events, and the debug contact list.
+	// This is how a moving body reaches the scene. Godot's RigidBody does not
+	// poll the server — it is pushed its state through the force-integration
+	// callback (RigidBody::_direct_state_changed), which then applies the
+	// transform to the node. Without this, bodies simulate correctly inside
+	// Box3D and nothing on screen ever moves.
+	for (int i = 0; i < bodies.size(); i++) {
+		Box3DBody *body = bodies[i];
+		if (!body->force_integration_callback_id) {
+			continue;
+		}
+
+		Object *obj = ObjectDB::get_instance(body->force_integration_callback_id);
+		if (!obj) {
+			// The node is gone; drop the callback rather than resolving a dead
+			// id every frame.
+			body->force_integration_callback_id = 0;
+			body->force_integration_callback_method = StringName();
+			continue;
+		}
+
+		Box3DPhysicsDirectBodyState *state = Box3DPhysicsDirectBodyState::singleton;
+		if (!state) {
+			continue;
+		}
+		state->body = body;
+		state->step_delta = last_step_delta;
+
+		Variant v = state;
+		const Variant *vp[2] = { &v, &body->force_integration_callback_udata };
+		Variant::CallError ce;
+		const int argc = (body->force_integration_callback_udata.get_type() == Variant::NIL) ? 1 : 2;
+		obj->call(body->force_integration_callback_method, vp, argc, ce);
+	}
+
+	// Still to flush here: area monitor / area-monitor enter-exit events and the
+	// debug contact list.
 }

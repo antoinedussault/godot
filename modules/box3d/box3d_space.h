@@ -65,6 +65,9 @@ public:
 
 	int sub_step_count = 4;
 
+	// Reported to the force-integration callback as PhysicsDirectBodyState::get_step().
+	real_t last_step_delta = 0.0;
+
 	int max_debug_contacts = 0;
 	Vector<Vector3> debug_contacts;
 

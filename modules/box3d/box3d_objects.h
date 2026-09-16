@@ -40,14 +40,25 @@ public:
 	// can rebuild their solver-side geometry.
 	Set<RID> owners;
 
+	// Box3D holds a REFERENCE to height field data rather than cloning it, so
+	// this blob must outlive every b3 shape built from it. Owned here, shared
+	// across attachments of the same shape, and released by free_geometry().
+	b3HeightFieldData *heightfield_data = nullptr;
+
 	// Builds this shape's Box3D geometry and attaches it to a body. Returns
 	// b3_nullShapeId for shape types not yet supported.
 	//
 	// Sphere, capsule and hull geometry is fully cloned by Box3D, so the
-	// temporaries built inside are safe to discard. Mesh and height field are
-	// NOT cloned — when those land, their buffers must be owned by this object
-	// and outlive every shape built from them.
-	b3ShapeId attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform) const;
+	// temporaries built inside are safe to discard; the height field is not.
+	b3ShapeId attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform);
+
+	// Releases owned geometry. Must run only when no b3 shape still references
+	// it — i.e. after the shapes built from it are destroyed.
+	void free_geometry();
+
+	// For SHAPE_HEIGHTMAP, the grid dimensions in grid points. Returns false for
+	// any other type or malformed data.
+	bool get_heightmap_dimensions(int &r_width, int &r_depth) const;
 
 	// Builds a point-cloud proxy of this shape for shape casts and overlap
 	// queries, with `p_xform` applied. Points are written into `r_points`, which
@@ -139,7 +150,23 @@ public:
 
 	Set<RID> collision_exceptions;
 
+	// Box3D anchors a height field at the body origin extending positive, while
+	// Godot centers it, and b3CreateHeightFieldShape takes no transform to
+	// correct with. For a static body carrying only a height field, the fix is
+	// to shift the b3 body itself: this is the body-local transform that maps
+	// Godot's placement onto Box3D's corner anchor. Identity when unused.
+	//
+	// Safe specifically because static bodies are skipped during transform
+	// writeback, so the shifted b3 position is never read back into `transform`.
+	bool has_shape_origin_offset = false;
+	Transform shape_origin_offset;
+
 	_FORCE_INLINE_ bool in_world() const { return !B3_IS_NULL(body_id); }
+
+	// The transform the b3 body should actually sit at, offset included.
+	_FORCE_INLINE_ Transform get_solver_transform() const {
+		return has_shape_origin_offset ? (transform * shape_origin_offset) : transform;
+	}
 
 	Box3DBody() :
 			Box3DCollisionObject(TYPE_BODY) {}

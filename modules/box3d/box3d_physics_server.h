@@ -68,6 +68,14 @@ private:
 	void _body_rebuild_shapes(Box3DBody *p_body);
 	void _body_apply_mass(Box3DBody *p_body);
 
+	// Pushes the body's transform into the solver, including the height field
+	// origin correction when one applies.
+	void _body_sync_transform(Box3DBody *p_body);
+
+	// Works out whether this body needs the height field origin offset, and what
+	// it is. Also enforces the two cases the offset cannot express.
+	void _body_update_shape_origin_offset(Box3DBody *p_body);
+
 public:
 
 	/* SHAPE API */

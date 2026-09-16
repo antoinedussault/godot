@@ -24,12 +24,16 @@ Box3DPhysicsServer::~Box3DPhysicsServer() {
 void Box3DPhysicsServer::_bind_methods() {
 }
 
+// Every "which kind of RID is this?" probe below uses owns() rather than
+// getornull(). getornull() emits an ERROR on a miss, so probing three owners to
+// identify one RID would print two errors for every successful lookup — which is
+// exactly what free() did on shutdown.
 Box3DCollisionObject *Box3DPhysicsServer::get_collision_object(RID p_rid) const {
-	if (Box3DBody *body = body_owner.getornull(p_rid)) {
-		return static_cast<Box3DCollisionObject *>(body);
+	if (body_owner.owns(p_rid)) {
+		return static_cast<Box3DCollisionObject *>(body_owner.getornull(p_rid));
 	}
-	if (Box3DArea *area = area_owner.getornull(p_rid)) {
-		return static_cast<Box3DCollisionObject *>(area);
+	if (area_owner.owns(p_rid)) {
+		return static_cast<Box3DCollisionObject *>(area_owner.getornull(p_rid));
 	}
 	return nullptr;
 }
@@ -115,6 +119,72 @@ void Box3DPhysicsServer::_body_exit_world(Box3DBody *p_body) {
 	}
 }
 
+void Box3DPhysicsServer::_body_sync_transform(Box3DBody *p_body) {
+	if (!p_body->in_world()) {
+		return;
+	}
+	const Transform t = p_body->get_solver_transform();
+	b3Body_SetTransform(p_body->body_id,
+			b3_pos_from_godot(t.origin),
+			b3_quat_from_godot(t.basis.get_rotation_quat()));
+}
+
+void Box3DPhysicsServer::_body_update_shape_origin_offset(Box3DBody *p_body) {
+	p_body->has_shape_origin_offset = false;
+	p_body->shape_origin_offset = Transform();
+
+	int heightmap_index = -1;
+	bool has_other_shapes = false;
+
+	for (int i = 0; i < p_body->shapes.size(); i++) {
+		if (p_body->shapes[i].disabled) {
+			continue;
+		}
+		Box3DShape *shape = shape_owner.getornull(p_body->shapes[i].shape);
+		if (!shape) {
+			continue;
+		}
+		if (shape->type == SHAPE_HEIGHTMAP) {
+			heightmap_index = i;
+		} else {
+			has_other_shapes = true;
+		}
+	}
+
+	if (heightmap_index < 0) {
+		return;
+	}
+
+	// Two cases the body-offset trick cannot express. Both warn rather than
+	// silently placing terrain half a cell out, which is the failure that would
+	// otherwise be found by walking off the edge of the world.
+	if (p_body->mode != BODY_MODE_STATIC) {
+		WARN_PRINT_ONCE("Box3D: HeightMapShape is only supported on static bodies.");
+		return;
+	}
+	if (has_other_shapes) {
+		WARN_PRINT_ONCE("Box3D: a HeightMapShape must be the only shape on its body; "
+						"the height field cannot be offset independently of the other shapes.");
+		return;
+	}
+
+	Box3DShape *shape = shape_owner.getornull(p_body->shapes[heightmap_index].shape);
+	int width = 0;
+	int depth = 0;
+	if (!shape || !shape->get_heightmap_dimensions(width, depth)) {
+		return;
+	}
+
+	// Godot centers the field on the shape's origin and spans (width-1) by
+	// (depth-1) at one unit per grid step; Box3D runs from its origin in +X/+Z.
+	// Shifting the body back by half the extent lines the two up.
+	Transform offset = p_body->shapes[heightmap_index].xform;
+	offset.origin += offset.basis.xform(Vector3(-(width - 1) * 0.5, 0, -(depth - 1) * 0.5));
+
+	p_body->has_shape_origin_offset = true;
+	p_body->shape_origin_offset = offset;
+}
+
 void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 	ERR_FAIL_NULL(p_body);
 	if (!p_body->in_world()) {
@@ -148,6 +218,11 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 
 		entry.shape_id = shape->attach(p_body->body_id, &def, entry.xform);
 	}
+
+	// The offset depends on which shapes are attached, so it is recomputed here
+	// and pushed into the solver before mass, which reads the final layout.
+	_body_update_shape_origin_offset(p_body);
+	_body_sync_transform(p_body);
 
 	_body_apply_mass(p_body);
 }
@@ -203,6 +278,40 @@ void Box3DPhysicsServer::shape_set_data(RID p_shape, const Variant &p_data) {
 	Box3DShape *shape = shape_owner.getornull(p_shape);
 	ERR_FAIL_NULL(shape);
 	shape->data = p_data;
+
+	// Solver geometry built from the old data is now stale. This is the hot path
+	// for streamed terrain: CellTerrain reassigns a HeightMapShape's data every
+	// time a cell loads.
+	//
+	// Order matters. The height field blob is shared by every body this shape is
+	// attached to, so every referencing b3 shape must be destroyed BEFORE the
+	// blob is freed — otherwise rebuilding one body leaves another holding a
+	// dangling pointer into freed height data.
+	if (shape->owners.empty()) {
+		shape->free_geometry();
+		return;
+	}
+
+	for (Set<RID>::Element *E = shape->owners.front(); E; E = E->next()) {
+		Box3DBody *body = body_owner.getornull(E->get());
+		if (!body || !body->in_world()) {
+			continue;
+		}
+		for (int i = 0; i < body->shapes.size(); i++) {
+			if (body->shapes[i].shape == p_shape && !B3_IS_NULL(body->shapes[i].shape_id)) {
+				b3DestroyShape(body->shapes[i].shape_id, false);
+				body->shapes.write[i].shape_id = b3_nullShapeId;
+			}
+		}
+	}
+
+	shape->free_geometry();
+
+	for (Set<RID>::Element *E = shape->owners.front(); E; E = E->next()) {
+		if (Box3DBody *body = body_owner.getornull(E->get())) {
+			_body_rebuild_shapes(body);
+		}
+	}
 }
 
 PhysicsServer::ShapeType Box3DPhysicsServer::shape_get_type(RID p_shape) const {
@@ -475,7 +584,7 @@ void Box3DPhysicsServer::area_set_shape_disabled(RID p_area, int p_shape_idx, bo
 }
 
 void Box3DPhysicsServer::area_attach_object_instance_id(RID p_area, ObjectID p_id) {
-	if (space_owner.getornull(p_area)) {
+	if (space_owner.owns(p_area)) {
 		return; // The default area has no node behind it.
 	}
 	Box3DArea *area = area_owner.getornull(p_area);
@@ -484,7 +593,7 @@ void Box3DPhysicsServer::area_attach_object_instance_id(RID p_area, ObjectID p_i
 }
 
 ObjectID Box3DPhysicsServer::area_get_object_instance_id(RID p_area) const {
-	if (space_owner.getornull(p_area)) {
+	if (space_owner.owns(p_area)) {
 		return 0;
 	}
 	Box3DArea *area = area_owner.getornull(p_area);
@@ -496,7 +605,8 @@ void Box3DPhysicsServer::area_set_param(RID p_area, AreaParameter p_param, const
 	// A space RID here means "the world's default area" — that is how World sets
 	// default gravity and damping.
 	Box3DArea *area = nullptr;
-	if (Box3DSpace *space = space_owner.getornull(p_area)) {
+	if (space_owner.owns(p_area)) {
+		Box3DSpace *space = space_owner.getornull(p_area);
 		area = space->default_area;
 	} else {
 		area = area_owner.getornull(p_area);
@@ -534,14 +644,16 @@ void Box3DPhysicsServer::area_set_param(RID p_area, AreaParameter p_param, const
 	}
 
 	// When this is a space's default area, gravity belongs to the live world.
-	if (Box3DSpace *space = space_owner.getornull(p_area)) {
+	if (space_owner.owns(p_area)) {
+		Box3DSpace *space = space_owner.getornull(p_area);
 		space->update_gravity();
 	}
 }
 
 Variant Box3DPhysicsServer::area_get_param(RID p_area, AreaParameter p_param) const {
 	Box3DArea *area = nullptr;
-	if (Box3DSpace *space = space_owner.getornull(p_area)) {
+	if (space_owner.owns(p_area)) {
+		Box3DSpace *space = space_owner.getornull(p_area);
 		area = space->default_area;
 	} else {
 		area = area_owner.getornull(p_area);
@@ -752,7 +864,26 @@ void Box3DPhysicsServer::body_remove_shape(RID p_body, int p_shape_idx) {
 	if (body->in_world() && !B3_IS_NULL(body->shapes[p_shape_idx].shape_id)) {
 		b3DestroyShape(body->shapes[p_shape_idx].shape_id, false);
 	}
+
+	const RID removed = body->shapes[p_shape_idx].shape;
 	body->shapes.remove(p_shape_idx);
+
+	// Drop the back-reference once no entry uses this shape any more. RIDs are
+	// recycled, so a stale owner would later point shape_set_data() at whatever
+	// body inherited the id.
+	bool still_used = false;
+	for (int i = 0; i < body->shapes.size(); i++) {
+		if (body->shapes[i].shape == removed) {
+			still_used = true;
+			break;
+		}
+	}
+	if (!still_used) {
+		if (Box3DShape *shape = shape_owner.getornull(removed)) {
+			shape->owners.erase(p_body);
+		}
+	}
+
 	_body_rebuild_shapes(body);
 }
 
@@ -760,14 +891,18 @@ void Box3DPhysicsServer::body_clear_shapes(RID p_body) {
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 
-	if (body->in_world()) {
-		for (int i = 0; i < body->shapes.size(); i++) {
-			if (!B3_IS_NULL(body->shapes[i].shape_id)) {
-				b3DestroyShape(body->shapes[i].shape_id, false);
-			}
+	for (int i = 0; i < body->shapes.size(); i++) {
+		if (body->in_world() && !B3_IS_NULL(body->shapes[i].shape_id)) {
+			b3DestroyShape(body->shapes[i].shape_id, false);
+		}
+		if (Box3DShape *shape = shape_owner.getornull(body->shapes[i].shape)) {
+			shape->owners.erase(p_body);
 		}
 	}
 	body->shapes.clear();
+
+	_body_update_shape_origin_offset(body);
+	_body_sync_transform(body);
 	_body_apply_mass(body);
 }
 
@@ -900,11 +1035,7 @@ void Box3DPhysicsServer::body_set_state(RID p_body, BodyState p_state, const Var
 	switch (p_state) {
 		case BODY_STATE_TRANSFORM: {
 			body->transform = p_variant;
-			if (body->in_world()) {
-				b3Body_SetTransform(body->body_id,
-						b3_pos_from_godot(body->transform.origin),
-						b3_quat_from_godot(body->transform.basis.get_rotation_quat()));
-			}
+			_body_sync_transform(body);
 		} break;
 		case BODY_STATE_LINEAR_VELOCITY: {
 			body->linear_velocity = p_variant;
@@ -1357,26 +1488,34 @@ bool Box3DPhysicsServer::generic_6dof_joint_get_flag(RID p_joint, Vector3::Axis 
 /* MISC */
 
 void Box3DPhysicsServer::free(RID p_rid) {
-	if (Box3DShape *shape = shape_owner.getornull(p_rid)) {
+	if (shape_owner.owns(p_rid)) {
+		// Godot frees a shape only once nothing references it, so any b3 shapes
+		// built from this height field are already gone by now.
+		Box3DShape *shape = shape_owner.getornull(p_rid);
+		shape->free_geometry();
 		shape_owner.free(p_rid);
 		memdelete(shape);
 
-	} else if (Box3DBody *body = body_owner.getornull(p_rid)) {
+	} else if (body_owner.owns(p_rid)) {
 		// Leave the world before the bookkeeping goes away, or the space would be
 		// left holding a dangling Box3DBody pointer in its body list.
+		Box3DBody *body = body_owner.getornull(p_rid);
 		_body_exit_world(body);
 		body_owner.free(p_rid);
 		memdelete(body);
 
-	} else if (Box3DArea *area = area_owner.getornull(p_rid)) {
+	} else if (area_owner.owns(p_rid)) {
+		Box3DArea *area = area_owner.getornull(p_rid);
 		area_owner.free(p_rid);
 		memdelete(area);
 
-	} else if (Box3DJoint *joint = joint_owner.getornull(p_rid)) {
+	} else if (joint_owner.owns(p_rid)) {
+		Box3DJoint *joint = joint_owner.getornull(p_rid);
 		joint_owner.free(p_rid);
 		memdelete(joint);
 
-	} else if (Box3DSpace *space = space_owner.getornull(p_rid)) {
+	} else if (space_owner.owns(p_rid)) {
+		Box3DSpace *space = space_owner.getornull(p_rid);
 		space_set_active(p_rid, false);
 		if (space->default_area) {
 			memdelete(space->default_area);

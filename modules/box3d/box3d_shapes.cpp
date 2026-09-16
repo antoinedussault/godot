@@ -115,7 +115,101 @@ static b3ShapeId attach_convex(b3BodyId p_body, const b3ShapeDef *p_def, const V
 	return id;
 }
 
-b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform) const {
+bool Box3DShape::get_heightmap_dimensions(int &r_width, int &r_depth) const {
+	if (type != PhysicsServer::SHAPE_HEIGHTMAP) {
+		return false;
+	}
+	Dictionary d = data;
+	if (!d.has("width") || !d.has("depth")) {
+		return false;
+	}
+	r_width = d["width"];
+	r_depth = d["depth"];
+	return r_width > 1 && r_depth > 1;
+}
+
+void Box3DShape::free_geometry() {
+	if (heightfield_data) {
+		b3DestroyHeightField(heightfield_data);
+		heightfield_data = nullptr;
+	}
+}
+
+static b3ShapeId attach_heightmap(b3BodyId p_body, const b3ShapeDef *p_def, Box3DShape *p_shape) {
+	if (p_shape->heightfield_data) {
+		return b3CreateHeightFieldShape(p_body, p_def, p_shape->heightfield_data);
+	}
+
+	Dictionary d = p_shape->data;
+	ERR_FAIL_COND_V(!d.has("width") || !d.has("depth") || !d.has("heights"), b3_nullShapeId);
+
+	const int width = d["width"];
+	const int depth = d["depth"];
+	PoolRealArray heights = d["heights"];
+	ERR_FAIL_COND_V(width <= 1 || depth <= 1, b3_nullShapeId);
+	ERR_FAIL_COND_V(heights.size() != width * depth, b3_nullShapeId);
+
+	// Box3D quantizes heights into uint16 between a global min and max, so those
+	// bounds must be supplied. Godot hands them over when it has them; otherwise
+	// scan. Neighbouring cells sharing bounds is what makes their edges line up
+	// exactly, which matters directly for streamed terrain — every CellTerrain
+	// must agree on this range or seams open up between cells.
+	float min_height = 0.0f;
+	float max_height = 0.0f;
+	if (d.has("min_height") && d.has("max_height")) {
+		min_height = (real_t)d["min_height"];
+		max_height = (real_t)d["max_height"];
+	} else {
+		PoolRealArray::Read r = heights.read();
+		for (int i = 0; i < heights.size(); i++) {
+			if (r[i] < min_height) {
+				min_height = r[i];
+			} else if (r[i] > max_height) {
+				max_height = r[i];
+			}
+		}
+	}
+	ERR_FAIL_COND_V(min_height > max_height, b3_nullShapeId);
+
+	// Box3D wants a plain float array; Godot's PoolRealArray is real_t, which is
+	// float in a single-precision build but must still be copied explicitly.
+	Vector<float> flat;
+	flat.resize(heights.size());
+	{
+		PoolRealArray::Read r = heights.read();
+		float *w = flat.ptrw();
+		for (int i = 0; i < heights.size(); i++) {
+			w[i] = (float)r[i];
+		}
+	}
+
+	b3HeightFieldDef def = {};
+	def.heights = flat.ptrw();
+	def.materialIndices = nullptr;
+	// Godot's HeightMapShape has a fixed grid spacing of one unit (its AABB is
+	// width-1 by depth-1); scale.y of 1 keeps heights in world units.
+	def.scale = { 1.0f, 1.0f, 1.0f };
+	def.countX = width;
+	def.countZ = depth;
+	def.globalMinimumHeight = min_height;
+	def.globalMaximumHeight = max_height;
+	def.clockwiseWinding = false;
+
+	// b3CreateHeightField copies the def ("No pointers are held to this data"),
+	// but b3CreateHeightFieldShape does NOT copy the result — so the blob is
+	// owned by the shape and released in free_geometry().
+	//
+	// Built once and shared by every body this shape is attached to. Freeing it
+	// here on each attach would dangle any b3 shape another body still holds,
+	// so invalidation is driven from shape_set_data(), which tears down every
+	// referencing b3 shape first.
+	p_shape->heightfield_data = b3CreateHeightField(&def);
+	ERR_FAIL_NULL_V(p_shape->heightfield_data, b3_nullShapeId);
+
+	return b3CreateHeightFieldShape(p_body, p_def, p_shape->heightfield_data);
+}
+
+b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform) {
 	switch (type) {
 		case PhysicsServer::SHAPE_SPHERE:
 			return attach_sphere(p_body, p_def, data, p_local_xform);
@@ -135,11 +229,11 @@ b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Tra
 			return b3_nullShapeId;
 
 		case PhysicsServer::SHAPE_HEIGHTMAP:
-			// Same non-cloning contract as mesh, and the one that matters most
-			// here: CellTerrain rebuilds a HeightMapShape per streamed cell, so
-			// the buffer lifetime has to survive that churn.
-			WARN_PRINT_ONCE("Box3D: HeightMapShape is not implemented yet.");
-			return b3_nullShapeId;
+			// The local transform is deliberately ignored: Box3D anchors a height
+			// field at the body origin and offers no per-shape transform, so the
+			// placement correction is applied to the body instead (see
+			// Box3DBody::shape_origin_offset). Static bodies only.
+			return attach_heightmap(p_body, p_def, this);
 
 		case PhysicsServer::SHAPE_PLANE:
 			WARN_PRINT_ONCE("Box3D: PlaneShape has no Box3D equivalent (use a large box for a floor).");
