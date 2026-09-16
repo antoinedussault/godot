@@ -1,6 +1,8 @@
 #include "box3d_physics_server.h"
 #include "box3d_types_converter.h"
 
+#include "box3d/constants.h"
+
 #include "core/error_macros.h"
 #include "core/os/os.h"
 #include "core/project_settings.h"
@@ -1669,6 +1671,30 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 			if (pctx.count > 0) {
 				b3Vec3 zero = { 0.0f, 0.0f, 0.0f };
 				recover = b3_to_godot(b3SolvePlanes(zero, pctx.planes, pctx.count).delta);
+
+				// Tolerate penetration up to the kinematic margin instead of
+				// pushing fully out every frame.
+				//
+				// The recovery is folded into MotionResult::motion, and
+				// move_and_slide_with_snap() applies that to the body -- so a
+				// push that is regenerated every frame gets re-applied every
+				// frame. Resting on a surface, the solver's own contact pushout
+				// keeps the body a hair inside, so fighting it produces a
+				// permanent up-down fight: visible as Y jitter, and on a slope
+				// the horizontal part of the push eats into walking speed.
+				// The floor for this is Box3D's own resting tolerance, not Godot's
+				// margin. B3_LINEAR_SLOP is 0.005: the solver deliberately keeps
+				// resting bodies up to 5mm deep. Godot's default kinematic margin
+				// is 0.001, five times tighter -- so recovering to it pushes out
+				// penetration the solver immediately recreates, every frame,
+				// forever. That residual fight is the remaining Y jitter.
+				const real_t margin = MAX(body->kinematic_safe_margin, (real_t)B3_LINEAR_SLOP);
+				const real_t len = recover.length();
+				if (len <= margin) {
+					recover = Vector3();
+				} else {
+					recover *= (len - margin) / len;
+				}
 			}
 		}
 
@@ -1682,8 +1708,19 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 		// 2. Sweep to first contact.
 		const float fraction = b3World_CastMover(space->world_id, world_origin, &swept,
 				b3_from_godot(p_motion), filter, b3_mover_filter_callback, &exclude);
-		const real_t travel_fraction = CLAMP((real_t)fraction, (real_t)0.0, (real_t)1.0);
-		const Vector3 travel = p_motion * travel_fraction;
+		real_t travel_fraction = CLAMP((real_t)fraction, (real_t)0.0, (real_t)1.0);
+		Vector3 travel = p_motion * travel_fraction;
+
+		// A gap narrower than the solver's own slop means "already touching".
+		// Without this the snap probe closes that sub-millimetre gap every frame
+		// while the contact solver pushes back out within B3_LINEAR_SLOP, and the
+		// body oscillates inside the slop band forever -- small, but it is exactly
+		// the residual Y jitter a resting character shows. Report the contact, but
+		// no travel.
+		if (travel_fraction < 1.0 && travel.length() < (real_t)B3_LINEAR_SLOP) {
+			travel = Vector3();
+			travel_fraction = 0.0;
+		}
 
 		const bool swept_into_something = travel_fraction < 1.0;
 		const bool recovered = !recover.is_equal_approx(Vector3());
