@@ -4,14 +4,17 @@ A third `PhysicsServer` implementation alongside `GodotPhysics` and `Bullet`,
 built on [Box3D](https://github.com/erincatto/box3d) — Erin Catto's 3D engine
 (MIT, C17, soft-step solver, CCD, SIMD, cross-platform determinism).
 
-**Status: rigid bodies simulate.** A `b3World` is created per space, bodies enter
-and leave it with the scene tree, primitive and convex shapes are built, mass
-matches Godot's, and solver transforms are written back each step — so dynamic
-bodies fall, collide and stack.
+**Status: playable.** Rigid bodies fall, collide and stack; `KinematicBody`
+characters stand on ground, slide, and report `is_on_floor()`; height fields give
+terrain collision; and ray/point/shape queries return real hits.
 
-Not yet wired: scene queries (every `intersect_*` returns no hit),
-`body_test_motion` (so `KinematicBody` does not collide), areas, joints, contact
-reporting, and trimesh/heightmap shapes.
+Verified end to end: a sphere dropped from y=10 rests at exactly y=2.0 on a floor
+whose top face is y=1, and a capsule character lands at the geometrically correct
+height and walks at exactly the requested speed.
+
+Not yet wired: **Areas** (no `body_entered` signals, no gravity overrides — this
+is the biggest remaining gap for real game content), joints, contact reporting in
+`_integrate_forces`, trimesh shapes, and `RayShape`.
 
 ## Enabling it
 
@@ -63,11 +66,20 @@ Roughly dependency order; each line is independently testable.
       - `SHAPE_CYLINDER` is a 16-sided generated hull, not a true cylinder — it
         settles on a facet instead of rolling forever. A real behaviour
         difference from Bullet; document it.
+- [x] **Height fields**: built, owned and invalidated correctly. Box3D anchors
+      them at the body origin extending positive while Godot centers them, and
+      `b3CreateHeightFieldShape` takes no transform — so the offset is applied to
+      the static body via `Box3DBody::get_solver_transform()`.
+      Box3D holds a *reference* to the height blob rather than cloning it, and
+      the blob is shared across attachments, so `shape_set_data()` destroys every
+      referencing b3 shape before freeing it. This is the streamed-terrain hot
+      path: `CellTerrain` reassigns heightmap data on every cell load.
+      **Watch for seams**: Box3D quantizes heights into `uint16` between a global
+      min/max. Cells that compute their own bounds will not line up at shared
+      edges — they must agree on the range.
 - [ ] **Shapes, the rest**:
-      - `SHAPE_CONCAVE_POLYGON` / `SHAPE_HEIGHTMAP` — note that
-        `b3CreateMeshShape` and `b3CreateHeightFieldShape` do **not** clone their
-        input. The buffers must be owned by `Box3DShape` and outlive every shape
-        built from them. Both are static-body only.
+      - `SHAPE_CONCAVE_POLYGON` — `b3CreateMeshShape` has the same non-cloning
+        contract as the height field. Static bodies only.
       - `SHAPE_PLANE` — no equivalent (use a large box for a floor).
       - `SHAPE_RAY` — no equivalent. Bullet needed both a custom shape and a
         custom collision algorithm for this one (`modules/bullet/btRayShape.cpp`,
@@ -79,13 +91,22 @@ Roughly dependency order; each line is independently testable.
       requested mass (inertia is linear in mass for a fixed shape).
 - [ ] **Bodies, remaining**: `add_force`/`add_torque` accumulation, torque
       impulses, per-body damping driven by areas, CCD flag.
-- [ ] **Queries**: `intersect_ray` first — it is what `RayCast` and most game
-      code hits — then `intersect_shape`, `cast_motion`, `rest_info`.
-- [ ] **`body_test_motion`**: the big one. This single method defines the feel of
-      `KinematicBody.move_and_slide()` — recovery, margin, safe/unsafe fractions.
-      Box3D's character mover is a different model and cannot be dropped in
-      behind this signature; it needs a shape cast plus a recovery loop written
-      to Godot's semantics.
+- [x] **Queries**: `intersect_ray`, `intersect_point`, `intersect_shape` and
+      `cast_motion` are live. `rest_info` and `collide_shape` still stubbed —
+      they need contact depth, which `b3World_OverlapShape` does not return.
+- [x] **`body_test_motion`**: done, and *not* via a shape cast. A cast is the
+      wrong tool for a character already standing on the ground — it reports
+      impact fraction 0 and the body never moves, which is exactly what the
+      first attempt did.
+      The working version uses Box3D's mover API: `b3World_CollideMover`
+      gathers every contact plane, and `b3SolvePlanes` resolves depenetration
+      and sliding together in one pass. That also handles inside corners, which
+      a one-normal-at-a-time slide gets wrong.
+      Capsule and sphere bodies take that path; anything else falls back to the
+      shape cast and gets a correct time of impact but no depenetration.
+      `body_test_ray_separation` shares the same plane-solver recovery.
+      Verified: a capsule falls onto a floor, rests at the geometrically correct
+      height, reports `is_on_floor()`, and walks at exactly the requested speed.
 - [ ] **Areas**: Box3D sensors give overlap. Godot also wants gravity
       point/vector override, space-override modes, damp overrides and ordered
       enter/exit callbacks — all backend-side logic.

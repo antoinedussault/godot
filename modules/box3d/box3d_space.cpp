@@ -15,7 +15,7 @@
 // overlap the shape's categoryBits. Shapes are attached with
 // categoryBits = the body's collision layer, so passing Godot's collision mask
 // straight through as maskBits gives Godot's behaviour.
-static b3QueryFilter b3_query_filter(uint32_t p_collision_mask) {
+b3QueryFilter b3_query_filter(uint32_t p_collision_mask) {
 	b3QueryFilter filter = b3DefaultQueryFilter();
 	filter.categoryBits = ~(uint64_t)0;
 	filter.maskBits = (uint64_t)p_collision_mask;
@@ -24,9 +24,9 @@ static b3QueryFilter b3_query_filter(uint32_t p_collision_mask) {
 
 // Resolves a hit shape back to the Godot side. Returns nullptr if the shape has
 // no Box3DBody behind it.
-static Box3DBody *b3_body_from_shape(b3ShapeId p_shape_id, int *r_shape_index) {
+Box3DBody *b3_body_from_shape(b3ShapeId p_shape_id, int *r_shape_index) {
 	b3BodyId body_id = b3Shape_GetBody(p_shape_id);
-    if (B3_IS_NULL(body_id)) {
+	if (B3_IS_NULL(body_id)) {
 		return nullptr;
 	}
 
@@ -47,20 +47,7 @@ static Box3DBody *b3_body_from_shape(b3ShapeId p_shape_id, int *r_shape_index) {
 	return body;
 }
 
-// Shared context for the closest-hit ray and shape casts.
-struct Box3DClosestHitContext {
-	const Set<RID> *exclude = nullptr;
-	bool collide_with_bodies = true;
-
-	bool hit = false;
-	float fraction = 1.0f;
-	Vector3 point;
-	Vector3 normal;
-	Box3DBody *body = nullptr;
-	int shape_index = 0;
-};
-
-static float b3_closest_hit_callback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
+float b3_closest_hit_callback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
 		uint64_t userMaterialId, int triangleIndex, int childIndex, void *context) {
 	Box3DClosestHitContext *ctx = static_cast<Box3DClosestHitContext *>(context);
 
@@ -358,7 +345,10 @@ void Box3DSpace::step(real_t p_delta) {
 	}
 
 	last_step_delta = p_delta;
+
+	locked = true;
 	b3World_Step(world_id, (float)p_delta, sub_step_count);
+	locked = false;
 
 	// Copy solver transforms back into the Godot-side bookkeeping. Static bodies
 	// are skipped: the engine is the authority on those, and reading them back

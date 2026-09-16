@@ -33,6 +33,26 @@ public:
 	virtual Vector3 get_closest_point_to_object_volume(RID p_object, const Vector3 p_point) const;
 };
 
+// Query plumbing shared with the PhysicsServer, which reuses it for
+// body_test_motion.
+b3QueryFilter b3_query_filter(uint32_t p_collision_mask);
+Box3DBody *b3_body_from_shape(b3ShapeId p_shape_id, int *r_shape_index);
+
+struct Box3DClosestHitContext {
+	const Set<RID> *exclude = nullptr;
+	bool collide_with_bodies = true;
+
+	bool hit = false;
+	float fraction = 1.0f;
+	Vector3 point;
+	Vector3 normal;
+	Box3DBody *body = nullptr;
+	int shape_index = 0;
+};
+
+float b3_closest_hit_callback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
+		uint64_t userMaterialId, int triangleIndex, int childIndex, void *context);
+
 // One physics world, wrapping a b3WorldId.
 class Box3DSpace : public RID_Data {
 public:
@@ -67,6 +87,12 @@ public:
 
 	// Reported to the force-integration callback as PhysicsDirectBodyState::get_step().
 	real_t last_step_delta = 0.0;
+
+	// True only while b3World_Step is running. Body state may be read at any
+	// other time -- including from _physics_process, which the engine runs
+	// between flush_queries() and step() (main.cpp:2262-2276). Guarding on
+	// "are we flushing queries" instead would wrongly reject that window.
+	bool locked = false;
 
 	int max_debug_contacts = 0;
 	Vector<Vector3> debug_contacts;

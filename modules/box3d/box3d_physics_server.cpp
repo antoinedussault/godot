@@ -4,6 +4,8 @@
 #include "core/error_macros.h"
 #include "core/project_settings.h"
 
+#include <float.h> // FLT_MAX, for fully rigid mover planes
+
 // Two distinct kinds of "not done":
 //
 //   B3_TODO         — planned, needs the Box3D solver underneath it.
@@ -1262,42 +1264,337 @@ bool Box3DPhysicsServer::body_is_ray_pickable(RID p_body) const {
 }
 
 PhysicsDirectBodyState *Box3DPhysicsServer::body_get_direct_state(RID p_body) {
-	ERR_FAIL_COND_V_MSG(!doing_sync, nullptr, "Body state is inaccessible right now, wait for iteration or physics process notification.");
-
+	if (!body_owner.owns(p_body)) {
+		return nullptr;
+	}
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL_V(body, nullptr);
+
+	Box3DSpace *space = space_owner.getornull(body->space);
+	if (!space) {
+		return nullptr;
+	}
+	ERR_FAIL_COND_V_MSG(space->locked, nullptr, "Body state is inaccessible right now, wait for iteration or physics process notification.");
 	ERR_FAIL_NULL_V(Box3DPhysicsDirectBodyState::singleton, nullptr);
 
 	Box3DPhysicsDirectBodyState::singleton->body = body;
 	return Box3DPhysicsDirectBodyState::singleton;
 }
 
-bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, const Vector3 &p_motion, bool p_infinite_inertia, MotionResult *r_result, bool p_exclude_raycast_shapes, const Set<RID> &p_exclude) {
-	// This one method defines the entire feel of KinematicBody.move_and_slide():
-	// depenetration recovery, the collision margin, and the safe/unsafe fraction
-	// split. Box3D's own character mover is a different model and cannot be
-	// dropped in behind this signature — the real implementation is a shape cast
-	// plus a recovery loop written against b3World, matching Godot's semantics
-	// rather than Box3D's.
-	//
-	// Reporting "no collision" keeps CellPlayerBody moving in a straight line
-	// (through geometry) instead of locking in place, which is the more
-	// debuggable failure while this is unimplemented.
-	B3_TODO("body_test_motion()");
+// Depenetration planes gathered by b3World_CollideMover.
+#define B3_MAX_MOVER_PLANES 32
 
+struct Box3DMoverPlaneContext {
+	const Set<RID> *exclude = nullptr;
+	b3CollisionPlane planes[B3_MAX_MOVER_PLANES];
+	// Parallel to `planes`, so the winning plane can name what was touched.
+	Box3DBody *plane_bodies[B3_MAX_MOVER_PLANES];
+	Vector3 plane_points[B3_MAX_MOVER_PLANES];
+	int plane_shapes[B3_MAX_MOVER_PLANES];
+	int count = 0;
+};
+
+static bool b3_mover_plane_callback(b3ShapeId shapeId, const b3PlaneResult *planes, int planeCount, void *context) {
+	Box3DMoverPlaneContext *ctx = static_cast<Box3DMoverPlaneContext *>(context);
+
+	int shape_index = 0;
+	Box3DBody *body = b3_body_from_shape(shapeId, &shape_index);
+	if (!body) {
+		return true;
+	}
+	if (ctx->exclude && ctx->exclude->has(body->self)) {
+		return true;
+	}
+
+	for (int i = 0; i < planeCount && ctx->count < B3_MAX_MOVER_PLANES; i++) {
+		ctx->plane_bodies[ctx->count] = body;
+		ctx->plane_points[ctx->count] = b3_to_godot(planes[i].point);
+		ctx->plane_shapes[ctx->count] = shape_index;
+
+		b3CollisionPlane &cp = ctx->planes[ctx->count++];
+		cp.plane = planes[i].plane;
+		// FLT_MAX makes the plane fully rigid. A character standing on terrain
+		// must not be allowed to sink into it, so no softness here.
+		cp.pushLimit = FLT_MAX;
+		cp.push = 0.0f;
+		cp.clipVelocity = true;
+	}
+	return true;
+}
+
+// Builds the mover capsule for a body, in world space, if the body is shaped
+// like a character: exactly one enabled capsule or sphere. Returns false
+// otherwise, which costs the body its depenetration but not its motion test.
+static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *p_server, const Transform &p_from, b3Capsule *r_capsule) {
+	int found = -1;
+	for (int i = 0; i < p_body->shapes.size(); i++) {
+		if (p_body->shapes[i].disabled) {
+			continue;
+		}
+		if (found >= 0) {
+			return false; // more than one shape
+		}
+		found = i;
+	}
+	if (found < 0) {
+		return false;
+	}
+
+	Box3DShape *shape = p_server->get_shape(p_body->shapes[found].shape);
+	if (!shape) {
+		return false;
+	}
+
+	const Transform xf = p_from * p_body->shapes[found].xform;
+
+	if (shape->type == PhysicsServer::SHAPE_CAPSULE) {
+		Dictionary d = shape->data;
+		if (!d.has("radius") || !d.has("height")) {
+			return false;
+		}
+		const real_t radius = d["radius"];
+		const real_t height = d["height"];
+		// Godot's capsule is Z-aligned, its height excluding the caps.
+		r_capsule->center1 = b3_from_godot(xf.xform(Vector3(0, 0, height * 0.5)));
+		r_capsule->center2 = b3_from_godot(xf.xform(Vector3(0, 0, -height * 0.5)));
+		r_capsule->radius = (float)radius;
+		return true;
+	}
+
+	if (shape->type == PhysicsServer::SHAPE_SPHERE) {
+		// A sphere is a capsule with coincident endpoints.
+		const b3Vec3 c = b3_from_godot(xf.origin);
+		r_capsule->center1 = c;
+		r_capsule->center2 = c;
+		r_capsule->radius = (float)(real_t)shape->data;
+		return true;
+	}
+
+	return false;
+}
+
+bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, const Vector3 &p_motion, bool p_infinite_inertia, MotionResult *r_result, bool p_exclude_raycast_shapes, const Set<RID> &p_exclude) {
+	// This is what gives KinematicBody.move_and_slide() its behaviour. Godot
+	// performs the sliding itself; what it needs back is how far the body may
+	// travel, what it would touch, and the surface normal to slide along.
+	//
+	// Two stages:
+	//   1. Depenetration. Box3D's mover planes (b3World_CollideMover) plus
+	//      b3SolvePlanes resolve any existing overlap. Without this a character
+	//      that ends a frame slightly inside the ground stays stuck there,
+	//      because a shape cast treats initial overlap as a miss.
+	//   2. A shape cast along the motion for the time of impact and normal.
+	//
+	// Stage 1 is capsule-only because that is what Box3D's mover API accepts;
+	// other shapes still get stage 2.
 	if (r_result) {
 		r_result->motion = p_motion;
 		r_result->remainder = Vector3();
 		r_result->collision_depth = 0;
-		r_result->collision_safe_fraction = 1.0;
-		r_result->collision_unsafe_fraction = 1.0;
+		r_result->collision_safe_fraction = 0;
+		r_result->collision_unsafe_fraction = 0;
 	}
-	return false;
+
+	Box3DBody *body = body_owner.getornull(p_body);
+	ERR_FAIL_NULL_V(body, false);
+
+	Box3DSpace *space = space_owner.getornull(body->space);
+	if (!space || B3_IS_NULL(space->world_id)) {
+		return false;
+	}
+
+	// A body must never collide with itself, and Godot's collision exceptions
+	// apply here just as they do during simulation.
+	Set<RID> exclude = p_exclude;
+	exclude.insert(p_body);
+	for (Set<RID>::Element *E = body->collision_exceptions.front(); E; E = E->next()) {
+		exclude.insert(E->get());
+	}
+
+	const b3QueryFilter filter = b3_query_filter(body->collision_mask);
+	const b3Pos world_origin = b3_pos_from_godot(Vector3());
+
+	// --- Character path: Box3D's own plane solver -------------------------
+	//
+	// A shape cast is the wrong tool for a character already standing on the
+	// ground: it reports impact fraction 0 and the body never moves. Box3D's
+	// mover API exists for exactly this. b3SolvePlanes takes the desired
+	// translation and every contact plane at once and returns the translation
+	// that satisfies all of them -- depenetration and sliding resolved together,
+	// which also handles inside corners that a one-normal-at-a-time slide gets
+	// wrong.
+	//
+	// Capsule and sphere bodies only, because that is what Box3D's mover accepts.
+	b3Capsule mover;
+	if (b3_build_mover_capsule(body, this, p_from, &mover)) {
+		Box3DMoverPlaneContext pctx;
+		pctx.exclude = &exclude;
+		b3World_CollideMover(space->world_id, world_origin, &mover, filter, b3_mover_plane_callback, &pctx);
+
+		if (pctx.count == 0) {
+			return false; // nothing touching; the whole motion is free
+		}
+
+		b3PlaneSolverResult solved = b3SolvePlanes(b3_from_godot(p_motion), pctx.planes, pctx.count);
+		const Vector3 delta = b3_to_godot(solved.delta);
+
+		// The contact that actually restrained the move is the one the solver
+		// pushed hardest against.
+		int best_plane = -1;
+		float best_push = 0.0f;
+		for (int i = 0; i < pctx.count; i++) {
+			if (pctx.planes[i].push > best_push) {
+				best_push = pctx.planes[i].push;
+				best_plane = i;
+			}
+		}
+
+		const bool blocked = !delta.is_equal_approx(p_motion);
+		if (!blocked && best_plane < 0) {
+			return false;
+		}
+
+		if (r_result) {
+			r_result->motion = delta;
+			r_result->remainder = p_motion - delta;
+
+			const real_t len = p_motion.length();
+			const real_t safe = len > CMP_EPSILON ? CLAMP(delta.length() / len, (real_t)0.0, (real_t)1.0) : (real_t)1.0;
+			r_result->collision_safe_fraction = safe;
+			r_result->collision_unsafe_fraction = safe;
+
+			if (best_plane >= 0) {
+				Vector3 normal = b3_to_godot(pctx.planes[best_plane].plane.normal);
+				if (normal.length_squared() > CMP_EPSILON) {
+					normal.normalize();
+				} else {
+					normal = Vector3(0, 1, 0);
+				}
+
+				// Box3D's plane normals point outward from the shape the mover rests
+				// on, which is already the surface normal Godot wants for
+				// is_on_floor() / is_on_wall().
+				r_result->collision_normal = normal;
+				r_result->collision_point = pctx.plane_points[best_plane];
+				r_result->collision_depth = pctx.planes[best_plane].push;
+
+				Box3DBody *other = pctx.plane_bodies[best_plane];
+				if (other) {
+					r_result->collider = other->self;
+					r_result->collider_id = other->instance_id;
+					r_result->collider_shape = pctx.plane_shapes[best_plane];
+					r_result->collider_velocity = other->linear_velocity;
+				}
+			}
+			r_result->collision_local_shape = 0;
+		}
+		return true;
+	}
+
+	// --- Generic path: shape cast -----------------------------------------
+	//
+	// Non-capsule bodies get no depenetration, because Box3D's plane gathering is
+	// capsule-only. They still get a correct time of impact.
+	Box3DClosestHitContext best;
+	best.fraction = 1.0f;
+
+	for (int i = 0; i < body->shapes.size(); i++) {
+		if (body->shapes[i].disabled) {
+			continue;
+		}
+		Box3DShape *shape = shape_owner.getornull(body->shapes[i].shape);
+		if (!shape) {
+			continue;
+		}
+		if (p_exclude_raycast_shapes && shape->type == SHAPE_RAY) {
+			continue;
+		}
+
+		Vector<b3Vec3> points;
+		b3ShapeProxy proxy;
+		if (!shape->build_proxy(points, p_from * body->shapes[i].xform, &proxy)) {
+			continue; // concave/heightmap/plane cannot be cast, only cast against
+		}
+
+		Box3DClosestHitContext ctx;
+		ctx.exclude = &exclude;
+		b3World_CastShape(space->world_id, world_origin, &proxy, b3_from_godot(p_motion),
+				filter, b3_closest_hit_callback, &ctx);
+
+		if (ctx.hit && ctx.fraction <= best.fraction) {
+			best = ctx;
+			best.shape_index = i;
+		}
+	}
+
+	if (!best.hit || !best.body) {
+		return false;
+	}
+
+	if (r_result) {
+		const real_t safe = (real_t)best.fraction;
+		r_result->motion = p_motion * safe;
+		r_result->remainder = p_motion - r_result->motion;
+		r_result->collision_safe_fraction = safe;
+		r_result->collision_unsafe_fraction = safe;
+
+		// Box3D can hand back a degenerate normal when the cast starts already
+		// touching. Godot asserts on a non-unit normal (vector3.h:442).
+		Vector3 normal = best.normal;
+		if (normal.length_squared() > CMP_EPSILON) {
+			normal.normalize();
+		} else {
+			normal = p_motion.length_squared() > CMP_EPSILON ? -p_motion.normalized() : Vector3(0, 1, 0);
+		}
+
+		r_result->collision_point = best.point;
+		r_result->collision_normal = normal;
+		r_result->collision_local_shape = best.shape_index;
+		r_result->collider = best.body->self;
+		r_result->collider_id = best.body->instance_id;
+		r_result->collider_shape = best.shape_index;
+		r_result->collider_velocity = best.body->linear_velocity;
+	}
+	return true;
 }
 
 int Box3DPhysicsServer::body_test_ray_separation(RID p_body, const Transform &p_transform, bool p_infinite_inertia, Vector3 &r_recover_motion, SeparationResult *r_results, int p_result_max, float p_margin) {
-	B3_TODO("body_test_ray_separation()");
+	// move_and_slide() calls this to unstick a body before moving it (and for
+	// snap-to-floor). The separation results feed RayShape handling, which Box3D
+	// has no equivalent for, but the recover motion is exactly the mover-plane
+	// depenetration used by body_test_motion -- so that part is real.
 	r_recover_motion = Vector3();
+
+	Box3DBody *body = body_owner.getornull(p_body);
+	ERR_FAIL_NULL_V(body, 0);
+
+	Box3DSpace *space = space_owner.getornull(body->space);
+	if (!space || B3_IS_NULL(space->world_id)) {
+		return 0;
+	}
+
+	b3Capsule mover;
+	if (!b3_build_mover_capsule(body, this, p_transform, &mover)) {
+		return 0;
+	}
+
+	Set<RID> exclude;
+	exclude.insert(p_body);
+	for (Set<RID>::Element *E = body->collision_exceptions.front(); E; E = E->next()) {
+		exclude.insert(E->get());
+	}
+
+	Box3DMoverPlaneContext pctx;
+	pctx.exclude = &exclude;
+	b3World_CollideMover(space->world_id, b3_pos_from_godot(Vector3()), &mover,
+			b3_query_filter(body->collision_mask), b3_mover_plane_callback, &pctx);
+
+	if (pctx.count > 0) {
+		b3Vec3 zero = { 0.0f, 0.0f, 0.0f };
+		r_recover_motion = b3_to_godot(b3SolvePlanes(zero, pctx.planes, pctx.count).delta);
+	}
+
+	// No RayShape support, so no separation results to report.
 	return 0;
 }
 
@@ -1532,11 +1829,11 @@ void Box3DPhysicsServer::free(RID p_rid) {
 void Box3DPhysicsServer::init() {
 	Box3DPhysicsDirectBodyState::init_singleton();
 
-	WARN_PRINT("Box3D physics backend is partially implemented: rigid bodies simulate "
-			   "(sphere/box/capsule/cylinder/convex shapes), but scene queries, "
-			   "areas, joints, trimesh/heightmap shapes and KinematicBody motion "
-			   "are not wired up yet. Set physics/3d/physics_engine back to "
-			   "\"DEFAULT\" for a fully working world.");
+	WARN_PRINT("Box3D physics backend is partially implemented. Working: rigid bodies, "
+			   "KinematicBody movement, height fields, and ray/shape/point queries. "
+			   "Not wired up: Areas (so no Area signals or gravity overrides), joints, "
+			   "trimesh shapes, contact reporting, and RayShape. Set "
+			   "physics/3d/physics_engine back to \"DEFAULT\" for a fully working world.");
 }
 
 void Box3DPhysicsServer::step(float p_delta) {
