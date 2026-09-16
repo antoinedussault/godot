@@ -2,6 +2,7 @@
 #include "box3d_types_converter.h"
 
 #include "core/error_macros.h"
+#include "core/os/os.h"
 #include "core/project_settings.h"
 
 #include <float.h> // FLT_MAX, for fully rigid mover planes
@@ -1453,6 +1454,16 @@ static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *
 	return false;
 }
 
+// Set BOX3D_DEBUG_MOTION=1 to trace every character motion test. Off by default
+// so it costs one already-cached bool in the hot path.
+static bool b3_debug_motion() {
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = OS::get_singleton()->get_environment("BOX3D_DEBUG_MOTION") == "1" ? 1 : 0;
+	}
+	return enabled == 1;
+}
+
 bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, const Vector3 &p_motion, bool p_infinite_inertia, MotionResult *r_result, bool p_exclude_raycast_shapes, const Set<RID> &p_exclude) {
 	// This is what gives KinematicBody.move_and_slide() its behaviour. Godot
 	// performs the sliding itself; what it needs back is how far the body may
@@ -1494,168 +1505,124 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 	const b3QueryFilter filter = b3_query_filter(body->collision_mask);
 	const b3Pos world_origin = b3_pos_from_godot(Vector3());
 
-	// --- Character path: Box3D's own plane solver -------------------------
+	// --- Character path ---------------------------------------------------
 	//
-	// A shape cast is the wrong tool for a character already standing on the
-	// ground: it reports impact fraction 0 and the body never moves. Box3D's
-	// mover API exists for exactly this. b3SolvePlanes takes the desired
-	// translation and every contact plane at once and returns the translation
-	// that satisfies all of them.
+	// body_test_motion's contract is "move until first contact, then STOP". It
+	// must NOT slide: move_and_slide() does that itself by re-calling with the
+	// remainder projected along the normal returned here.
 	//
-	// It MUST be iterated. b3SolvePlanes answers "what move satisfies the planes
-	// as measured HERE", so solving once against the starting position leaves the
-	// answer stale by the time the body arrives -- on a slope the capsule sinks
-	// in one frame and is shoved out the next, which reads as a hard vertical
-	// jitter even though the reported velocity stays perfectly steady. Re-gathering
-	// planes at each intermediate position converges instead.
+	// Solving contact planes against the full motion slides instead of sweeping,
+	// and that is fatal for the downward probe move_and_slide_with_snap() sends
+	// every frame: asked to move (0, -0.8, 0) on a slope, a plane solve projects
+	// that onto the slope and answers with DOWN-SLOPE travel -- horizontal motion
+	// the caller never asked for. Godot applies it verbatim, so the character
+	// teleports downhill a little every frame until it loses the floor.
 	//
-	// Capsule and sphere bodies only, because that is what Box3D's mover accepts.
+	// So: use the plane solver only to push out of existing penetration (target
+	// delta zero -- no sliding), then sweep.
 	b3Capsule mover;
 	if (b3_build_mover_capsule(body, this, p_from, &mover)) {
-		const int MAX_SOLVER_ITERATIONS = 4;
-
-		Transform current = p_from;
-		Vector3 remaining = p_motion;
-		Vector3 total;
-
-		bool touched = false;
-		Vector3 hit_normal;
-		Vector3 hit_point;
-		real_t hit_depth = 0;
-		Box3DBody *hit_body = nullptr;
-		int hit_shape = 0;
-
-		for (int iter = 0; iter < MAX_SOLVER_ITERATIONS; iter++) {
-			b3Capsule step_mover;
-			if (!b3_build_mover_capsule(body, this, current, &step_mover)) {
-				break;
-			}
-
+		// 1. Depenetration.
+		Vector3 recover;
+		{
 			Box3DMoverPlaneContext pctx;
 			pctx.exclude = &exclude;
-			b3World_CollideMover(space->world_id, world_origin, &step_mover, filter,
+			b3World_CollideMover(space->world_id, world_origin, &mover, filter,
 					b3_mover_plane_callback, &pctx);
-
-			if (pctx.count == 0) {
-				// Nothing in contact. Resolving planes alone would report the whole
-				// motion as free, which is wrong whenever the move would RUN INTO
-				// something -- and that is the normal case for the downward probe
-				// move_and_slide_with_snap() uses to stick to the ground. A
-				// character cresting or descending a slope leaves the surface for a
-				// frame, so with no sweep there is nothing to snap to: the body
-				// floats, falls, and re-lands, which reads as jitter on descent and
-				// leaves stop_on_slope with no floor contact to act on.
-				//
-				// So sweep the capsule along what is left of the motion and stop at
-				// first contact; the next iteration gathers planes there and slides.
-				const float fraction = b3World_CastMover(space->world_id, world_origin, &step_mover,
-						b3_from_godot(remaining), filter, b3_mover_filter_callback, &exclude);
-
-				if (fraction >= 1.0f) {
-					// Genuinely unobstructed.
-					total += remaining;
-					remaining = Vector3();
-					break;
-				}
-
-				const Vector3 step = remaining * (real_t)fraction;
-				total += step;
-				remaining -= step;
-				current.origin += step;
-				touched = true;
-				continue;
+			if (pctx.count > 0) {
+				b3Vec3 zero = { 0.0f, 0.0f, 0.0f };
+				recover = b3_to_godot(b3SolvePlanes(zero, pctx.planes, pctx.count).delta);
 			}
+		}
 
-			touched = true;
+		const Transform from(p_from.basis, p_from.origin + recover);
 
-			b3PlaneSolverResult solved = b3SolvePlanes(b3_from_godot(remaining), pctx.planes, pctx.count);
-			const Vector3 delta = b3_to_godot(solved.delta);
+		b3Capsule swept;
+		if (!b3_build_mover_capsule(body, this, from, &swept)) {
+			return false;
+		}
 
-			total += delta;
-			remaining -= delta;
-			current.origin += delta;
+		// 2. Sweep to first contact.
+		const float fraction = b3World_CastMover(space->world_id, world_origin, &swept,
+				b3_from_godot(p_motion), filter, b3_mover_filter_callback, &exclude);
+		const real_t travel_fraction = CLAMP((real_t)fraction, (real_t)0.0, (real_t)1.0);
+		const Vector3 travel = p_motion * travel_fraction;
 
-			// Pick the contact to report to Godot, which slides the body's velocity
-			// along this normal and classifies floor vs wall from it.
-			//
-			// NOT by largest push: once a character is resting, no plane needs any
-			// push, every push is 0, and a push-based pick finds nothing -- leaving
-			// the normal to fall back to straight up. Godot then strips the whole
-			// vertical velocity on those frames and only the slope-normal component
-			// on the others, which alternates frame to frame and is exactly what
-			// reads as jitter on a slope.
-			//
-			// Score by opposition to the intended motion instead: the surface
-			// actually standing in the way. That is stable from frame to frame
-			// because it depends on geometry, not on whether a correction happened
-			// to be needed this step.
-			int best_plane = -1;
-			{
-				const Vector3 dir = remaining.length_squared() > CMP_EPSILON ? remaining.normalized() : Vector3();
-				real_t best_score = -1e20;
+		const bool swept_into_something = travel_fraction < 1.0;
+		const bool recovered = !recover.is_equal_approx(Vector3());
+		if (!swept_into_something && !recovered) {
+			return false;
+		}
+
+		// 3. The contact normal, measured where the sweep stopped, so
+		// move_and_slide() slides along the surface actually hit.
+		Vector3 normal;
+		Vector3 point;
+		real_t depth = 0;
+		Box3DBody *other = nullptr;
+		int other_shape = 0;
+		{
+			const Transform at(from.basis, from.origin + travel);
+			b3Capsule contact_mover;
+			if (b3_build_mover_capsule(body, this, at, &contact_mover)) {
+				Box3DMoverPlaneContext pctx;
+				pctx.exclude = &exclude;
+				b3World_CollideMover(space->world_id, world_origin, &contact_mover, filter,
+						b3_mover_plane_callback, &pctx);
+
+				const Vector3 dir = p_motion.length_squared() > CMP_EPSILON ? p_motion.normalized() : Vector3();
+				real_t best = -1e20;
+				int best_plane = -1;
 				for (int i = 0; i < pctx.count; i++) {
 					const Vector3 n = b3_to_godot(pctx.planes[i].plane.normal);
 					if (n.length_squared() <= CMP_EPSILON) {
 						continue;
 					}
-					// With no motion left to oppose, prefer the most floor-like
-					// contact so a standing character still reports its ground.
+					// Prefer whatever stands in the way of the requested motion;
+					// with no motion, the most floor-like contact.
 					const real_t score = dir == Vector3() ? n.normalized().y : -n.normalized().dot(dir);
-					if (score > best_score) {
-						best_score = score;
+					if (score > best) {
+						best = score;
 						best_plane = i;
 					}
 				}
-			}
-			if (best_plane >= 0) {
-				hit_normal = b3_to_godot(pctx.planes[best_plane].plane.normal);
-				hit_point = pctx.plane_points[best_plane];
-				hit_depth = pctx.planes[best_plane].push;
-				hit_body = pctx.plane_bodies[best_plane];
-				hit_shape = pctx.plane_shapes[best_plane];
-			}
-
-			// Converged: either the move is spent or the solver stopped making
-			// progress. Iterating further would only add noise.
-			if (remaining.length_squared() <= CMP_EPSILON || delta.length_squared() <= CMP_EPSILON) {
-				break;
+				if (best_plane >= 0) {
+					normal = b3_to_godot(pctx.planes[best_plane].plane.normal).normalized();
+					point = pctx.plane_points[best_plane];
+					depth = pctx.planes[best_plane].push;
+					other = pctx.plane_bodies[best_plane];
+					other_shape = pctx.plane_shapes[best_plane];
+				}
 			}
 		}
 
-		if (!touched) {
-			return false;
+		if (normal.length_squared() <= CMP_EPSILON) {
+			normal = p_motion.length_squared() > CMP_EPSILON ? -p_motion.normalized() : Vector3(0, 1, 0);
 		}
 
 		if (r_result) {
-			r_result->motion = total;
-			r_result->remainder = p_motion - total;
-
-			const real_t len = p_motion.length();
-			const real_t safe = len > CMP_EPSILON ? CLAMP(total.length() / len, (real_t)0.0, (real_t)1.0) : (real_t)1.0;
-			r_result->collision_safe_fraction = safe;
-			r_result->collision_unsafe_fraction = safe;
-
-			Vector3 normal = hit_normal;
-			if (normal.length_squared() > CMP_EPSILON) {
-				normal.normalize();
-			} else {
-				normal = Vector3(0, 1, 0);
-			}
-
-			// Box3D's plane normals point outward from the shape the mover rests
-			// on, which is already the surface normal Godot wants for
-			// is_on_floor() / is_on_wall().
+			r_result->motion = recover + travel;
+			r_result->remainder = p_motion - travel;
+			r_result->collision_safe_fraction = travel_fraction;
+			r_result->collision_unsafe_fraction = travel_fraction;
 			r_result->collision_normal = normal;
-			r_result->collision_point = hit_point;
-			r_result->collision_depth = hit_depth;
+			r_result->collision_point = point;
+			r_result->collision_depth = depth;
 			r_result->collision_local_shape = 0;
-
-			if (hit_body) {
-				r_result->collider = hit_body->self;
-				r_result->collider_id = hit_body->instance_id;
-				r_result->collider_shape = hit_shape;
-				r_result->collider_velocity = hit_body->linear_velocity;
+			if (other) {
+				r_result->collider = other->self;
+				r_result->collider_id = other->instance_id;
+				r_result->collider_shape = other_shape;
+				r_result->collider_velocity = other->linear_velocity;
 			}
+		}
+
+		if (b3_debug_motion()) {
+			print_line(String("B3MOVE motion=") + String(Variant(p_motion)) +
+					" recover=" + String(Variant(recover)) +
+					" travel=" + String(Variant(travel)) +
+					" frac=" + rtos(travel_fraction) +
+					" n=" + String(Variant(normal)));
 		}
 		return true;
 	}
