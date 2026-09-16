@@ -1543,14 +1543,36 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 			remaining -= delta;
 			current.origin += delta;
 
-			// The contact that actually restrained this step is the one the solver
-			// pushed hardest against.
+			// Pick the contact to report to Godot, which slides the body's velocity
+			// along this normal and classifies floor vs wall from it.
+			//
+			// NOT by largest push: once a character is resting, no plane needs any
+			// push, every push is 0, and a push-based pick finds nothing -- leaving
+			// the normal to fall back to straight up. Godot then strips the whole
+			// vertical velocity on those frames and only the slope-normal component
+			// on the others, which alternates frame to frame and is exactly what
+			// reads as jitter on a slope.
+			//
+			// Score by opposition to the intended motion instead: the surface
+			// actually standing in the way. That is stable from frame to frame
+			// because it depends on geometry, not on whether a correction happened
+			// to be needed this step.
 			int best_plane = -1;
-			float best_push = 0.0f;
-			for (int i = 0; i < pctx.count; i++) {
-				if (pctx.planes[i].push > best_push) {
-					best_push = pctx.planes[i].push;
-					best_plane = i;
+			{
+				const Vector3 dir = remaining.length_squared() > CMP_EPSILON ? remaining.normalized() : Vector3();
+				real_t best_score = -1e20;
+				for (int i = 0; i < pctx.count; i++) {
+					const Vector3 n = b3_to_godot(pctx.planes[i].plane.normal);
+					if (n.length_squared() <= CMP_EPSILON) {
+						continue;
+					}
+					// With no motion left to oppose, prefer the most floor-like
+					// contact so a standing character still reports its ground.
+					const real_t score = dir == Vector3() ? n.normalized().y : -n.normalized().dot(dir);
+					if (score > best_score) {
+						best_score = score;
+						best_plane = i;
+					}
 				}
 			}
 			if (best_plane >= 0) {
