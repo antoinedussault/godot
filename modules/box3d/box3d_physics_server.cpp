@@ -66,8 +66,9 @@ void Box3DPhysicsServer::_body_enter_world(Box3DBody *p_body, Box3DSpace *p_spac
 
 	b3BodyDef def = b3DefaultBodyDef();
 	def.type = b3_body_type_from_godot(p_body->mode);
-	def.position = b3_pos_from_godot(p_body->transform.origin);
-	def.rotation = b3_quat_from_godot(p_body->transform.basis.get_rotation_quat());
+	const Transform solver_xf = p_body->get_solver_transform();
+	def.position = b3_pos_from_godot(solver_xf.origin);
+	def.rotation = b3_quat_from_godot(solver_xf.basis.get_rotation_quat());
 	def.linearVelocity = b3_from_godot(p_body->linear_velocity);
 	def.angularVelocity = b3_from_godot(p_body->angular_velocity);
 	def.gravityScale = (float)p_body->gravity_scale;
@@ -118,6 +119,24 @@ void Box3DPhysicsServer::_body_exit_world(Box3DBody *p_body) {
 
 	for (int i = 0; i < p_body->shapes.size(); i++) {
 		p_body->shapes.write[i].shape_id = b3_nullShapeId;
+		p_body->shapes.write[i].free_owned_geometry();
+	}
+}
+
+void Box3DPhysicsServer::_body_update_filters(Box3DBody *p_body) {
+	if (!p_body->in_world()) {
+		return;
+	}
+
+	b3Filter filter;
+	filter.categoryBits = p_body->collision_layer;
+	filter.maskBits = p_body->collision_mask;
+	filter.groupIndex = 0;
+
+	for (int i = 0; i < p_body->shapes.size(); i++) {
+		if (!B3_IS_NULL(p_body->shapes[i].shape_id)) {
+			b3Shape_SetFilter(p_body->shapes[i].shape_id, filter, true);
+		}
 	}
 }
 
@@ -133,7 +152,8 @@ void Box3DPhysicsServer::_body_sync_transform(Box3DBody *p_body) {
 
 void Box3DPhysicsServer::_body_update_shape_origin_offset(Box3DBody *p_body) {
 	p_body->has_shape_origin_offset = false;
-	p_body->shape_origin_offset = Transform();
+	p_body->shape_origin_local = Transform();
+	p_body->shape_corner_offset = Vector3();
 
 	int heightmap_index = -1;
 	bool has_other_shapes = false;
@@ -177,14 +197,23 @@ void Box3DPhysicsServer::_body_update_shape_origin_offset(Box3DBody *p_body) {
 		return;
 	}
 
-	// Godot centers the field on the shape's origin and spans (width-1) by
-	// (depth-1) at one unit per grid step; Box3D runs from its origin in +X/+Z.
-	// Shifting the body back by half the extent lines the two up.
-	Transform offset = p_body->shapes[heightmap_index].xform;
-	offset.origin += offset.basis.xform(Vector3(-(width - 1) * 0.5, 0, -(depth - 1) * 0.5));
+	// Scale lives in the body basis in Godot, and is baked into the shape for
+	// Box3D, so the offset has to be computed in the same baked frame.
+	Transform scale_xf;
+	scale_xf.basis.scale(p_body->transform.basis.get_scale());
+	const Transform local = scale_xf * p_body->shapes[heightmap_index].xform;
+	const Vector3 scale = local.basis.get_scale();
 
+	// Godot centers the field on the shape origin and spans (width-1) by
+	// (depth-1) grid steps; Box3D runs from its origin in +X/+Z. The step size is
+	// the scale, so the shift is half the SCALED extent -- using grid units here
+	// would misplace any terrain whose spacing is not exactly 1.
 	p_body->has_shape_origin_offset = true;
-	p_body->shape_origin_offset = offset;
+	p_body->shape_origin_local = local;
+	p_body->shape_corner_offset = Vector3(
+			-(real_t)(width - 1) * scale.x * 0.5,
+			0,
+			-(real_t)(depth - 1) * scale.z * 0.5);
 }
 
 void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
@@ -193,6 +222,15 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 		return;
 	}
 
+	// Godot keeps scale in the body's basis; Box3D bodies are rigid. Bake the
+	// body scale into each shape's local transform so nothing is lost, and give
+	// the solver body the rotation-only transform (get_solver_transform()).
+	const Vector3 body_scale = p_body->transform.basis.get_scale();
+	p_body->baked_scale = body_scale;
+
+	Transform scale_xf;
+	scale_xf.basis.scale(body_scale);
+
 	for (int i = 0; i < p_body->shapes.size(); i++) {
 		Box3DShapeEntry &entry = p_body->shapes.write[i];
 
@@ -200,6 +238,8 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 			b3DestroyShape(entry.shape_id, false);
 			entry.shape_id = b3_nullShapeId;
 		}
+		// Free after the shape referencing it is gone, never before.
+		entry.free_owned_geometry();
 		if (entry.disabled) {
 			continue;
 		}
@@ -218,7 +258,7 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 		// Mass is recomputed once, after every shape is attached.
 		def.updateBodyMass = false;
 
-		entry.shape_id = shape->attach(p_body->body_id, &def, entry.xform);
+		entry.shape_id = shape->attach(p_body->body_id, &def, scale_xf * entry.xform, &entry);
 	}
 
 	// The offset depends on which shapes are attached, so it is recomputed here
@@ -290,7 +330,6 @@ void Box3DPhysicsServer::shape_set_data(RID p_shape, const Variant &p_data) {
 	// blob is freed — otherwise rebuilding one body leaves another holding a
 	// dangling pointer into freed height data.
 	if (shape->owners.empty()) {
-		shape->free_geometry();
 		return;
 	}
 
@@ -300,14 +339,16 @@ void Box3DPhysicsServer::shape_set_data(RID p_shape, const Variant &p_data) {
 			continue;
 		}
 		for (int i = 0; i < body->shapes.size(); i++) {
-			if (body->shapes[i].shape == p_shape && !B3_IS_NULL(body->shapes[i].shape_id)) {
+			if (body->shapes[i].shape != p_shape) {
+				continue;
+			}
+			if (!B3_IS_NULL(body->shapes[i].shape_id)) {
 				b3DestroyShape(body->shapes[i].shape_id, false);
 				body->shapes.write[i].shape_id = b3_nullShapeId;
 			}
+		body->shapes.write[i].free_owned_geometry();
 		}
 	}
-
-	shape->free_geometry();
 
 	for (Set<RID>::Element *E = shape->owners.front(); E; E = E->next()) {
 		if (Box3DBody *body = body_owner.getornull(E->get())) {
@@ -866,6 +907,7 @@ void Box3DPhysicsServer::body_remove_shape(RID p_body, int p_shape_idx) {
 	if (body->in_world() && !B3_IS_NULL(body->shapes[p_shape_idx].shape_id)) {
 		b3DestroyShape(body->shapes[p_shape_idx].shape_id, false);
 	}
+		body->shapes.write[p_shape_idx].free_owned_geometry();
 
 	const RID removed = body->shapes[p_shape_idx].shape;
 	body->shapes.remove(p_shape_idx);
@@ -897,6 +939,7 @@ void Box3DPhysicsServer::body_clear_shapes(RID p_body) {
 		if (body->in_world() && !B3_IS_NULL(body->shapes[i].shape_id)) {
 			b3DestroyShape(body->shapes[i].shape_id, false);
 		}
+		body->shapes.write[i].free_owned_geometry();
 		if (Box3DShape *shape = shape_owner.getornull(body->shapes[i].shape)) {
 			shape->owners.erase(p_body);
 		}
@@ -936,6 +979,11 @@ void Box3DPhysicsServer::body_set_collision_layer(RID p_body, uint32_t p_layer) 
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->collision_layer = p_layer;
+	// Godot sets layer and mask independently of the shape list, and usually
+	// after the shapes already exist. Without this the solver keeps the filter
+	// captured at attach time -- which for a default-constructed body is layer 1,
+	// so anything on another layer silently stops colliding.
+	_body_update_filters(body);
 }
 
 uint32_t Box3DPhysicsServer::body_get_collision_layer(RID p_body) const {
@@ -948,6 +996,7 @@ void Box3DPhysicsServer::body_set_collision_mask(RID p_body, uint32_t p_mask) {
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->collision_mask = p_mask;
+	_body_update_filters(body);
 }
 
 uint32_t Box3DPhysicsServer::body_get_collision_mask(RID p_body) const {
@@ -1037,7 +1086,17 @@ void Box3DPhysicsServer::body_set_state(RID p_body, BodyState p_state, const Var
 	switch (p_state) {
 		case BODY_STATE_TRANSFORM: {
 			body->transform = p_variant;
-			_body_sync_transform(body);
+
+			// Scale is baked into the shapes, not carried by the solver body, so a
+			// change to it invalidates them. Rebuilding only when the scale
+			// actually moved keeps ordinary movement cheap -- this runs on every
+			// moved body, every frame.
+			const Vector3 new_scale = body->transform.basis.get_scale();
+			if (!new_scale.is_equal_approx(body->baked_scale)) {
+				_body_rebuild_shapes(body); // also re-syncs the transform
+			} else {
+				_body_sync_transform(body);
+			}
 		} break;
 		case BODY_STATE_LINEAR_VELOCITY: {
 			body->linear_velocity = p_variant;
@@ -1326,48 +1385,44 @@ static bool b3_mover_plane_callback(b3ShapeId shapeId, const b3PlaneResult *plan
 // like a character: exactly one enabled capsule or sphere. Returns false
 // otherwise, which costs the body its depenetration but not its motion test.
 static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *p_server, const Transform &p_from, b3Capsule *r_capsule) {
-	int found = -1;
+	// Use the first enabled capsule or sphere. A character rig often carries extra
+	// shapes (a hitbox, a crouch volume); requiring exactly one would drop such a
+	// body onto the shape-cast path, where standing on the ground reports impact
+	// fraction 0 and the character cannot move at all.
 	for (int i = 0; i < p_body->shapes.size(); i++) {
 		if (p_body->shapes[i].disabled) {
 			continue;
 		}
-		if (found >= 0) {
-			return false; // more than one shape
+
+		Box3DShape *shape = p_server->get_shape(p_body->shapes[i].shape);
+		if (!shape) {
+			continue;
 		}
-		found = i;
-	}
-	if (found < 0) {
-		return false;
-	}
 
-	Box3DShape *shape = p_server->get_shape(p_body->shapes[found].shape);
-	if (!shape) {
-		return false;
-	}
+		const Transform xf = p_from * p_body->shapes[i].xform;
 
-	const Transform xf = p_from * p_body->shapes[found].xform;
-
-	if (shape->type == PhysicsServer::SHAPE_CAPSULE) {
-		Dictionary d = shape->data;
-		if (!d.has("radius") || !d.has("height")) {
-			return false;
+		if (shape->type == PhysicsServer::SHAPE_CAPSULE) {
+			Dictionary d = shape->data;
+			if (!d.has("radius") || !d.has("height")) {
+				continue;
+			}
+			const real_t radius = d["radius"];
+			const real_t height = d["height"];
+			// Godot's capsule is Z-aligned, its height excluding the caps.
+			r_capsule->center1 = b3_from_godot(xf.xform(Vector3(0, 0, height * 0.5)));
+			r_capsule->center2 = b3_from_godot(xf.xform(Vector3(0, 0, -height * 0.5)));
+			r_capsule->radius = (float)radius;
+			return true;
 		}
-		const real_t radius = d["radius"];
-		const real_t height = d["height"];
-		// Godot's capsule is Z-aligned, its height excluding the caps.
-		r_capsule->center1 = b3_from_godot(xf.xform(Vector3(0, 0, height * 0.5)));
-		r_capsule->center2 = b3_from_godot(xf.xform(Vector3(0, 0, -height * 0.5)));
-		r_capsule->radius = (float)radius;
-		return true;
-	}
 
-	if (shape->type == PhysicsServer::SHAPE_SPHERE) {
-		// A sphere is a capsule with coincident endpoints.
-		const b3Vec3 c = b3_from_godot(xf.origin);
-		r_capsule->center1 = c;
-		r_capsule->center2 = c;
-		r_capsule->radius = (float)(real_t)shape->data;
-		return true;
+		if (shape->type == PhysicsServer::SHAPE_SPHERE) {
+			// A sphere is a capsule with coincident endpoints.
+			const b3Vec3 c = b3_from_godot(xf.origin);
+			r_capsule->center1 = c;
+			r_capsule->center2 = c;
+			r_capsule->radius = (float)(real_t)shape->data;
+			return true;
+		}
 	}
 
 	return false;
@@ -1786,10 +1841,7 @@ bool Box3DPhysicsServer::generic_6dof_joint_get_flag(RID p_joint, Vector3::Axis 
 
 void Box3DPhysicsServer::free(RID p_rid) {
 	if (shape_owner.owns(p_rid)) {
-		// Godot frees a shape only once nothing references it, so any b3 shapes
-		// built from this height field are already gone by now.
 		Box3DShape *shape = shape_owner.getornull(p_rid);
-		shape->free_geometry();
 		shape_owner.free(p_rid);
 		memdelete(shape);
 
@@ -1830,9 +1882,9 @@ void Box3DPhysicsServer::init() {
 	Box3DPhysicsDirectBodyState::init_singleton();
 
 	WARN_PRINT("Box3D physics backend is partially implemented. Working: rigid bodies, "
-			   "KinematicBody movement, height fields, and ray/shape/point queries. "
-			   "Not wired up: Areas (so no Area signals or gravity overrides), joints, "
-			   "trimesh shapes, contact reporting, and RayShape. Set "
+			   "KinematicBody movement, height fields, trimesh, and ray/shape/point "
+			   "queries. Not wired up: Areas (so no Area signals or gravity overrides), "
+			   "joints, contact reporting in _integrate_forces, and RayShape. Set "
 			   "physics/3d/physics_engine back to \"DEFAULT\" for a fully working world.");
 }
 

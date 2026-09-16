@@ -68,6 +68,10 @@ private:
 	void _body_rebuild_shapes(Box3DBody *p_body);
 	void _body_apply_mass(Box3DBody *p_body);
 
+	// Pushes the body's collision layer/mask onto its live b3 shapes. Godot sets
+	// these independently of the shape list, and often after the shapes exist.
+	void _body_update_filters(Box3DBody *p_body);
+
 	// Pushes the body's transform into the solver, including the height field
 	// origin correction when one applies.
 	void _body_sync_transform(Box3DBody *p_body);

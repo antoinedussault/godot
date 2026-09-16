@@ -314,6 +314,7 @@ void Box3DSpace::destroy_world() {
 		bodies.write[i]->body_id = b3_nullBodyId;
 		for (int j = 0; j < bodies[i]->shapes.size(); j++) {
 			bodies.write[i]->shapes.write[j].shape_id = b3_nullShapeId;
+			bodies.write[i]->shapes.write[j].free_owned_geometry();
 		}
 	}
 	bodies.clear();

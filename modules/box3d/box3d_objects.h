@@ -9,6 +9,7 @@
 #include "servers/physics_server.h"
 
 #include "box3d/box3d.h"
+#include "box3d/collision.h"
 
 // Internal object model for the Box3D PhysicsServer backend.
 //
@@ -24,6 +25,25 @@ struct Box3DShapeEntry {
 	Transform xform;
 	bool disabled = false;
 	b3ShapeId shape_id = b3_nullShapeId;
+
+	// Box3D holds a REFERENCE to height field and mesh data instead of cloning
+	// it, so these must outlive the shape built from them. They are owned per
+	// ATTACHMENT, not per shape resource: the transform is baked in, and two
+	// bodies can use one shape resource at different scales.
+	b3HeightFieldData *heightfield_data = nullptr;
+	b3MeshData *mesh_data = nullptr;
+
+	// Must run only after the b3 shape built from this geometry is destroyed.
+	_FORCE_INLINE_ void free_owned_geometry() {
+		if (heightfield_data) {
+			b3DestroyHeightField(heightfield_data);
+			heightfield_data = nullptr;
+		}
+		if (mesh_data) {
+			b3DestroyMesh(mesh_data);
+			mesh_data = nullptr;
+		}
+	}
 };
 
 // A shape resource. `data` is kept in the exact Variant form Godot handed us so
@@ -40,21 +60,15 @@ public:
 	// can rebuild their solver-side geometry.
 	Set<RID> owners;
 
-	// Box3D holds a REFERENCE to height field data rather than cloning it, so
-	// this blob must outlive every b3 shape built from it. Owned here, shared
-	// across attachments of the same shape, and released by free_geometry().
-	b3HeightFieldData *heightfield_data = nullptr;
-
 	// Builds this shape's Box3D geometry and attaches it to a body. Returns
 	// b3_nullShapeId for shape types not yet supported.
 	//
-	// Sphere, capsule and hull geometry is fully cloned by Box3D, so the
-	// temporaries built inside are safe to discard; the height field is not.
-	b3ShapeId attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform);
-
-	// Releases owned geometry. Must run only when no b3 shape still references
-	// it — i.e. after the shapes built from it are destroyed.
-	void free_geometry();
+	// Sphere, capsule and hull geometry is fully cloned by Box3D and the
+	// temporaries built here are safe to discard. A height field is NOT cloned:
+	// the blob is handed back through r_owned_heightfield and becomes the
+	// caller's to free once the shape built from it is destroyed.
+	b3ShapeId attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform,
+			Box3DShapeEntry *r_owner = nullptr);
 
 	// For SHAPE_HEIGHTMAP, the grid dimensions in grid points. Returns false for
 	// any other type or malformed data.
@@ -153,19 +167,37 @@ public:
 	// Box3D anchors a height field at the body origin extending positive, while
 	// Godot centers it, and b3CreateHeightFieldShape takes no transform to
 	// correct with. For a static body carrying only a height field, the fix is
-	// to shift the b3 body itself: this is the body-local transform that maps
-	// Godot's placement onto Box3D's corner anchor. Identity when unused.
+	// to shift the b3 body itself.
 	//
 	// Safe specifically because static bodies are skipped during transform
 	// writeback, so the shifted b3 position is never read back into `transform`.
+	// The body scale that is currently baked into the attached shapes. Godot may
+	// set a body's transform long after its shapes exist -- CellTerrain attaches
+	// the HeightMapShape and only then applies the scale that defines its grid
+	// spacing (cell_terrain.cpp:653-664) -- so a scale change has to rebuild them.
+	Vector3 baked_scale = Vector3(1, 1, 1);
+
 	bool has_shape_origin_offset = false;
-	Transform shape_origin_offset;
+	// The height field shape's local transform, scale included.
+	Transform shape_origin_local;
+	// Half the field's scaled extent, negated: the corner Box3D anchors at.
+	Vector3 shape_corner_offset;
 
 	_FORCE_INLINE_ bool in_world() const { return !B3_IS_NULL(body_id); }
 
-	// The transform the b3 body should actually sit at, offset included.
+	// Godot bakes scale into a body's basis; Box3D transforms are strictly rigid
+	// and carry none. Scale is therefore baked into the SHAPES instead (see
+	// Box3DPhysicsServer::_body_rebuild_shapes), and the solver body gets the
+	// rotation-only basis. Dropping the scale here without compensating is what
+	// made scaled terrain collide at the wrong size.
 	_FORCE_INLINE_ Transform get_solver_transform() const {
-		return has_shape_origin_offset ? (transform * shape_origin_offset) : transform;
+		const Transform rigid(transform.basis.orthonormalized(), transform.origin);
+		if (!has_shape_origin_offset) {
+			return rigid;
+		}
+		const Transform world = rigid * shape_origin_local;
+		const Basis wrot = world.basis.orthonormalized();
+		return Transform(wrot, world.origin + wrot.xform(shape_corner_offset));
 	}
 
 	Box3DBody() :

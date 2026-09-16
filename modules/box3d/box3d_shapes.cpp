@@ -128,18 +128,12 @@ bool Box3DShape::get_heightmap_dimensions(int &r_width, int &r_depth) const {
 	return r_width > 1 && r_depth > 1;
 }
 
-void Box3DShape::free_geometry() {
-	if (heightfield_data) {
-		b3DestroyHeightField(heightfield_data);
-		heightfield_data = nullptr;
-	}
-}
-
-static b3ShapeId attach_heightmap(b3BodyId p_body, const b3ShapeDef *p_def, Box3DShape *p_shape) {
-	if (p_shape->heightfield_data) {
-		return b3CreateHeightFieldShape(p_body, p_def, p_shape->heightfield_data);
-	}
-
+static b3ShapeId attach_heightmap(b3BodyId p_body, const b3ShapeDef *p_def, Box3DShape *p_shape,
+		const Vector3 &p_scale, Box3DShapeEntry *r_owner) {
+	// Deliberately NOT cached on the shape. The grid spacing is baked into the
+	// blob via b3HeightFieldDef::scale, so a cached blob silently keeps the scale
+	// it was first built with -- which is how CellTerrain ended up colliding at
+	// one unit per grid step after applying its real spacing.
 	Dictionary d = p_shape->data;
 	ERR_FAIL_COND_V(!d.has("width") || !d.has("depth") || !d.has("heights"), b3_nullShapeId);
 
@@ -186,9 +180,15 @@ static b3ShapeId attach_heightmap(b3BodyId p_body, const b3ShapeDef *p_def, Box3
 	b3HeightFieldDef def = {};
 	def.heights = flat.ptrw();
 	def.materialIndices = nullptr;
-	// Godot's HeightMapShape has a fixed grid spacing of one unit (its AABB is
-	// width-1 by depth-1); scale.y of 1 keeps heights in world units.
-	def.scale = { 1.0f, 1.0f, 1.0f };
+	// Godot's HeightMapShape always has a one-unit grid; real spacing comes from
+	// the scale on the shape's transform. CellTerrain relies on exactly this --
+	// it scales its StaticBody by cell_size/(verts_per_side-1)
+	// (cell_terrain.cpp:661) -- so assuming 1 collapses every terrain cell to a
+	// tiny patch and the player falls straight through.
+	const Vector3 scale = p_scale;
+	ERR_FAIL_COND_V_MSG(scale.x <= 0 || scale.y <= 0 || scale.z <= 0, b3_nullShapeId,
+			"Box3D: height field scale must be positive on every axis.");
+	def.scale = { (float)scale.x, (float)scale.y, (float)scale.z };
 	def.countX = width;
 	def.countZ = depth;
 	def.globalMinimumHeight = min_height;
@@ -203,13 +203,81 @@ static b3ShapeId attach_heightmap(b3BodyId p_body, const b3ShapeDef *p_def, Box3
 	// here on each attach would dangle any b3 shape another body still holds,
 	// so invalidation is driven from shape_set_data(), which tears down every
 	// referencing b3 shape first.
-	p_shape->heightfield_data = b3CreateHeightField(&def);
-	ERR_FAIL_NULL_V(p_shape->heightfield_data, b3_nullShapeId);
+	b3HeightFieldData *blob = b3CreateHeightField(&def);
+	ERR_FAIL_NULL_V(blob, b3_nullShapeId);
 
-	return b3CreateHeightFieldShape(p_body, p_def, p_shape->heightfield_data);
+	b3ShapeId id = b3CreateHeightFieldShape(p_body, p_def, blob);
+	if (B3_IS_NULL(id)) {
+		b3DestroyHeightField(blob);
+		return b3_nullShapeId;
+	}
+
+	ERR_FAIL_NULL_V(r_owner, id);
+	r_owner->heightfield_data = blob;
+	return id;
 }
 
-b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform) {
+static b3ShapeId attach_concave(b3BodyId p_body, const b3ShapeDef *p_def, Box3DShape *p_shape,
+		const Transform &p_local, Box3DShapeEntry *r_owner) {
+	// Godot stores a ConcavePolygonShape as a flat run of triangle corners --
+	// three Vector3 per triangle, no index buffer (shape_sw.cpp:_setup).
+	PoolVector<Vector3> faces = p_shape->data;
+	const int count = faces.size();
+	ERR_FAIL_COND_V_MSG(count < 3 || (count % 3) != 0, b3_nullShapeId,
+			"Box3D: a ConcavePolygonShape needs a multiple of 3 vertices.");
+
+	Vector<b3Vec3> verts;
+	Vector<int32_t> indices;
+	verts.resize(count);
+	indices.resize(count);
+	{
+		PoolVector<Vector3>::Read r = faces.read();
+		b3Vec3 *vw = verts.ptrw();
+		int32_t *iw = indices.ptrw();
+		for (int i = 0; i < count; i++) {
+			// b3CreateMeshShape takes a scale but no transform, so the shape's
+			// local placement is baked into the vertices instead. Unlike a height
+			// field, a mesh has arbitrary vertices, so this costs nothing and
+			// handles rotation and translation as well as scale.
+			vw[i] = b3_from_godot(p_local.xform(r[i]));
+			iw[i] = i;
+		}
+	}
+
+	b3MeshDef def = {};
+	def.vertices = verts.ptrw();
+	def.stride = 0;
+	def.indices = indices.ptrw();
+	def.materialIndices = nullptr;
+	def.weldTolerance = 0.0001f;
+	def.vertexCount = count;
+	def.triangleCount = count / 3;
+	// The corners arrive unshared; welding rebuilds the shared edges Box3D needs
+	// for adjacency, which is what stops a character catching on interior seams.
+	def.weldVertices = true;
+	def.useMedianSplit = false;
+	def.identifyEdges = true;
+	// Godot winds front faces clockwise. Box3D assumes counter-clockwise unless
+	// told otherwise, and it ignores back-side collision on meshes -- so getting
+	// this backwards makes a floor solid only from underneath.
+	def.clockWiseWinding = true;
+
+	b3MeshData *mesh = b3CreateMesh(&def, nullptr, 0);
+	ERR_FAIL_NULL_V(mesh, b3_nullShapeId);
+
+	const b3Vec3 unit_scale = { 1.0f, 1.0f, 1.0f };
+	b3ShapeId id = b3CreateMeshShape(p_body, p_def, mesh, unit_scale);
+	if (B3_IS_NULL(id)) {
+		b3DestroyMesh(mesh);
+		return b3_nullShapeId;
+	}
+
+	ERR_FAIL_NULL_V(r_owner, id);
+	r_owner->mesh_data = mesh;
+	return id;
+}
+
+b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Transform &p_local_xform, Box3DShapeEntry *r_owner) {
 	switch (type) {
 		case PhysicsServer::SHAPE_SPHERE:
 			return attach_sphere(p_body, p_def, data, p_local_xform);
@@ -223,17 +291,16 @@ b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Tra
 			return attach_convex(p_body, p_def, data, p_local_xform);
 
 		case PhysicsServer::SHAPE_CONCAVE_POLYGON:
-			// b3CreateMeshShape does NOT clone its input: the b3MeshData must be
-			// owned here and outlive every shape built from it. Static bodies only.
-			WARN_PRINT_ONCE("Box3D: ConcavePolygonShape is not implemented yet.");
-			return b3_nullShapeId;
+			// Box3D only generates mesh contacts against static bodies, which
+			// matches Godot's own restriction on concave shapes.
+			return attach_concave(p_body, p_def, this, p_local_xform, r_owner);
 
 		case PhysicsServer::SHAPE_HEIGHTMAP:
-			// The local transform is deliberately ignored: Box3D anchors a height
-			// field at the body origin and offers no per-shape transform, so the
-			// placement correction is applied to the body instead (see
-			// Box3DBody::shape_origin_offset). Static bodies only.
-			return attach_heightmap(p_body, p_def, this);
+			// Only the SCALE of the local transform is used here. Box3D anchors a
+			// height field at the body origin and offers no per-shape transform,
+			// so rotation and translation are applied to the body instead (see
+			// Box3DBody::get_solver_transform). Static bodies only.
+			return attach_heightmap(p_body, p_def, this, p_local_xform.basis.get_scale(), r_owner);
 
 		case PhysicsServer::SHAPE_PLANE:
 			WARN_PRINT_ONCE("Box3D: PlaneShape has no Box3D equivalent (use a large box for a floor).");
