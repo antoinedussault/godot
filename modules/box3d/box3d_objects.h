@@ -123,6 +123,12 @@ public:
 	ObjectID area_monitor_callback_id = 0;
 	StringName area_monitor_callback_method;
 
+	// An Area lives in the solver as a STATIC body whose shapes are sensors.
+	// Box3D reports sensor begin/end touch events, which is what Godot's area
+	// monitoring is built from.
+	b3BodyId body_id = b3_nullBodyId;
+	_FORCE_INLINE_ bool in_world() const { return !B3_IS_NULL(body_id); }
+
 	Box3DArea() :
 			Box3DCollisionObject(TYPE_AREA) {}
 };

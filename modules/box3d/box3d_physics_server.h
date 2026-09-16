@@ -80,6 +80,12 @@ private:
 	// it is. Also enforces the two cases the offset cannot express.
 	void _body_update_shape_origin_offset(Box3DBody *p_body);
 
+	// Areas mirror the body lifetime, but their shapes are sensors.
+	void _area_enter_world(Box3DArea *p_area, Box3DSpace *p_space);
+	void _area_exit_world(Box3DArea *p_area);
+	void _area_rebuild_shapes(Box3DArea *p_area);
+	void _area_sync_transform(Box3DArea *p_area);
+
 public:
 
 	/* SHAPE API */

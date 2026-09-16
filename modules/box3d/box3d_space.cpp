@@ -24,27 +24,37 @@ b3QueryFilter b3_query_filter(uint32_t p_collision_mask) {
 
 // Resolves a hit shape back to the Godot side. Returns nullptr if the shape has
 // no Box3DBody behind it.
-Box3DBody *b3_body_from_shape(b3ShapeId p_shape_id, int *r_shape_index) {
+Box3DCollisionObject *b3_object_from_shape(b3ShapeId p_shape_id, int *r_shape_index) {
 	b3BodyId body_id = b3Shape_GetBody(p_shape_id);
 	if (B3_IS_NULL(body_id)) {
 		return nullptr;
 	}
 
-	Box3DBody *body = static_cast<Box3DBody *>(b3Body_GetUserData(body_id));
-	if (!body) {
+	Box3DCollisionObject *obj = static_cast<Box3DCollisionObject *>(b3Body_GetUserData(body_id));
+	if (!obj) {
 		return nullptr;
 	}
 
 	if (r_shape_index) {
 		*r_shape_index = 0;
-		for (int i = 0; i < body->shapes.size(); i++) {
-			if (B3_ID_EQUALS(body->shapes[i].shape_id, p_shape_id)) {
+		for (int i = 0; i < obj->shapes.size(); i++) {
+			if (B3_ID_EQUALS(obj->shapes[i].shape_id, p_shape_id)) {
 				*r_shape_index = i;
 				break;
 			}
 		}
 	}
-	return body;
+	return obj;
+}
+
+// Bodies only. Queries and the character mover must never resolve a sensor as
+// something solid.
+Box3DBody *b3_body_from_shape(b3ShapeId p_shape_id, int *r_shape_index) {
+	Box3DCollisionObject *obj = b3_object_from_shape(p_shape_id, r_shape_index);
+	if (!obj || obj->type != Box3DCollisionObject::TYPE_BODY) {
+		return nullptr;
+	}
+	return static_cast<Box3DBody *>(obj);
 }
 
 float b3_closest_hit_callback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction,
@@ -349,6 +359,85 @@ void Box3DSpace::remove_body(Box3DBody *p_body) {
 	bodies.erase(p_body);
 }
 
+void Box3DSpace::add_area(Box3DArea *p_area) {
+	if (areas.find(p_area) == -1) {
+		areas.push_back(p_area);
+	}
+}
+
+void Box3DSpace::remove_area(Box3DArea *p_area) {
+	areas.erase(p_area);
+}
+
+// Godot's Area expects _body_inout(status, body_rid, instance_id, body_shape,
+// area_shape); area-vs-area monitoring takes the same shape.
+static void b3_dispatch_area_event(ObjectID p_receiver, const StringName &p_method,
+		int p_status, const Box3DCollisionObject *p_other, int p_other_shape, int p_self_shape) {
+	if (!p_receiver || p_method == StringName()) {
+		return;
+	}
+	Object *obj = ObjectDB::get_instance(p_receiver);
+	if (!obj) {
+		return;
+	}
+
+	Variant v_status = p_status;
+	Variant v_rid = p_other->self;
+	Variant v_instance = p_other->instance_id;
+	Variant v_other_shape = p_other_shape;
+	Variant v_self_shape = p_self_shape;
+	const Variant *argv[5] = { &v_status, &v_rid, &v_instance, &v_other_shape, &v_self_shape };
+
+	Variant::CallError ce;
+	obj->call(p_method, argv, 5, ce);
+}
+
+void Box3DSpace::flush_sensor_events() {
+	if (B3_IS_NULL(world_id)) {
+		return;
+	}
+
+	const b3SensorEvents events = b3World_GetSensorEvents(world_id);
+
+	for (int i = 0; i < events.beginCount; i++) {
+		int sensor_shape = 0;
+		int visitor_shape = 0;
+		Box3DCollisionObject *sensor = b3_object_from_shape(events.beginEvents[i].sensorShapeId, &sensor_shape);
+		Box3DCollisionObject *visitor = b3_object_from_shape(events.beginEvents[i].visitorShapeId, &visitor_shape);
+		if (!sensor || !visitor || sensor->type != Box3DCollisionObject::TYPE_AREA) {
+			continue;
+		}
+
+		Box3DArea *area = static_cast<Box3DArea *>(sensor);
+		if (visitor->type == Box3DCollisionObject::TYPE_BODY) {
+			b3_dispatch_area_event(area->monitor_callback_id, area->monitor_callback_method,
+					PhysicsServer::AREA_BODY_ADDED, visitor, visitor_shape, sensor_shape);
+		} else {
+			b3_dispatch_area_event(area->area_monitor_callback_id, area->area_monitor_callback_method,
+					PhysicsServer::AREA_BODY_ADDED, visitor, visitor_shape, sensor_shape);
+		}
+	}
+
+	for (int i = 0; i < events.endCount; i++) {
+		int sensor_shape = 0;
+		int visitor_shape = 0;
+		Box3DCollisionObject *sensor = b3_object_from_shape(events.endEvents[i].sensorShapeId, &sensor_shape);
+		Box3DCollisionObject *visitor = b3_object_from_shape(events.endEvents[i].visitorShapeId, &visitor_shape);
+		if (!sensor || !visitor || sensor->type != Box3DCollisionObject::TYPE_AREA) {
+			continue;
+		}
+
+		Box3DArea *area = static_cast<Box3DArea *>(sensor);
+		if (visitor->type == Box3DCollisionObject::TYPE_BODY) {
+			b3_dispatch_area_event(area->monitor_callback_id, area->monitor_callback_method,
+					PhysicsServer::AREA_BODY_REMOVED, visitor, visitor_shape, sensor_shape);
+		} else {
+			b3_dispatch_area_event(area->area_monitor_callback_id, area->area_monitor_callback_method,
+					PhysicsServer::AREA_BODY_REMOVED, visitor, visitor_shape, sensor_shape);
+		}
+	}
+}
+
 void Box3DSpace::step(real_t p_delta) {
 	if (B3_IS_NULL(world_id)) {
 		return;
@@ -410,6 +499,7 @@ void Box3DSpace::call_queries() {
 		obj->call(body->force_integration_callback_method, vp, argc, ce);
 	}
 
-	// Still to flush here: area monitor / area-monitor enter-exit events and the
-	// debug contact list.
+	flush_sensor_events();
+
+	// Still to flush here: the debug contact list.
 }

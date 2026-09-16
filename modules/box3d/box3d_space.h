@@ -37,6 +37,7 @@ public:
 // body_test_motion.
 b3QueryFilter b3_query_filter(uint32_t p_collision_mask);
 Box3DBody *b3_body_from_shape(b3ShapeId p_shape_id, int *r_shape_index);
+Box3DCollisionObject *b3_object_from_shape(b3ShapeId p_shape_id, int *r_shape_index);
 
 struct Box3DClosestHitContext {
 	const Set<RID> *exclude = nullptr;
@@ -72,6 +73,7 @@ public:
 	// body_set_space(), and walked after each step to copy solver transforms
 	// back into the Godot-side bookkeeping.
 	Vector<Box3DBody *> bodies;
+	Vector<Box3DArea *> areas;
 
 	// SPACE_PARAM_*, stored so space_get_param() round-trips. Box3D exposes its
 	// own solver tuning (contact hertz/damping/speed) which these do not map
@@ -117,6 +119,12 @@ public:
 
 	void add_body(Box3DBody *p_body);
 	void remove_body(Box3DBody *p_body);
+	void add_area(Box3DArea *p_area);
+	void remove_area(Box3DArea *p_area);
+
+	// Drains Box3D's sensor begin/end touch events into Godot's area monitor
+	// callbacks.
+	void flush_sensor_events();
 
 	void step(real_t p_delta);
 	void call_queries();

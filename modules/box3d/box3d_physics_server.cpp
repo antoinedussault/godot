@@ -99,7 +99,7 @@ void Box3DPhysicsServer::_body_enter_world(Box3DBody *p_body, Box3DSpace *p_spac
 
 	// Lets a query result walk b3ShapeId -> b3BodyId -> Box3DBody in one hop,
 	// which is how every scene query resolves what it hit.
-	def.userData = p_body;
+	def.userData = static_cast<Box3DCollisionObject *>(p_body);
 
 	// Godot treats a negative damp as "inherit from the area"; Box3D has no such
 	// sentinel, so clamp it to zero here. Area-driven damping is a later pass.
@@ -305,6 +305,12 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 		def.baseMaterial.restitution = b3_sanitize_material(p_body->bounce);
 		def.filter.categoryBits = p_body->collision_layer;
 		def.filter.maskBits = p_body->collision_mask;
+		// Sensor events are opt-in on BOTH sides -- "This applies to sensors and
+		// non-sensors. False by default, even for sensors." Without this on the
+		// visiting body, an Area sees nothing enter it.
+		// Note only convex shapes can act as visitors, so a trimesh or height
+		// field body will never trigger an Area. That suits static terrain.
+		def.enableSensorEvents = true;
 		// Mass is recomputed once, after every shape is attached.
 		def.updateBodyMass = false;
 
@@ -351,6 +357,96 @@ void Box3DPhysicsServer::_body_apply_mass(Box3DBody *p_body) {
 	md.inertia.cz.z *= ratio;
 
 	b3Body_SetMassData(p_body->body_id, md);
+}
+
+/* AREA SOLVER LIFETIME */
+
+void Box3DPhysicsServer::_area_sync_transform(Box3DArea *p_area) {
+	if (!p_area->in_world()) {
+		return;
+	}
+	const Transform rigid(p_area->transform.basis.orthonormalized(), p_area->transform.origin);
+	b3Body_SetTransform(p_area->body_id,
+			b3_pos_from_godot(rigid.origin),
+			b3_quat_from_godot(rigid.basis.get_rotation_quat()));
+}
+
+void Box3DPhysicsServer::_area_rebuild_shapes(Box3DArea *p_area) {
+	if (!p_area->in_world()) {
+		return;
+	}
+
+	Transform scale_xf;
+	scale_xf.basis.scale(p_area->transform.basis.get_scale());
+
+	for (int i = 0; i < p_area->shapes.size(); i++) {
+		Box3DShapeEntry &entry = p_area->shapes.write[i];
+
+		if (!B3_IS_NULL(entry.shape_id)) {
+			b3DestroyShape(entry.shape_id, false);
+			entry.shape_id = b3_nullShapeId;
+		}
+		entry.free_owned_geometry();
+		if (entry.disabled) {
+			continue;
+		}
+
+		Box3DShape *shape = shape_owner.getornull(entry.shape);
+		if (!shape) {
+			continue;
+		}
+
+		b3ShapeDef def = b3DefaultShapeDef();
+		def.density = 0.0f;
+		// A sensor detects overlap without resolving it, which is exactly what an
+		// Area is. Sensor events are what the monitor callbacks are driven from.
+		def.isSensor = true;
+		def.enableSensorEvents = true;
+		def.filter.categoryBits = p_area->collision_layer;
+		def.filter.maskBits = p_area->collision_mask;
+		def.updateBodyMass = false;
+
+		entry.shape_id = shape->attach(p_area->body_id, &def, scale_xf * entry.xform, &entry);
+	}
+}
+
+void Box3DPhysicsServer::_area_enter_world(Box3DArea *p_area, Box3DSpace *p_space) {
+	ERR_FAIL_NULL(p_area);
+	ERR_FAIL_NULL(p_space);
+	if (B3_IS_NULL(p_space->world_id)) {
+		p_space->create_world();
+	}
+	ERR_FAIL_COND(B3_IS_NULL(p_space->world_id));
+
+	const Transform rigid(p_area->transform.basis.orthonormalized(), p_area->transform.origin);
+
+	b3BodyDef def = b3DefaultBodyDef();
+	def.type = b3_staticBody;
+	def.position = b3_pos_from_godot(rigid.origin);
+	def.rotation = b3_quat_from_godot(rigid.basis.get_rotation_quat());
+	// Shared with bodies, so a sensor event can resolve either side back to its
+	// Godot object; Box3DCollisionObject::type says which.
+	def.userData = static_cast<Box3DCollisionObject *>(p_area);
+
+	p_area->body_id = b3CreateBody(p_space->world_id, &def);
+	p_space->add_area(p_area);
+	_area_rebuild_shapes(p_area);
+}
+
+void Box3DPhysicsServer::_area_exit_world(Box3DArea *p_area) {
+	ERR_FAIL_NULL(p_area);
+
+	if (Box3DSpace *space = space_owner.getornull(p_area->space)) {
+		space->remove_area(p_area);
+	}
+	if (p_area->in_world()) {
+		b3DestroyBody(p_area->body_id);
+		p_area->body_id = b3_nullBodyId;
+	}
+	for (int i = 0; i < p_area->shapes.size(); i++) {
+		p_area->shapes.write[i].shape_id = b3_nullShapeId;
+		p_area->shapes.write[i].free_owned_geometry();
+	}
 }
 
 /* SHAPE API */
@@ -583,7 +679,18 @@ RID Box3DPhysicsServer::area_create() {
 void Box3DPhysicsServer::area_set_space(RID p_area, RID p_space) {
 	Box3DArea *area = area_owner.getornull(p_area);
 	ERR_FAIL_NULL(area);
+	if (area->space == p_space) {
+		return;
+	}
+	if (area->space.is_valid()) {
+		_area_exit_world(area);
+	}
 	area->space = p_space;
+	if (p_space.is_valid()) {
+		Box3DSpace *space = space_owner.getornull(p_space);
+		ERR_FAIL_NULL(space);
+		_area_enter_world(area, space);
+	}
 }
 
 RID Box3DPhysicsServer::area_get_space(RID p_area) const {
@@ -616,6 +723,7 @@ void Box3DPhysicsServer::area_add_shape(RID p_area, RID p_shape, const Transform
 	entry.disabled = p_disabled;
 	area->shapes.push_back(entry);
 	shape->owners.insert(p_area);
+	_area_rebuild_shapes(area);
 }
 
 void Box3DPhysicsServer::area_set_shape(RID p_area, int p_shape_idx, RID p_shape) {
@@ -779,6 +887,7 @@ void Box3DPhysicsServer::area_set_transform(RID p_area, const Transform &p_trans
 	Box3DArea *area = area_owner.getornull(p_area);
 	ERR_FAIL_NULL(area);
 	area->transform = p_transform;
+	_area_sync_transform(area);
 }
 
 Transform Box3DPhysicsServer::area_get_transform(RID p_area) const {
@@ -1968,6 +2077,7 @@ void Box3DPhysicsServer::free(RID p_rid) {
 
 	} else if (area_owner.owns(p_rid)) {
 		Box3DArea *area = area_owner.getornull(p_rid);
+		_area_exit_world(area);
 		area_owner.free(p_rid);
 		memdelete(area);
 
