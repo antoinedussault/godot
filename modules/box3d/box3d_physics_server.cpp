@@ -41,6 +41,16 @@ Box3DCollisionObject *Box3DPhysicsServer::get_collision_object(RID p_rid) const 
 	return nullptr;
 }
 
+// Set BOX3D_DEBUG_MOTION=1 to trace every character motion test. Off by default
+// so it costs one already-cached bool in the hot path.
+static bool b3_debug_motion() {
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = OS::get_singleton()->get_environment("BOX3D_DEBUG_MOTION") == "1" ? 1 : 0;
+	}
+	return enabled == 1;
+}
+
 /* SOLVER-SIDE BODY LIFETIME */
 
 // Box3D asserts on non-finite or negative material values and aborts, so every
@@ -157,9 +167,32 @@ void Box3DPhysicsServer::_body_sync_transform(Box3DBody *p_body) {
 		return;
 	}
 	const Transform t = p_body->get_solver_transform();
+
+	// A KINEMATIC body is moved by Godot as a teleport every frame. Box3D moves
+	// kinematic bodies by velocity, and it is the velocity that contacts read --
+	// so teleporting alone makes a moving platform or a pushing character slide
+	// through dynamic bodies without imparting anything. Give the solver the
+	// implied velocity as well so contacts push, while the teleport keeps the
+	// position exactly where Godot wants it.
+	if (p_body->mode == BODY_MODE_KINEMATIC) {
+		Box3DSpace *space = space_owner.getornull(p_body->space);
+		const real_t dt = space ? space->last_step_delta : 0.0;
+		if (dt > 0) {
+			const Transform now = b3_transform_to_godot(b3Body_GetTransform(p_body->body_id));
+			b3Body_SetLinearVelocity(p_body->body_id, b3_from_godot((t.origin - now.origin) / dt));
+		}
+	}
+
 	b3Body_SetTransform(p_body->body_id,
 			b3_pos_from_godot(t.origin),
 			b3_quat_from_godot(t.basis.get_rotation_quat()));
+
+	if (b3_debug_motion()) {
+		const Transform after = b3_transform_to_godot(b3Body_GetTransform(p_body->body_id));
+		print_line(String("B3SYNC mode=") + itos((int)p_body->mode) +
+				" want=" + String(Variant(t.origin)) +
+				" got=" + String(Variant(after.origin)));
+	}
 }
 
 void Box3DPhysicsServer::_body_update_shape_origin_offset(Box3DBody *p_body) {
@@ -1103,6 +1136,11 @@ void Box3DPhysicsServer::body_set_state(RID p_body, BodyState p_state, const Var
 	switch (p_state) {
 		case BODY_STATE_TRANSFORM: {
 			body->transform = p_variant;
+			if (b3_debug_motion()) {
+				print_line(String("B3STATE mode=") + itos((int)body->mode) +
+						" in_world=" + itos((int)body->in_world()) +
+						" pos=" + String(Variant(body->transform.origin)));
+			}
 
 			// Scale is baked into the shapes, not carried by the solver body, so a
 			// change to it invalidates them. Rebuilding only when the scale
@@ -1454,16 +1492,6 @@ static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *
 	return false;
 }
 
-// Set BOX3D_DEBUG_MOTION=1 to trace every character motion test. Off by default
-// so it costs one already-cached bool in the hot path.
-static bool b3_debug_motion() {
-	static int enabled = -1;
-	if (enabled < 0) {
-		enabled = OS::get_singleton()->get_environment("BOX3D_DEBUG_MOTION") == "1" ? 1 : 0;
-	}
-	return enabled == 1;
-}
-
 bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, const Vector3 &p_motion, bool p_infinite_inertia, MotionResult *r_result, bool p_exclude_raycast_shapes, const Set<RID> &p_exclude) {
 	// This is what gives KinematicBody.move_and_slide() its behaviour. Godot
 	// performs the sliding itself; what it needs back is how far the body may
@@ -1654,6 +1682,10 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 
 		Box3DClosestHitContext ctx;
 		ctx.exclude = &exclude;
+		if (p_motion.length_squared() > CMP_EPSILON) {
+			ctx.reject_non_opposing = true;
+			ctx.motion_dir = p_motion.normalized();
+		}
 		b3World_CastShape(space->world_id, world_origin, &proxy, b3_from_godot(p_motion),
 				filter, b3_closest_hit_callback, &ctx);
 

@@ -62,6 +62,15 @@ float b3_closest_hit_callback(b3ShapeId shapeId, b3Pos point, b3Vec3 normal, flo
 		return -1.0f;
 	}
 
+	if (ctx->reject_non_opposing) {
+		const Vector3 n = b3_to_godot(normal);
+		// Facing the same way as the motion, or perpendicular to it: the body is
+		// sliding along this surface, not into it.
+		if (n.length_squared() <= CMP_EPSILON || n.normalized().dot(ctx->motion_dir) >= -CMP_EPSILON) {
+			return -1.0f;
+		}
+	}
+
 	ctx->hit = true;
 	ctx->fraction = fraction;
 	ctx->point = b3_pos_to_godot(point);

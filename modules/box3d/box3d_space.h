@@ -42,6 +42,13 @@ struct Box3DClosestHitContext {
 	const Set<RID> *exclude = nullptr;
 	bool collide_with_bodies = true;
 
+	// When set, hits whose surface does not OPPOSE this direction are ignored.
+	// A body resting on the ground is already touching it, so a cast along the
+	// ground reports a hit at fraction 0 and the body can never move. Only
+	// surfaces the motion runs into should block it.
+	bool reject_non_opposing = false;
+	Vector3 motion_dir;
+
 	bool hit = false;
 	float fraction = 1.0f;
 	Vector3 point;
