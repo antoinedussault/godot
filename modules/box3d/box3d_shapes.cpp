@@ -5,6 +5,7 @@
 #include "core/math/math_funcs.h"
 
 #include "box3d/collision.h"
+#include "box3d/constants.h"
 
 // Godot shape -> Box3D geometry.
 //
@@ -14,6 +15,36 @@
 //   - Godot's CylinderShape is Y-aligned and its `height` is the FULL height,
 //     centered on the origin.
 // Getting either wrong leaves a player capsule lying on its side.
+
+// Builds a hull within Box3D's structural limits.
+//
+// The binding constraint is edges, not vertices: B3_MAX_HULL_EDGES (128) means
+// 256 half-edges, and a triangulated convex hull has E = 3V - 6, so the real
+// ceiling is around 44 vertices -- not the 128 that B3_MAX_HULL_VERTICES
+// suggests. Detailed collision meshes blow straight past it ("half edge count
+// of 372 exceeds limit of 256").
+//
+// b3CreateHull's vertex budget is a simplification target, so stepping it down
+// until the result fits keeps the shape rather than dropping it.
+static b3HullData *b3_build_hull_within_limits(const Vector<b3Vec3> &p_points) {
+	static const int budgets[] = { 44, 32, 24, 16, 12, 8 };
+
+	for (int i = 0; i < 6; i++) {
+		const int budget = MIN(p_points.size(), budgets[i]);
+		if (budget < 4) {
+			break;
+		}
+		if (b3HullData *hull = b3CreateHull(p_points.ptr(), p_points.size(), budget)) {
+			if (i > 0) {
+				WARN_PRINT_ONCE("Box3D: a convex shape had to be simplified further than "
+								"expected to fit Box3D's hull limits; its collision is coarser "
+								"than the source shape.");
+			}
+			return hull;
+		}
+	}
+	return nullptr;
+}
 
 static b3ShapeId attach_sphere(b3BodyId p_body, const b3ShapeDef *p_def, const Variant &p_data, const Transform &p_local) {
 	b3Sphere sphere;
@@ -88,7 +119,7 @@ static b3ShapeId attach_cylinder(b3BodyId p_body, const b3ShapeDef *p_def, const
 		pw[i * 2 + 1] = b3_from_godot(p_local.xform(Vector3(x, -half_h, z)));
 	}
 
-	b3HullData *hull = b3CreateHull(points.ptr(), points.size(), points.size());
+	b3HullData *hull = b3_build_hull_within_limits(points);
 	ERR_FAIL_NULL_V(hull, b3_nullShapeId);
 
 	b3ShapeId id = b3CreateHullShape(p_body, p_def, hull);
@@ -107,8 +138,12 @@ static b3ShapeId attach_convex(b3BodyId p_body, const b3ShapeDef *p_def, const V
 		pw[i] = b3_from_godot(p_local.xform(godot_points[i]));
 	}
 
-	b3HullData *hull = b3CreateHull(points.ptr(), points.size(), points.size());
-	ERR_FAIL_NULL_V(hull, b3_nullShapeId);
+	b3HullData *hull = b3_build_hull_within_limits(points);
+	if (!hull) {
+		WARN_PRINT_ONCE("Box3D: a ConvexPolygonShape was too complex to simplify into a hull; "
+						"that shape has no collision. Reduce its point count.");
+		return b3_nullShapeId;
+	}
 
 	b3ShapeId id = b3CreateHullShape(p_body, p_def, hull);
 	b3DestroyHull(hull);
@@ -223,6 +258,9 @@ static b3ShapeId attach_concave(b3BodyId p_body, const b3ShapeDef *p_def, Box3DS
 	// three Vector3 per triangle, no index buffer (shape_sw.cpp:_setup).
 	PoolVector<Vector3> faces = p_shape->data;
 	const int count = faces.size();
+	if (count == 0) {
+		return b3_nullShapeId; // An empty concave shape is legal; it just has no geometry.
+	}
 	ERR_FAIL_COND_V_MSG(count < 3 || (count % 3) != 0, b3_nullShapeId,
 			"Box3D: a ConcavePolygonShape needs a multiple of 3 vertices.");
 

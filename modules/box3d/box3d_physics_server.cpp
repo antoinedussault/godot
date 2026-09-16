@@ -42,6 +42,17 @@ Box3DCollisionObject *Box3DPhysicsServer::get_collision_object(RID p_rid) const 
 
 /* SOLVER-SIDE BODY LIFETIME */
 
+// Box3D asserts on non-finite or negative material values and aborts, so every
+// value handed to it has to be sanitised first.
+static float b3_sanitize_material(real_t p_value) {
+	const float v = (float)p_value;
+	// This Godot version has is_nan/is_inf but no is_finite.
+	if (Math::is_nan(v) || Math::is_inf(v)) {
+		return 0.0f;
+	}
+	return v < 0.0f ? -v : v;
+}
+
 static b3BodyType b3_body_type_from_godot(PhysicsServer::BodyMode p_mode) {
 	switch (p_mode) {
 		case PhysicsServer::BODY_MODE_STATIC:
@@ -251,8 +262,13 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 
 		b3ShapeDef def = b3DefaultShapeDef();
 		def.density = 1.0f;
-		def.baseMaterial.friction = (float)p_body->friction;
-		def.baseMaterial.restitution = (float)p_body->bounce;
+		// Godot encodes PhysicsMaterial's "rough" and "absorbent" flags as a
+		// NEGATIVE friction/bounce (scene/resources/physics_material.h:57-69).
+		// Box3D asserts both are finite and non-negative and aborts the process
+		// otherwise, so take the magnitude -- the flag's meaning has no Box3D
+		// equivalent, but its magnitude is the right value either way.
+		def.baseMaterial.friction = b3_sanitize_material(p_body->friction);
+		def.baseMaterial.restitution = b3_sanitize_material(p_body->bounce);
 		def.filter.categoryBits = p_body->collision_layer;
 		def.filter.maskBits = p_body->collision_mask;
 		// Mass is recomputed once, after every shape is attached.
@@ -1475,73 +1491,117 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 	// ground: it reports impact fraction 0 and the body never moves. Box3D's
 	// mover API exists for exactly this. b3SolvePlanes takes the desired
 	// translation and every contact plane at once and returns the translation
-	// that satisfies all of them -- depenetration and sliding resolved together,
-	// which also handles inside corners that a one-normal-at-a-time slide gets
-	// wrong.
+	// that satisfies all of them.
+	//
+	// It MUST be iterated. b3SolvePlanes answers "what move satisfies the planes
+	// as measured HERE", so solving once against the starting position leaves the
+	// answer stale by the time the body arrives -- on a slope the capsule sinks
+	// in one frame and is shoved out the next, which reads as a hard vertical
+	// jitter even though the reported velocity stays perfectly steady. Re-gathering
+	// planes at each intermediate position converges instead.
 	//
 	// Capsule and sphere bodies only, because that is what Box3D's mover accepts.
 	b3Capsule mover;
 	if (b3_build_mover_capsule(body, this, p_from, &mover)) {
-		Box3DMoverPlaneContext pctx;
-		pctx.exclude = &exclude;
-		b3World_CollideMover(space->world_id, world_origin, &mover, filter, b3_mover_plane_callback, &pctx);
+		const int MAX_SOLVER_ITERATIONS = 4;
 
-		if (pctx.count == 0) {
-			return false; // nothing touching; the whole motion is free
-		}
+		Transform current = p_from;
+		Vector3 remaining = p_motion;
+		Vector3 total;
 
-		b3PlaneSolverResult solved = b3SolvePlanes(b3_from_godot(p_motion), pctx.planes, pctx.count);
-		const Vector3 delta = b3_to_godot(solved.delta);
+		bool touched = false;
+		Vector3 hit_normal;
+		Vector3 hit_point;
+		real_t hit_depth = 0;
+		Box3DBody *hit_body = nullptr;
+		int hit_shape = 0;
 
-		// The contact that actually restrained the move is the one the solver
-		// pushed hardest against.
-		int best_plane = -1;
-		float best_push = 0.0f;
-		for (int i = 0; i < pctx.count; i++) {
-			if (pctx.planes[i].push > best_push) {
-				best_push = pctx.planes[i].push;
-				best_plane = i;
+		for (int iter = 0; iter < MAX_SOLVER_ITERATIONS; iter++) {
+			b3Capsule step_mover;
+			if (!b3_build_mover_capsule(body, this, current, &step_mover)) {
+				break;
+			}
+
+			Box3DMoverPlaneContext pctx;
+			pctx.exclude = &exclude;
+			b3World_CollideMover(space->world_id, world_origin, &step_mover, filter,
+					b3_mover_plane_callback, &pctx);
+
+			if (pctx.count == 0) {
+				// Nothing in contact any more: the rest of the move is free.
+				total += remaining;
+				remaining = Vector3();
+				break;
+			}
+
+			touched = true;
+
+			b3PlaneSolverResult solved = b3SolvePlanes(b3_from_godot(remaining), pctx.planes, pctx.count);
+			const Vector3 delta = b3_to_godot(solved.delta);
+
+			total += delta;
+			remaining -= delta;
+			current.origin += delta;
+
+			// The contact that actually restrained this step is the one the solver
+			// pushed hardest against.
+			int best_plane = -1;
+			float best_push = 0.0f;
+			for (int i = 0; i < pctx.count; i++) {
+				if (pctx.planes[i].push > best_push) {
+					best_push = pctx.planes[i].push;
+					best_plane = i;
+				}
+			}
+			if (best_plane >= 0) {
+				hit_normal = b3_to_godot(pctx.planes[best_plane].plane.normal);
+				hit_point = pctx.plane_points[best_plane];
+				hit_depth = pctx.planes[best_plane].push;
+				hit_body = pctx.plane_bodies[best_plane];
+				hit_shape = pctx.plane_shapes[best_plane];
+			}
+
+			// Converged: either the move is spent or the solver stopped making
+			// progress. Iterating further would only add noise.
+			if (remaining.length_squared() <= CMP_EPSILON || delta.length_squared() <= CMP_EPSILON) {
+				break;
 			}
 		}
 
-		const bool blocked = !delta.is_equal_approx(p_motion);
-		if (!blocked && best_plane < 0) {
+		if (!touched) {
 			return false;
 		}
 
 		if (r_result) {
-			r_result->motion = delta;
-			r_result->remainder = p_motion - delta;
+			r_result->motion = total;
+			r_result->remainder = p_motion - total;
 
 			const real_t len = p_motion.length();
-			const real_t safe = len > CMP_EPSILON ? CLAMP(delta.length() / len, (real_t)0.0, (real_t)1.0) : (real_t)1.0;
+			const real_t safe = len > CMP_EPSILON ? CLAMP(total.length() / len, (real_t)0.0, (real_t)1.0) : (real_t)1.0;
 			r_result->collision_safe_fraction = safe;
 			r_result->collision_unsafe_fraction = safe;
 
-			if (best_plane >= 0) {
-				Vector3 normal = b3_to_godot(pctx.planes[best_plane].plane.normal);
-				if (normal.length_squared() > CMP_EPSILON) {
-					normal.normalize();
-				} else {
-					normal = Vector3(0, 1, 0);
-				}
-
-				// Box3D's plane normals point outward from the shape the mover rests
-				// on, which is already the surface normal Godot wants for
-				// is_on_floor() / is_on_wall().
-				r_result->collision_normal = normal;
-				r_result->collision_point = pctx.plane_points[best_plane];
-				r_result->collision_depth = pctx.planes[best_plane].push;
-
-				Box3DBody *other = pctx.plane_bodies[best_plane];
-				if (other) {
-					r_result->collider = other->self;
-					r_result->collider_id = other->instance_id;
-					r_result->collider_shape = pctx.plane_shapes[best_plane];
-					r_result->collider_velocity = other->linear_velocity;
-				}
+			Vector3 normal = hit_normal;
+			if (normal.length_squared() > CMP_EPSILON) {
+				normal.normalize();
+			} else {
+				normal = Vector3(0, 1, 0);
 			}
+
+			// Box3D's plane normals point outward from the shape the mover rests
+			// on, which is already the surface normal Godot wants for
+			// is_on_floor() / is_on_wall().
+			r_result->collision_normal = normal;
+			r_result->collision_point = hit_point;
+			r_result->collision_depth = hit_depth;
 			r_result->collision_local_shape = 0;
+
+			if (hit_body) {
+				r_result->collider = hit_body->self;
+				r_result->collider_id = hit_body->instance_id;
+				r_result->collider_shape = hit_shape;
+				r_result->collider_velocity = hit_body->linear_velocity;
+			}
 		}
 		return true;
 	}
