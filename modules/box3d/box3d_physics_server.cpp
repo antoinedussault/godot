@@ -1509,8 +1509,22 @@ PhysicsDirectBodyState *Box3DPhysicsServer::body_get_direct_state(RID p_body) {
 // Depenetration planes gathered by b3World_CollideMover.
 #define B3_MAX_MOVER_PLANES 32
 
+// True for bodies the solver drives itself - a RigidBody, in any of its modes.
+// Static and kinematic geometry is NOT dynamic: a moving platform is expected
+// to carry and shove a character around.
+static inline bool b3_is_dynamic(const Box3DBody *p_body) {
+	return p_body->mode == PhysicsServer::BODY_MODE_RIGID ||
+			p_body->mode == PhysicsServer::BODY_MODE_CHARACTER;
+}
+
 struct Box3DMoverPlaneContext {
 	const Set<RID> *exclude = nullptr;
+	// Drop planes belonging to dynamic bodies. Set when the planes are going to
+	// be turned into a depenetration push applied to the CHARACTER: a prop must
+	// never move the character, only the other way round. Left false when the
+	// planes are only being read for a contact normal, since the character does
+	// still need to know it touched the prop.
+	bool skip_dynamic = false;
 	b3CollisionPlane planes[B3_MAX_MOVER_PLANES];
 	// Parallel to `planes`, so the winning plane can name what was touched.
 	Box3DBody *plane_bodies[B3_MAX_MOVER_PLANES];
@@ -1519,13 +1533,26 @@ struct Box3DMoverPlaneContext {
 	int count = 0;
 };
 
+struct Box3DMoverSweepContext {
+	const Set<RID> *exclude = nullptr;
+	// Godot's documented infinite_inertia: the character pushes RigidBodies but
+	// stops detecting collisions with them entirely.
+	bool skip_dynamic = false;
+};
+
 static bool b3_mover_filter_callback(b3ShapeId shapeId, void *context) {
-	const Set<RID> *exclude = static_cast<const Set<RID> *>(context);
+	const Box3DMoverSweepContext *ctx = static_cast<const Box3DMoverSweepContext *>(context);
 	Box3DBody *body = b3_body_from_shape(shapeId, nullptr);
 	if (!body) {
 		return false;
 	}
-	return !(exclude && exclude->has(body->self));
+	if (ctx->exclude && ctx->exclude->has(body->self)) {
+		return false;
+	}
+	if (ctx->skip_dynamic && b3_is_dynamic(body)) {
+		return false;
+	}
+	return true;
 }
 
 static bool b3_mover_plane_callback(b3ShapeId shapeId, const b3PlaneResult *planes, int planeCount, void *context) {
@@ -1537,6 +1564,9 @@ static bool b3_mover_plane_callback(b3ShapeId shapeId, const b3PlaneResult *plan
 		return true;
 	}
 	if (ctx->exclude && ctx->exclude->has(body->self)) {
+		return true;
+	}
+	if (ctx->skip_dynamic && b3_is_dynamic(body)) {
 		return true;
 	}
 
@@ -1666,6 +1696,24 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 		{
 			Box3DMoverPlaneContext pctx;
 			pctx.exclude = &exclude;
+			// A RigidBody must never depenetrate a character.
+			//
+			// This is what launched a player who leaned on a pushable prop. The
+			// recovery delta is unbounded (b3SolvePlanes with pushLimit FLT_MAX
+			// treats every plane as perfectly rigid), it is folded into
+			// MotionResult::motion, and move_and_slide() applies that to the
+			// body on EVERY iteration - up to max_slides times per frame, plus
+			// the snap probe. A prop resting against the capsule regenerates the
+			// overlap each frame, so the character gets shoved again and again
+			// and climbs away at hundreds of units a second.
+			//
+			// Characters collide against the world; props are pushed BY
+			// characters. That is the standard one-way contract, and skipping
+			// dynamic bodies here is what enforces it. The sweep below still
+			// sees the prop, so the character is blocked by it and still reports
+			// the contact through get_slide_collision() - which is what game
+			// code uses to apply the push in the correct direction.
+			pctx.skip_dynamic = true;
 			b3World_CollideMover(space->world_id, world_origin, &mover, filter,
 					b3_mover_plane_callback, &pctx);
 			if (pctx.count > 0) {
@@ -1706,8 +1754,14 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 		}
 
 		// 2. Sweep to first contact.
+		Box3DMoverSweepContext sctx;
+		sctx.exclude = &exclude;
+		// infinite_inertia was accepted and then ignored here, so move_and_slide's
+		// last argument did nothing at all. Honour it: true means "walk through
+		// RigidBodies, shoving them aside"; false keeps the character blocked.
+		sctx.skip_dynamic = p_infinite_inertia;
 		const float fraction = b3World_CastMover(space->world_id, world_origin, &swept,
-				b3_from_godot(p_motion), filter, b3_mover_filter_callback, &exclude);
+				b3_from_godot(p_motion), filter, b3_mover_filter_callback, &sctx);
 		real_t travel_fraction = CLAMP((real_t)fraction, (real_t)0.0, (real_t)1.0);
 		Vector3 travel = p_motion * travel_fraction;
 
@@ -1722,9 +1776,23 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 			travel_fraction = 0.0;
 		}
 
-		const bool swept_into_something = travel_fraction < 1.0;
-		const bool recovered = !recover.is_equal_approx(Vector3());
-		if (!swept_into_something && !recovered) {
+		// Nothing blocked the motion. Depenetration on its own is NOT a collision:
+		// move_and_collide() applies result.motion either way, so the recovery
+		// still lands, but the boolean must stay false.
+		//
+		// Reporting true here manufactures a contact out of leftover recovery
+		// planes, and move_and_slide() then believes it. Walking off a cliff, the
+		// capsule still grazes the edge, the most floor-like leftover plane is the
+		// cliff top, so is_on_floor() stays true and the character hangs in the
+		// air instead of falling. Jumping, move_and_slide() slides the velocity
+		// along that phantom up-normal, which cancels the jump outright.
+		if (travel_fraction >= 1.0) {
+			if (r_result) {
+				r_result->motion = recover + p_motion;
+				r_result->remainder = Vector3();
+				r_result->collision_safe_fraction = 1.0;
+				r_result->collision_unsafe_fraction = 1.0;
+			}
 			return false;
 		}
 
@@ -1900,6 +1968,10 @@ int Box3DPhysicsServer::body_test_ray_separation(RID p_body, const Transform &p_
 
 	Box3DMoverPlaneContext pctx;
 	pctx.exclude = &exclude;
+	// Same one-way rule as body_test_motion: move_and_slide() applies this
+	// recover motion to the character directly, so a prop must not contribute
+	// to it.
+	pctx.skip_dynamic = true;
 	b3World_CollideMover(space->world_id, b3_pos_from_godot(Vector3()), &mover,
 			b3_query_filter(body->collision_mask), b3_mover_plane_callback, &pctx);
 
