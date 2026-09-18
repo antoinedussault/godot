@@ -66,6 +66,10 @@ private:
 	void _body_enter_world(Box3DBody *p_body, Box3DSpace *p_space);
 	void _body_exit_world(Box3DBody *p_body);
 	void _body_rebuild_shapes(Box3DBody *p_body);
+	// Rebuilds a single shape entry; O(1) instead of O(N) per edit.
+	void _body_rebuild_shape_at(Box3DBody *p_body, int p_index);
+	// Recomputes offset/transform/mass after shape edits. No geometry rebuilt.
+	void _body_finish_shape_edit(Box3DBody *p_body);
 	void _body_apply_mass(Box3DBody *p_body);
 
 	// Pushes the body's collision layer/mask onto its live b3 shapes. Godot sets

@@ -263,6 +263,70 @@ void Box3DPhysicsServer::_body_update_shape_origin_offset(Box3DBody *p_body) {
 			-(real_t)(depth - 1) * scale.z * 0.5);
 }
 
+// Rebuilds ONE shape entry. Everything expensive about a shape lives here --
+// hull construction, height field blob creation, mesh welding -- so the
+// difference between rebuilding one entry and all of them is the difference
+// between O(1) and O(N) per edit, and O(N) and O(N^2) for building a body up one
+// shape at a time. SpatialCable and CellTerrain both do exactly that.
+void Box3DPhysicsServer::_body_rebuild_shape_at(Box3DBody *p_body, int p_index) {
+	ERR_FAIL_NULL(p_body);
+	ERR_FAIL_INDEX(p_index, p_body->shapes.size());
+	if (!p_body->in_world()) {
+		return;
+	}
+
+	Box3DShapeEntry &entry = p_body->shapes.write[p_index];
+
+	if (!B3_IS_NULL(entry.shape_id)) {
+		b3DestroyShape(entry.shape_id, false);
+		entry.shape_id = b3_nullShapeId;
+	}
+	// Free after the shape referencing it is gone, never before.
+	entry.free_owned_geometry();
+	if (entry.disabled) {
+		return;
+	}
+
+	Box3DShape *shape = shape_owner.getornull(entry.shape);
+	if (!shape) {
+		return;
+	}
+
+	Transform scale_xf;
+	scale_xf.basis.scale(p_body->baked_scale);
+
+	b3ShapeDef def = b3DefaultShapeDef();
+	def.density = 1.0f;
+	// Godot encodes PhysicsMaterial's "rough" and "absorbent" flags as a
+	// NEGATIVE friction/bounce (scene/resources/physics_material.h:57-69).
+	// Box3D asserts both are finite and non-negative and aborts the process
+	// otherwise, so take the magnitude.
+	def.baseMaterial.friction = b3_sanitize_material(p_body->friction);
+	def.baseMaterial.restitution = b3_sanitize_material(p_body->bounce);
+	def.filter.categoryBits = p_body->collision_layer;
+	def.filter.maskBits = p_body->collision_mask;
+	// Sensor events are opt-in on BOTH sides -- "This applies to sensors and
+	// non-sensors. False by default, even for sensors." Without this on the
+	// visiting body, an Area sees nothing enter it. Only convex shapes can act
+	// as visitors, so a trimesh or height field body never triggers an Area.
+	def.enableSensorEvents = true;
+	// Mass is recomputed by the caller once, after all edits.
+	def.updateBodyMass = false;
+
+	entry.shape_id = shape->attach(p_body->body_id, &def, scale_xf * entry.xform, &entry);
+}
+
+// Settles everything that depends on the body's overall shape layout. Cheap:
+// no solver geometry is rebuilt here.
+void Box3DPhysicsServer::_body_finish_shape_edit(Box3DBody *p_body) {
+	if (!p_body->in_world()) {
+		return;
+	}
+	_body_update_shape_origin_offset(p_body);
+	_body_sync_transform(p_body);
+	_body_apply_mass(p_body);
+}
+
 void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 	ERR_FAIL_NULL(p_body);
 	if (!p_body->in_world()) {
@@ -272,59 +336,13 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 	// Godot keeps scale in the body's basis; Box3D bodies are rigid. Bake the
 	// body scale into each shape's local transform so nothing is lost, and give
 	// the solver body the rotation-only transform (get_solver_transform()).
-	const Vector3 body_scale = p_body->transform.basis.get_scale();
-	p_body->baked_scale = body_scale;
-
-	Transform scale_xf;
-	scale_xf.basis.scale(body_scale);
+	p_body->baked_scale = p_body->transform.basis.get_scale();
 
 	for (int i = 0; i < p_body->shapes.size(); i++) {
-		Box3DShapeEntry &entry = p_body->shapes.write[i];
-
-		if (!B3_IS_NULL(entry.shape_id)) {
-			b3DestroyShape(entry.shape_id, false);
-			entry.shape_id = b3_nullShapeId;
-		}
-		// Free after the shape referencing it is gone, never before.
-		entry.free_owned_geometry();
-		if (entry.disabled) {
-			continue;
-		}
-
-		Box3DShape *shape = shape_owner.getornull(entry.shape);
-		if (!shape) {
-			continue;
-		}
-
-		b3ShapeDef def = b3DefaultShapeDef();
-		def.density = 1.0f;
-		// Godot encodes PhysicsMaterial's "rough" and "absorbent" flags as a
-		// NEGATIVE friction/bounce (scene/resources/physics_material.h:57-69).
-		// Box3D asserts both are finite and non-negative and aborts the process
-		// otherwise, so take the magnitude -- the flag's meaning has no Box3D
-		// equivalent, but its magnitude is the right value either way.
-		def.baseMaterial.friction = b3_sanitize_material(p_body->friction);
-		def.baseMaterial.restitution = b3_sanitize_material(p_body->bounce);
-		def.filter.categoryBits = p_body->collision_layer;
-		def.filter.maskBits = p_body->collision_mask;
-		// Sensor events are opt-in on BOTH sides -- "This applies to sensors and
-		// non-sensors. False by default, even for sensors." Without this on the
-		// visiting body, an Area sees nothing enter it.
-		// Note only convex shapes can act as visitors, so a trimesh or height
-		// field body will never trigger an Area. That suits static terrain.
-		def.enableSensorEvents = true;
-		// Mass is recomputed once, after every shape is attached.
-		def.updateBodyMass = false;
-
-		entry.shape_id = shape->attach(p_body->body_id, &def, scale_xf * entry.xform, &entry);
+		_body_rebuild_shape_at(p_body, i);
 	}
 
-	// The offset depends on which shapes are attached, so it is recomputed here
-	// and pushed into the solver before mass, which reads the final layout.
-	_body_update_shape_origin_offset(p_body);
-	_body_sync_transform(p_body);
-
-	_body_apply_mass(p_body);
+	_body_finish_shape_edit(p_body);
 }
 
 void Box3DPhysicsServer::_body_apply_mass(Box3DBody *p_body) {
@@ -501,9 +519,19 @@ void Box3DPhysicsServer::shape_set_data(RID p_shape, const Variant &p_data) {
 	}
 
 	for (Set<RID>::Element *E = shape->owners.front(); E; E = E->next()) {
-		if (Box3DBody *body = body_owner.getornull(E->get())) {
-			_body_rebuild_shapes(body);
+		Box3DBody *body = body_owner.getornull(E->get());
+		if (!body) {
+			continue;
 		}
+		// Only the entries referencing this shape are stale. A terrain body
+		// carrying several shapes should not rebuild them all because one
+		// height field's data changed -- this is the cell-streaming hot path.
+		for (int i = 0; i < body->shapes.size(); i++) {
+			if (body->shapes[i].shape == E->get() || body->shapes[i].shape == p_shape) {
+				_body_rebuild_shape_at(body, i);
+			}
+		}
+		_body_finish_shape_edit(body);
 	}
 }
 
@@ -1011,7 +1039,10 @@ void Box3DPhysicsServer::body_add_shape(RID p_body, RID p_shape, const Transform
 	entry.disabled = p_disabled;
 	body->shapes.push_back(entry);
 	shape->owners.insert(p_body);
-	_body_rebuild_shapes(body);
+	// Only the new entry needs building. Rebuilding the whole list here made
+	// assembling an N-shape body cost O(N^2) of hull/mesh construction.
+	_body_rebuild_shape_at(body, body->shapes.size() - 1);
+	_body_finish_shape_edit(body);
 }
 
 void Box3DPhysicsServer::body_set_shape(RID p_body, int p_shape_idx, RID p_shape) {
@@ -1023,7 +1054,8 @@ void Box3DPhysicsServer::body_set_shape(RID p_body, int p_shape_idx, RID p_shape
 
 	body->shapes.write[p_shape_idx].shape = p_shape;
 	shape->owners.insert(p_body);
-	_body_rebuild_shapes(body);
+	_body_rebuild_shape_at(body, p_shape_idx);
+	_body_finish_shape_edit(body);
 }
 
 void Box3DPhysicsServer::body_set_shape_transform(RID p_body, int p_shape_idx, const Transform &p_transform) {
@@ -1031,7 +1063,8 @@ void Box3DPhysicsServer::body_set_shape_transform(RID p_body, int p_shape_idx, c
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.write[p_shape_idx].xform = p_transform;
-	_body_rebuild_shapes(body);
+	_body_rebuild_shape_at(body, p_shape_idx);
+	_body_finish_shape_edit(body);
 }
 
 int Box3DPhysicsServer::body_get_shape_count(RID p_body) const {
@@ -1059,7 +1092,8 @@ void Box3DPhysicsServer::body_set_shape_disabled(RID p_body, int p_shape_idx, bo
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
 	body->shapes.write[p_shape_idx].disabled = p_disabled;
-	_body_rebuild_shapes(body);
+	_body_rebuild_shape_at(body, p_shape_idx);
+	_body_finish_shape_edit(body);
 }
 
 void Box3DPhysicsServer::body_remove_shape(RID p_body, int p_shape_idx) {
@@ -1091,7 +1125,9 @@ void Box3DPhysicsServer::body_remove_shape(RID p_body, int p_shape_idx) {
 		}
 	}
 
-	_body_rebuild_shapes(body);
+	// The surviving entries keep their b3 shapes; only the body-level state
+	// needs settling.
+	_body_finish_shape_edit(body);
 }
 
 void Box3DPhysicsServer::body_clear_shapes(RID p_body) {
