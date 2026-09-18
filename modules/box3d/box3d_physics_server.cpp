@@ -440,6 +440,8 @@ void Box3DPhysicsServer::_area_exit_world(Box3DArea *p_area) {
 
 	if (Box3DSpace *space = space_owner.getornull(p_area->space)) {
 		space->remove_area(p_area);
+		// Bodies hold raw pointers to overlapping areas for the gravity override.
+		space->forget_area(p_area);
 	}
 	if (p_area->in_world()) {
 		b3DestroyBody(p_area->body_id);

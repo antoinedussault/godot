@@ -170,6 +170,11 @@ public:
 
 	Set<RID> collision_exceptions;
 
+	// Areas currently overlapping this body, maintained from Box3D sensor
+	// events. Box3D has no per-area gravity, so the override is recomputed and
+	// applied per body each step.
+	Vector<Box3DArea *> areas;
+
 	// Box3D anchors a height field at the body origin extending positive, while
 	// Godot centers it, and b3CreateHeightFieldShape takes no transform to
 	// correct with. For a static body carrying only a height field, the fix is

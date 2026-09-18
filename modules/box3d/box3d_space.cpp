@@ -410,6 +410,11 @@ void Box3DSpace::flush_sensor_events() {
 
 		Box3DArea *area = static_cast<Box3DArea *>(sensor);
 		if (visitor->type == Box3DCollisionObject::TYPE_BODY) {
+			// Remembered so gravity/damp overrides can be applied each step.
+			Box3DBody *vb = static_cast<Box3DBody *>(visitor);
+			if (vb->areas.find(area) == -1) {
+				vb->areas.push_back(area);
+			}
 			b3_dispatch_area_event(area->monitor_callback_id, area->monitor_callback_method,
 					PhysicsServer::AREA_BODY_ADDED, visitor, visitor_shape, sensor_shape);
 		} else {
@@ -429,11 +434,117 @@ void Box3DSpace::flush_sensor_events() {
 
 		Box3DArea *area = static_cast<Box3DArea *>(sensor);
 		if (visitor->type == Box3DCollisionObject::TYPE_BODY) {
+			static_cast<Box3DBody *>(visitor)->areas.erase(area);
 			b3_dispatch_area_event(area->monitor_callback_id, area->monitor_callback_method,
 					PhysicsServer::AREA_BODY_REMOVED, visitor, visitor_shape, sensor_shape);
 		} else {
 			b3_dispatch_area_event(area->area_monitor_callback_id, area->area_monitor_callback_method,
 					PhysicsServer::AREA_BODY_REMOVED, visitor, visitor_shape, sensor_shape);
+		}
+	}
+}
+
+void Box3DSpace::forget_area(Box3DArea *p_area) {
+	for (int i = 0; i < bodies.size(); i++) {
+		bodies.write[i]->areas.erase(p_area);
+	}
+}
+
+// Godot's per-area gravity/damp accumulation (mirrors BodySW::integrate_forces).
+static void b3_accumulate_area(const Box3DArea *p_area, const Vector3 &p_body_pos,
+		Vector3 *r_gravity, real_t *r_linear_damp, real_t *r_angular_damp) {
+	if (p_area->gravity_is_point) {
+		// gravity_vector is the point, in the area's local space.
+		const Vector3 to_point = p_area->transform.xform(p_area->gravity_vector) - p_body_pos;
+		if (p_area->gravity_distance_scale > 0) {
+			const real_t falloff = Math::pow(to_point.length() * p_area->gravity_distance_scale + 1, (real_t)2.0);
+			*r_gravity += to_point.normalized() * (p_area->gravity / falloff);
+		} else {
+			*r_gravity += to_point.normalized() * p_area->gravity;
+		}
+	} else {
+		*r_gravity += p_area->gravity_vector * p_area->gravity;
+	}
+	*r_linear_damp += p_area->linear_damp;
+	*r_angular_damp += p_area->angular_damp;
+}
+
+void Box3DSpace::apply_area_overrides() {
+	if (B3_IS_NULL(world_id) || !default_area) {
+		return;
+	}
+
+	const Vector3 world_gravity = default_area->gravity_vector * default_area->gravity;
+
+	for (int i = 0; i < bodies.size(); i++) {
+		Box3DBody *body = bodies[i];
+		if (!body->in_world() || body->mode == PhysicsServer::BODY_MODE_STATIC ||
+				body->mode == PhysicsServer::BODY_MODE_KINEMATIC) {
+			continue;
+		}
+
+		Vector3 gravity;
+		real_t area_linear_damp = 0;
+		real_t area_angular_damp = 0;
+		bool stopped = false;
+
+		if (!body->areas.empty()) {
+			// Highest priority first, matching Godot's ordering.
+			Vector<Box3DArea *> sorted = body->areas;
+			for (int a = 1; a < sorted.size(); a++) {
+				Box3DArea *key = sorted[a];
+				int j = a - 1;
+				while (j >= 0 && sorted[j]->priority < key->priority) {
+					sorted.write[j + 1] = sorted[j];
+					j--;
+				}
+				sorted.write[j + 1] = key;
+			}
+
+			for (int a = 0; a < sorted.size() && !stopped; a++) {
+				switch (sorted[a]->space_override_mode) {
+					case PhysicsServer::AREA_SPACE_OVERRIDE_COMBINE:
+					case PhysicsServer::AREA_SPACE_OVERRIDE_COMBINE_REPLACE: {
+						b3_accumulate_area(sorted[a], body->transform.origin, &gravity, &area_linear_damp, &area_angular_damp);
+						stopped = sorted[a]->space_override_mode == PhysicsServer::AREA_SPACE_OVERRIDE_COMBINE_REPLACE;
+					} break;
+					case PhysicsServer::AREA_SPACE_OVERRIDE_REPLACE:
+					case PhysicsServer::AREA_SPACE_OVERRIDE_REPLACE_COMBINE: {
+						gravity = Vector3();
+						area_linear_damp = 0;
+						area_angular_damp = 0;
+						b3_accumulate_area(sorted[a], body->transform.origin, &gravity, &area_linear_damp, &area_angular_damp);
+						stopped = sorted[a]->space_override_mode == PhysicsServer::AREA_SPACE_OVERRIDE_REPLACE;
+					} break;
+					default:
+						break;
+				}
+			}
+		}
+
+		if (!stopped) {
+			b3_accumulate_area(default_area, body->transform.origin, &gravity, &area_linear_damp, &area_angular_damp);
+		}
+
+		// A non-negative body damp REPLACES the accumulated area damp.
+		if (body->linear_damp >= 0) {
+			area_linear_damp = body->linear_damp;
+		}
+		if (body->angular_damp >= 0) {
+			area_angular_damp = body->angular_damp;
+		}
+		b3Body_SetLinearDamping(body->body_id, (float)MAX((real_t)0.0, area_linear_damp));
+		b3Body_SetAngularDamping(body->body_id, (float)MAX((real_t)0.0, area_angular_damp));
+
+		// Box3D already integrates world_gravity * the body's gravity scale, so
+		// only the DIFFERENCE from world gravity has to be applied. Bodies in no
+		// overriding area therefore cost nothing and behave exactly as before.
+		const Vector3 delta = (gravity - world_gravity) * body->gravity_scale;
+		if (delta.length_squared() > CMP_EPSILON) {
+			const float mass = b3Body_GetMass(body->body_id);
+			if (mass > 0.0f) {
+				b3Body_ApplyForceToCenter(body->body_id, b3_from_godot(delta * mass), true);
+			}
 		}
 	}
 }
@@ -444,6 +555,9 @@ void Box3DSpace::step(real_t p_delta) {
 	}
 
 	last_step_delta = p_delta;
+
+	// Must run before the step: Box3D clears applied forces after integrating.
+	apply_area_overrides();
 
 	locked = true;
 	b3World_Step(world_id, (float)p_delta, sub_step_count);

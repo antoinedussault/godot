@@ -126,6 +126,14 @@ public:
 	// callbacks.
 	void flush_sensor_events();
 
+	// Applies Godot's Area gravity/damp overrides. Box3D gravity is per-world, so
+	// anything an Area changes has to be applied per body before each step.
+	void apply_area_overrides();
+
+	// Drops an area from every body that was overlapping it, so a freed area is
+	// never dereferenced.
+	void forget_area(Box3DArea *p_area);
+
 	void step(real_t p_delta);
 	void call_queries();
 };
