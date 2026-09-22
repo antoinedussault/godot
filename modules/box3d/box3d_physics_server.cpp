@@ -1420,7 +1420,11 @@ void Box3DPhysicsServer::body_apply_impulse(RID p_body, const Vector3 &p_pos, co
 }
 
 void Box3DPhysicsServer::body_apply_torque_impulse(RID p_body, const Vector3 &p_impulse) {
-	B3_TODO("body_apply_torque_impulse()");
+	Box3DBody *body = body_owner.getornull(p_body);
+	ERR_FAIL_NULL(body);
+	if (body->in_world()) {
+		b3Body_ApplyAngularImpulse(body->body_id, b3_from_godot(p_impulse), true);
+	}
 }
 
 void Box3DPhysicsServer::body_set_axis_velocity(RID p_body, const Vector3 &p_axis_velocity) {

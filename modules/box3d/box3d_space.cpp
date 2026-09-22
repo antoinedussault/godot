@@ -549,6 +549,46 @@ void Box3DSpace::apply_area_overrides() {
 	}
 }
 
+// Pushes forces and torques accumulated through the PhysicsServer API into the
+// solver.
+//
+// add_central_force(), add_force(), add_torque() and set_applied_force() only
+// ever wrote to Box3DBody bookkeeping; nothing read it back, so every one of
+// them silently did nothing. Godot's contract is that these persist until
+// changed -- unlike impulses, which are one-shot -- so they are re-applied every
+// step. Box3D clears its own force accumulator each step, which is exactly the
+// behaviour that requires this.
+void Box3DSpace::apply_accumulated_forces() {
+	if (B3_IS_NULL(world_id)) {
+		return;
+	}
+
+	for (int i = 0; i < bodies.size(); i++) {
+		Box3DBody *body = bodies[i];
+		if (!body->in_world() || body->mode == PhysicsServer::BODY_MODE_STATIC ||
+				body->mode == PhysicsServer::BODY_MODE_KINEMATIC) {
+			continue;
+		}
+		if (body->omit_force_integration) {
+			continue;
+		}
+
+		if (body->applied_force.length_squared() > CMP_EPSILON) {
+			b3Body_ApplyForceToCenter(body->body_id, b3_from_godot(body->applied_force), true);
+		}
+		if (body->applied_torque.length_squared() > CMP_EPSILON) {
+			b3Body_ApplyTorque(body->body_id, b3_from_godot(body->applied_torque), true);
+		}
+
+		// Godot's applied force/torque are a PER-STEP accumulator, not a standing
+		// value: add_central_force() is expected to be called every frame while
+		// the force should act. Leaving them set compounds the caller's own
+		// per-frame additions -- measured as 25x the correct displacement.
+		body->applied_force = Vector3();
+		body->applied_torque = Vector3();
+	}
+}
+
 void Box3DSpace::step(real_t p_delta) {
 	if (B3_IS_NULL(world_id)) {
 		return;
@@ -558,6 +598,7 @@ void Box3DSpace::step(real_t p_delta) {
 
 	// Must run before the step: Box3D clears applied forces after integrating.
 	apply_area_overrides();
+	apply_accumulated_forces();
 
 	locked = true;
 	b3World_Step(world_id, (float)p_delta, sub_step_count);

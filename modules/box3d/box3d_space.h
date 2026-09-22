@@ -130,6 +130,10 @@ public:
 	// anything an Area changes has to be applied per body before each step.
 	void apply_area_overrides();
 
+	// Re-applies forces/torques set through the PhysicsServer API. Box3D clears
+	// its force accumulator each step; Godot's are persistent until changed.
+	void apply_accumulated_forces();
+
 	// Drops an area from every body that was overlapping it, so a freed area is
 	// never dereferenced.
 	void forget_area(Box3DArea *p_area);

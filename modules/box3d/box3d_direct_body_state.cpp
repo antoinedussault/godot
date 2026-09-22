@@ -2,6 +2,7 @@
 
 #include "box3d_physics_server.h"
 #include "box3d_space.h"
+#include "box3d_types_converter.h"
 #include "core/error_macros.h"
 
 Box3DPhysicsDirectBodyState *Box3DPhysicsDirectBodyState::singleton = nullptr;
@@ -121,19 +122,29 @@ void Box3DPhysicsDirectBodyState::add_torque(const Vector3 &p_torque) {
 
 void Box3DPhysicsDirectBodyState::apply_central_impulse(const Vector3 &p_j) {
 	ERR_FAIL_NULL(body);
+	if (body->in_world()) {
+		b3Body_ApplyLinearImpulseToCenter(body->body_id, b3_from_godot(p_j), true);
+		return;
+	}
 	body->linear_velocity += p_j * (body->mass > 0 ? 1.0 / body->mass : 0.0);
 }
 
 void Box3DPhysicsDirectBodyState::apply_impulse(const Vector3 &p_pos, const Vector3 &p_j) {
 	ERR_FAIL_NULL(body);
-	// Without an inertia tensor the angular half cannot be applied correctly, so
-	// only the linear part is honoured until the solver is wired up.
+	if (body->in_world()) {
+		// Godot gives the application point in body-local space; Box3D wants world.
+		b3Body_ApplyLinearImpulse(body->body_id, b3_from_godot(p_j),
+				b3_pos_from_godot(body->transform.xform(p_pos)), true);
+		return;
+	}
 	body->linear_velocity += p_j * (body->mass > 0 ? 1.0 / body->mass : 0.0);
 }
 
 void Box3DPhysicsDirectBodyState::apply_torque_impulse(const Vector3 &p_j) {
 	ERR_FAIL_NULL(body);
-	WARN_PRINT_ONCE("Box3D: apply_torque_impulse() needs an inertia tensor; ignored for now.");
+	if (body->in_world()) {
+		b3Body_ApplyAngularImpulse(body->body_id, b3_from_godot(p_j), true);
+	}
 }
 
 void Box3DPhysicsDirectBodyState::set_sleep_state(bool p_enable) {
