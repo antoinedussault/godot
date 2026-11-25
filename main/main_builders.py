@@ -20,7 +20,7 @@ def make_splash(target, source, env):
         g.write("/* THIS FILE IS GENERATED DO NOT EDIT */\n")
         g.write("#ifndef BOOT_SPLASH_H\n")
         g.write("#define BOOT_SPLASH_H\n")
-        # Black to blend seamlessly with the LowDot splash logo's background.
+        # Black to blend seamlessly with the Tuna splash logo's background.
         g.write("static const Color boot_splash_bg_color = Color(0, 0, 0);\n")
         g.write("static const unsigned char boot_splash_png[] = {\n")
         for i in range(len(buf)):

@@ -844,6 +844,14 @@ float Environment::get_volumetric_fog_height_ref() const {
 	return volumetric_fog_height_ref;
 }
 
+void Environment::set_volumetric_fog_height_relative(bool p_relative) {
+	volumetric_fog_height_relative = p_relative;
+	VS::get_singleton()->environment_set_volumetric_fog_height_relative(environment, volumetric_fog_height_relative);
+}
+bool Environment::is_volumetric_fog_height_relative() const {
+	return volumetric_fog_height_relative;
+}
+
 void Environment::set_volumetric_fog_albedo(const Color &p_albedo) {
 	volumetric_fog_albedo = p_albedo;
 	_update_volumetric_fog();
@@ -893,7 +901,7 @@ float Environment::get_volumetric_fog_extinction() const {
 }
 
 void Environment::set_volumetric_fog_samples(int p_samples) {
-	volumetric_fog_samples = CLAMP(p_samples, 8, 128);
+	volumetric_fog_samples = CLAMP(p_samples, 8, 512);
 	_update_volumetric_fog();
 }
 int Environment::get_volumetric_fog_samples() const {
@@ -906,6 +914,269 @@ void Environment::set_volumetric_fog_temporal_blend(float p_blend) {
 }
 float Environment::get_volumetric_fog_temporal_blend() const {
 	return volumetric_fog_temporal_blend;
+}
+
+void Environment::_update_dynamic_gi() {
+	VS::get_singleton()->environment_set_dynamic_gi(environment, dynamic_gi_enabled, dynamic_gi_cascades, dynamic_gi_voxel_size, dynamic_gi_energy, dynamic_gi_bounce_feedback, dynamic_gi_normal_bias, dynamic_gi_hysteresis, dynamic_gi_rays, dynamic_gi_reflection_occlusion, dynamic_gi_cull_mask, VS::EnvironmentDynamicGIDebug(dynamic_gi_debug));
+}
+
+void Environment::_update_ssgi() {
+	VS::get_singleton()->environment_set_ssgi(environment, ssgi_enabled, ssgi_radius, ssgi_intensity, ssgi_rays, ssgi_steps, ssgi_thickness, ssgi_temporal_blend, ssgi_half_resolution);
+}
+
+void Environment::set_dynamic_gi_enabled(bool p_value) {
+	dynamic_gi_enabled = p_value;
+	_update_dynamic_gi();
+	_change_notify();
+}
+bool Environment::is_dynamic_gi_enabled() const {
+	return dynamic_gi_enabled;
+}
+
+void Environment::set_dynamic_gi_cascades(int p_value) {
+	dynamic_gi_cascades = CLAMP(p_value, 1, 6);
+	_update_dynamic_gi();
+}
+int Environment::get_dynamic_gi_cascades() const {
+	return dynamic_gi_cascades;
+}
+
+void Environment::set_dynamic_gi_voxel_size(float p_value) {
+	dynamic_gi_voxel_size = MAX(p_value, 0.01f);
+	_update_dynamic_gi();
+}
+float Environment::get_dynamic_gi_voxel_size() const {
+	return dynamic_gi_voxel_size;
+}
+
+void Environment::set_dynamic_gi_energy(float p_value) {
+	dynamic_gi_energy = p_value;
+	_update_dynamic_gi();
+}
+float Environment::get_dynamic_gi_energy() const {
+	return dynamic_gi_energy;
+}
+
+void Environment::set_dynamic_gi_bounce_feedback(float p_value) {
+	dynamic_gi_bounce_feedback = p_value;
+	_update_dynamic_gi();
+}
+float Environment::get_dynamic_gi_bounce_feedback() const {
+	return dynamic_gi_bounce_feedback;
+}
+
+void Environment::set_dynamic_gi_normal_bias(float p_value) {
+	dynamic_gi_normal_bias = p_value;
+	_update_dynamic_gi();
+}
+float Environment::get_dynamic_gi_normal_bias() const {
+	return dynamic_gi_normal_bias;
+}
+
+void Environment::set_dynamic_gi_hysteresis(float p_value) {
+	dynamic_gi_hysteresis = CLAMP(p_value, 0.0f, 0.99f);
+	_update_dynamic_gi();
+}
+float Environment::get_dynamic_gi_hysteresis() const {
+	return dynamic_gi_hysteresis;
+}
+
+void Environment::set_dynamic_gi_rays(int p_value) {
+	dynamic_gi_rays = CLAMP(p_value / 64, 1, 3) * 64;
+	_update_dynamic_gi();
+}
+int Environment::get_dynamic_gi_rays() const {
+	return dynamic_gi_rays;
+}
+
+void Environment::set_dynamic_gi_reflection_occlusion(bool p_value) {
+	dynamic_gi_reflection_occlusion = p_value;
+	_update_dynamic_gi();
+}
+bool Environment::is_dynamic_gi_reflection_occlusion() const {
+	return dynamic_gi_reflection_occlusion;
+}
+
+void Environment::set_dynamic_gi_cull_mask(uint32_t p_value) {
+	dynamic_gi_cull_mask = p_value;
+	_update_dynamic_gi();
+}
+uint32_t Environment::get_dynamic_gi_cull_mask() const {
+	return dynamic_gi_cull_mask;
+}
+
+void Environment::set_dynamic_gi_debug(DynamicGIDebug p_value) {
+	dynamic_gi_debug = p_value;
+	_update_dynamic_gi();
+}
+Environment::DynamicGIDebug Environment::get_dynamic_gi_debug() const {
+	return dynamic_gi_debug;
+}
+
+void Environment::set_ssgi_enabled(bool p_value) {
+	ssgi_enabled = p_value;
+	_update_ssgi();
+	_change_notify();
+}
+bool Environment::is_ssgi_enabled() const {
+	return ssgi_enabled;
+}
+
+void Environment::set_ssgi_radius(float p_value) {
+	ssgi_radius = p_value;
+	_update_ssgi();
+}
+float Environment::get_ssgi_radius() const {
+	return ssgi_radius;
+}
+
+void Environment::set_ssgi_intensity(float p_value) {
+	ssgi_intensity = p_value;
+	_update_ssgi();
+}
+float Environment::get_ssgi_intensity() const {
+	return ssgi_intensity;
+}
+
+void Environment::set_ssgi_rays(int p_value) {
+	ssgi_rays = CLAMP(p_value, 1, 16);
+	_update_ssgi();
+}
+int Environment::get_ssgi_rays() const {
+	return ssgi_rays;
+}
+
+void Environment::set_ssgi_steps(int p_value) {
+	ssgi_steps = CLAMP(p_value, 4, 64);
+	_update_ssgi();
+}
+int Environment::get_ssgi_steps() const {
+	return ssgi_steps;
+}
+
+void Environment::set_ssgi_thickness(float p_value) {
+	ssgi_thickness = p_value;
+	_update_ssgi();
+}
+float Environment::get_ssgi_thickness() const {
+	return ssgi_thickness;
+}
+
+void Environment::set_ssgi_temporal_blend(float p_value) {
+	ssgi_temporal_blend = CLAMP(p_value, 0.0f, 0.99f);
+	_update_ssgi();
+}
+float Environment::get_ssgi_temporal_blend() const {
+	return ssgi_temporal_blend;
+}
+
+void Environment::set_ssgi_half_resolution(bool p_value) {
+	ssgi_half_resolution = p_value;
+	_update_ssgi();
+}
+bool Environment::is_ssgi_half_resolution() const {
+	return ssgi_half_resolution;
+}
+
+void Environment::_update_exp_height_fog() {
+	VS::get_singleton()->environment_set_exp_height_fog(environment, exp_height_fog_enabled, exp_height_fog_density, exp_height_fog_falloff, exp_height_fog_ref_height, exp_height_fog_ref_height_relative, exp_height_fog_start_distance, exp_height_fog_max_opacity, exp_height_fog_inscatter, exp_height_fog_directional_enabled, exp_height_fog_directional_color, exp_height_fog_light_direction, exp_height_fog_directional_exponent);
+}
+
+void Environment::set_exp_height_fog_enabled(bool p_enabled) {
+	exp_height_fog_enabled = p_enabled;
+	_update_exp_height_fog();
+	_change_notify();
+}
+bool Environment::is_exp_height_fog_enabled() const {
+	return exp_height_fog_enabled;
+}
+
+void Environment::set_exp_height_fog_density(float p_density) {
+	exp_height_fog_density = p_density;
+	_update_exp_height_fog();
+}
+float Environment::get_exp_height_fog_density() const {
+	return exp_height_fog_density;
+}
+
+void Environment::set_exp_height_fog_falloff(float p_falloff) {
+	exp_height_fog_falloff = p_falloff;
+	_update_exp_height_fog();
+}
+float Environment::get_exp_height_fog_falloff() const {
+	return exp_height_fog_falloff;
+}
+
+void Environment::set_exp_height_fog_ref_height(float p_ref_height) {
+	exp_height_fog_ref_height = p_ref_height;
+	_update_exp_height_fog();
+}
+float Environment::get_exp_height_fog_ref_height() const {
+	return exp_height_fog_ref_height;
+}
+
+void Environment::set_exp_height_fog_ref_height_relative(bool p_relative) {
+	exp_height_fog_ref_height_relative = p_relative;
+	_update_exp_height_fog();
+}
+bool Environment::is_exp_height_fog_ref_height_relative() const {
+	return exp_height_fog_ref_height_relative;
+}
+
+void Environment::set_exp_height_fog_start_distance(float p_distance) {
+	exp_height_fog_start_distance = p_distance;
+	_update_exp_height_fog();
+}
+float Environment::get_exp_height_fog_start_distance() const {
+	return exp_height_fog_start_distance;
+}
+
+void Environment::set_exp_height_fog_max_opacity(float p_opacity) {
+	exp_height_fog_max_opacity = p_opacity;
+	_update_exp_height_fog();
+}
+float Environment::get_exp_height_fog_max_opacity() const {
+	return exp_height_fog_max_opacity;
+}
+
+void Environment::set_exp_height_fog_inscatter(const Color &p_color) {
+	exp_height_fog_inscatter = p_color;
+	_update_exp_height_fog();
+}
+Color Environment::get_exp_height_fog_inscatter() const {
+	return exp_height_fog_inscatter;
+}
+
+void Environment::set_exp_height_fog_directional_enabled(bool p_enabled) {
+	exp_height_fog_directional_enabled = p_enabled;
+	_update_exp_height_fog();
+}
+bool Environment::is_exp_height_fog_directional_enabled() const {
+	return exp_height_fog_directional_enabled;
+}
+
+void Environment::set_exp_height_fog_directional_color(const Color &p_color) {
+	exp_height_fog_directional_color = p_color;
+	_update_exp_height_fog();
+}
+Color Environment::get_exp_height_fog_directional_color() const {
+	return exp_height_fog_directional_color;
+}
+
+void Environment::set_exp_height_fog_light_direction(const Vector3 &p_dir) {
+	exp_height_fog_light_direction = p_dir;
+	_update_exp_height_fog();
+}
+Vector3 Environment::get_exp_height_fog_light_direction() const {
+	return exp_height_fog_light_direction;
+}
+
+void Environment::set_exp_height_fog_directional_exponent(float p_exponent) {
+	exp_height_fog_directional_exponent = p_exponent;
+	_update_exp_height_fog();
+}
+float Environment::get_exp_height_fog_directional_exponent() const {
+	return exp_height_fog_directional_exponent;
 }
 
 void Environment::_bind_methods() {
@@ -1021,6 +1292,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_volumetric_fog_height_falloff"), &Environment::get_volumetric_fog_height_falloff);
 	ClassDB::bind_method(D_METHOD("set_volumetric_fog_height_ref", "ref_height"), &Environment::set_volumetric_fog_height_ref);
 	ClassDB::bind_method(D_METHOD("get_volumetric_fog_height_ref"), &Environment::get_volumetric_fog_height_ref);
+	ClassDB::bind_method(D_METHOD("set_volumetric_fog_height_relative", "relative"), &Environment::set_volumetric_fog_height_relative);
+	ClassDB::bind_method(D_METHOD("is_volumetric_fog_height_relative"), &Environment::is_volumetric_fog_height_relative);
 	ClassDB::bind_method(D_METHOD("set_volumetric_fog_albedo", "albedo"), &Environment::set_volumetric_fog_albedo);
 	ClassDB::bind_method(D_METHOD("get_volumetric_fog_albedo"), &Environment::get_volumetric_fog_albedo);
 	ClassDB::bind_method(D_METHOD("set_volumetric_fog_ambient", "ambient"), &Environment::set_volumetric_fog_ambient);
@@ -1043,14 +1316,117 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_density", PROPERTY_HINT_RANGE, "0,1,0.0001"), "set_volumetric_fog_density", "get_volumetric_fog_density");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_height_falloff", PROPERTY_HINT_RANGE, "0,2,0.001,or_greater"), "set_volumetric_fog_height_falloff", "get_volumetric_fog_height_falloff");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_height_ref", PROPERTY_HINT_RANGE, "-4000,4000,0.1,or_lesser,or_greater"), "set_volumetric_fog_height_ref", "get_volumetric_fog_height_ref");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "volumetric_fog_height_relative"), "set_volumetric_fog_height_relative", "is_volumetric_fog_height_relative");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "volumetric_fog_albedo"), "set_volumetric_fog_albedo", "get_volumetric_fog_albedo");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "volumetric_fog_ambient"), "set_volumetric_fog_ambient", "get_volumetric_fog_ambient");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_sun_energy", PROPERTY_HINT_RANGE, "0,16,0.01,or_greater"), "set_volumetric_fog_sun_energy", "get_volumetric_fog_sun_energy");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_anisotropy", PROPERTY_HINT_RANGE, "-0.95,0.95,0.01"), "set_volumetric_fog_anisotropy", "get_volumetric_fog_anisotropy");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_length", PROPERTY_HINT_RANGE, "1,4000,0.1,or_greater"), "set_volumetric_fog_length", "get_volumetric_fog_length");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_extinction", PROPERTY_HINT_RANGE, "0,4,0.01,or_greater"), "set_volumetric_fog_extinction", "get_volumetric_fog_extinction");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "volumetric_fog_samples", PROPERTY_HINT_RANGE, "8,128,1"), "set_volumetric_fog_samples", "get_volumetric_fog_samples");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "volumetric_fog_samples", PROPERTY_HINT_RANGE, "8,512,1"), "set_volumetric_fog_samples", "get_volumetric_fog_samples");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "volumetric_fog_temporal_blend", PROPERTY_HINT_RANGE, "0,0.98,0.01"), "set_volumetric_fog_temporal_blend", "get_volumetric_fog_temporal_blend");
+
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_enabled", "value"), &Environment::set_dynamic_gi_enabled);
+	ClassDB::bind_method(D_METHOD("is_dynamic_gi_enabled"), &Environment::is_dynamic_gi_enabled);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_cascades", "value"), &Environment::set_dynamic_gi_cascades);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_cascades"), &Environment::get_dynamic_gi_cascades);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_voxel_size", "value"), &Environment::set_dynamic_gi_voxel_size);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_voxel_size"), &Environment::get_dynamic_gi_voxel_size);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_energy", "value"), &Environment::set_dynamic_gi_energy);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_energy"), &Environment::get_dynamic_gi_energy);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_bounce_feedback", "value"), &Environment::set_dynamic_gi_bounce_feedback);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_bounce_feedback"), &Environment::get_dynamic_gi_bounce_feedback);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_normal_bias", "value"), &Environment::set_dynamic_gi_normal_bias);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_normal_bias"), &Environment::get_dynamic_gi_normal_bias);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_hysteresis", "value"), &Environment::set_dynamic_gi_hysteresis);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_hysteresis"), &Environment::get_dynamic_gi_hysteresis);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_rays", "value"), &Environment::set_dynamic_gi_rays);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_rays"), &Environment::get_dynamic_gi_rays);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_reflection_occlusion", "value"), &Environment::set_dynamic_gi_reflection_occlusion);
+	ClassDB::bind_method(D_METHOD("is_dynamic_gi_reflection_occlusion"), &Environment::is_dynamic_gi_reflection_occlusion);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_cull_mask", "value"), &Environment::set_dynamic_gi_cull_mask);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_cull_mask"), &Environment::get_dynamic_gi_cull_mask);
+	ClassDB::bind_method(D_METHOD("set_dynamic_gi_debug", "value"), &Environment::set_dynamic_gi_debug);
+	ClassDB::bind_method(D_METHOD("get_dynamic_gi_debug"), &Environment::get_dynamic_gi_debug);
+
+	ADD_GROUP("Dynamic GI", "dynamic_gi_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dynamic_gi_enabled"), "set_dynamic_gi_enabled", "is_dynamic_gi_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "dynamic_gi_cascades", PROPERTY_HINT_RANGE, "1,6,1"), "set_dynamic_gi_cascades", "get_dynamic_gi_cascades");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "dynamic_gi_voxel_size", PROPERTY_HINT_RANGE, "0.05,4,0.01,or_greater"), "set_dynamic_gi_voxel_size", "get_dynamic_gi_voxel_size");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "dynamic_gi_energy", PROPERTY_HINT_RANGE, "0,8,0.01,or_greater"), "set_dynamic_gi_energy", "get_dynamic_gi_energy");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "dynamic_gi_bounce_feedback", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_dynamic_gi_bounce_feedback", "get_dynamic_gi_bounce_feedback");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "dynamic_gi_normal_bias", PROPERTY_HINT_RANGE, "0,4,0.01"), "set_dynamic_gi_normal_bias", "get_dynamic_gi_normal_bias");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "dynamic_gi_hysteresis", PROPERTY_HINT_RANGE, "0,0.99,0.01"), "set_dynamic_gi_hysteresis", "get_dynamic_gi_hysteresis");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "dynamic_gi_rays", PROPERTY_HINT_ENUM, "64:64,128:128,192:192"), "set_dynamic_gi_rays", "get_dynamic_gi_rays");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dynamic_gi_reflection_occlusion"), "set_dynamic_gi_reflection_occlusion", "is_dynamic_gi_reflection_occlusion");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "dynamic_gi_cull_mask", PROPERTY_HINT_LAYERS_3D_RENDER), "set_dynamic_gi_cull_mask", "get_dynamic_gi_cull_mask");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "dynamic_gi_debug", PROPERTY_HINT_ENUM, "Disabled,Voxel Lighting,Voxel Albedo,Irradiance,SSGI"), "set_dynamic_gi_debug", "get_dynamic_gi_debug");
+
+	ClassDB::bind_method(D_METHOD("set_ssgi_enabled", "value"), &Environment::set_ssgi_enabled);
+	ClassDB::bind_method(D_METHOD("is_ssgi_enabled"), &Environment::is_ssgi_enabled);
+	ClassDB::bind_method(D_METHOD("set_ssgi_radius", "value"), &Environment::set_ssgi_radius);
+	ClassDB::bind_method(D_METHOD("get_ssgi_radius"), &Environment::get_ssgi_radius);
+	ClassDB::bind_method(D_METHOD("set_ssgi_intensity", "value"), &Environment::set_ssgi_intensity);
+	ClassDB::bind_method(D_METHOD("get_ssgi_intensity"), &Environment::get_ssgi_intensity);
+	ClassDB::bind_method(D_METHOD("set_ssgi_rays", "value"), &Environment::set_ssgi_rays);
+	ClassDB::bind_method(D_METHOD("get_ssgi_rays"), &Environment::get_ssgi_rays);
+	ClassDB::bind_method(D_METHOD("set_ssgi_steps", "value"), &Environment::set_ssgi_steps);
+	ClassDB::bind_method(D_METHOD("get_ssgi_steps"), &Environment::get_ssgi_steps);
+	ClassDB::bind_method(D_METHOD("set_ssgi_thickness", "value"), &Environment::set_ssgi_thickness);
+	ClassDB::bind_method(D_METHOD("get_ssgi_thickness"), &Environment::get_ssgi_thickness);
+	ClassDB::bind_method(D_METHOD("set_ssgi_temporal_blend", "value"), &Environment::set_ssgi_temporal_blend);
+	ClassDB::bind_method(D_METHOD("get_ssgi_temporal_blend"), &Environment::get_ssgi_temporal_blend);
+	ClassDB::bind_method(D_METHOD("set_ssgi_half_resolution", "value"), &Environment::set_ssgi_half_resolution);
+	ClassDB::bind_method(D_METHOD("is_ssgi_half_resolution"), &Environment::is_ssgi_half_resolution);
+
+	ADD_GROUP("SSGI", "ssgi_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ssgi_enabled"), "set_ssgi_enabled", "is_ssgi_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "ssgi_radius", PROPERTY_HINT_RANGE, "0.1,32,0.1,or_greater"), "set_ssgi_radius", "get_ssgi_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "ssgi_intensity", PROPERTY_HINT_RANGE, "0,4,0.01,or_greater"), "set_ssgi_intensity", "get_ssgi_intensity");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "ssgi_rays", PROPERTY_HINT_RANGE, "1,16,1"), "set_ssgi_rays", "get_ssgi_rays");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "ssgi_steps", PROPERTY_HINT_RANGE, "4,64,1"), "set_ssgi_steps", "get_ssgi_steps");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "ssgi_thickness", PROPERTY_HINT_RANGE, "0.01,4,0.01"), "set_ssgi_thickness", "get_ssgi_thickness");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "ssgi_temporal_blend", PROPERTY_HINT_RANGE, "0,0.99,0.01"), "set_ssgi_temporal_blend", "get_ssgi_temporal_blend");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ssgi_half_resolution"), "set_ssgi_half_resolution", "is_ssgi_half_resolution");
+
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_enabled", "enabled"), &Environment::set_exp_height_fog_enabled);
+	ClassDB::bind_method(D_METHOD("is_exp_height_fog_enabled"), &Environment::is_exp_height_fog_enabled);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_density", "density"), &Environment::set_exp_height_fog_density);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_density"), &Environment::get_exp_height_fog_density);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_falloff", "falloff"), &Environment::set_exp_height_fog_falloff);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_falloff"), &Environment::get_exp_height_fog_falloff);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_ref_height", "ref_height"), &Environment::set_exp_height_fog_ref_height);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_ref_height"), &Environment::get_exp_height_fog_ref_height);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_ref_height_relative", "relative"), &Environment::set_exp_height_fog_ref_height_relative);
+	ClassDB::bind_method(D_METHOD("is_exp_height_fog_ref_height_relative"), &Environment::is_exp_height_fog_ref_height_relative);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_start_distance", "distance"), &Environment::set_exp_height_fog_start_distance);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_start_distance"), &Environment::get_exp_height_fog_start_distance);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_max_opacity", "opacity"), &Environment::set_exp_height_fog_max_opacity);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_max_opacity"), &Environment::get_exp_height_fog_max_opacity);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_inscatter", "color"), &Environment::set_exp_height_fog_inscatter);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_inscatter"), &Environment::get_exp_height_fog_inscatter);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_directional_enabled", "enabled"), &Environment::set_exp_height_fog_directional_enabled);
+	ClassDB::bind_method(D_METHOD("is_exp_height_fog_directional_enabled"), &Environment::is_exp_height_fog_directional_enabled);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_directional_color", "color"), &Environment::set_exp_height_fog_directional_color);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_directional_color"), &Environment::get_exp_height_fog_directional_color);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_light_direction", "dir"), &Environment::set_exp_height_fog_light_direction);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_light_direction"), &Environment::get_exp_height_fog_light_direction);
+	ClassDB::bind_method(D_METHOD("set_exp_height_fog_directional_exponent", "exponent"), &Environment::set_exp_height_fog_directional_exponent);
+	ClassDB::bind_method(D_METHOD("get_exp_height_fog_directional_exponent"), &Environment::get_exp_height_fog_directional_exponent);
+
+	ADD_GROUP("Exp Height Fog", "exp_height_fog_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "exp_height_fog_enabled"), "set_exp_height_fog_enabled", "is_exp_height_fog_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "exp_height_fog_density", PROPERTY_HINT_RANGE, "0,1,0.0001"), "set_exp_height_fog_density", "get_exp_height_fog_density");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "exp_height_fog_falloff", PROPERTY_HINT_RANGE, "0,2,0.001"), "set_exp_height_fog_falloff", "get_exp_height_fog_falloff");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "exp_height_fog_ref_height", PROPERTY_HINT_RANGE, "-4000,4000,0.1,or_lesser,or_greater"), "set_exp_height_fog_ref_height", "get_exp_height_fog_ref_height");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "exp_height_fog_ref_height_relative"), "set_exp_height_fog_ref_height_relative", "is_exp_height_fog_ref_height_relative");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "exp_height_fog_start_distance", PROPERTY_HINT_RANGE, "0,10000,0.1"), "set_exp_height_fog_start_distance", "get_exp_height_fog_start_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "exp_height_fog_max_opacity", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_exp_height_fog_max_opacity", "get_exp_height_fog_max_opacity");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "exp_height_fog_inscatter"), "set_exp_height_fog_inscatter", "get_exp_height_fog_inscatter");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "exp_height_fog_directional_enabled"), "set_exp_height_fog_directional_enabled", "is_exp_height_fog_directional_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "exp_height_fog_directional_color"), "set_exp_height_fog_directional_color", "get_exp_height_fog_directional_color");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "exp_height_fog_light_direction"), "set_exp_height_fog_light_direction", "get_exp_height_fog_light_direction");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "exp_height_fog_directional_exponent", PROPERTY_HINT_RANGE, "1,32,0.1"), "set_exp_height_fog_directional_exponent", "get_exp_height_fog_directional_exponent");
 
 	ClassDB::bind_method(D_METHOD("set_tonemapper", "mode"), &Environment::set_tonemapper);
 	ClassDB::bind_method(D_METHOD("get_tonemapper"), &Environment::get_tonemapper);
@@ -1306,6 +1682,12 @@ void Environment::_bind_methods() {
 	BIND_ENUM_CONSTANT(DOF_BLUR_QUALITY_MEDIUM);
 	BIND_ENUM_CONSTANT(DOF_BLUR_QUALITY_HIGH);
 
+	BIND_ENUM_CONSTANT(DYNAMIC_GI_DEBUG_DISABLED);
+	BIND_ENUM_CONSTANT(DYNAMIC_GI_DEBUG_LIGHTING);
+	BIND_ENUM_CONSTANT(DYNAMIC_GI_DEBUG_ALBEDO);
+	BIND_ENUM_CONSTANT(DYNAMIC_GI_DEBUG_IRRADIANCE);
+	BIND_ENUM_CONSTANT(DYNAMIC_GI_DEBUG_SSGI);
+
 	BIND_ENUM_CONSTANT(SSAO_BLUR_DISABLED);
 	BIND_ENUM_CONSTANT(SSAO_BLUR_1x1);
 	BIND_ENUM_CONSTANT(SSAO_BLUR_2x2);
@@ -1420,6 +1802,7 @@ Environment::Environment() :
 	volumetric_fog_density = 0.03;
 	volumetric_fog_height_falloff = 0.1;
 	volumetric_fog_height_ref = 0.0;
+	volumetric_fog_height_relative = false;
 	volumetric_fog_albedo = Color(1, 1, 1);
 	volumetric_fog_ambient = Color(0.05, 0.06, 0.08);
 	volumetric_fog_sun_energy = 1.0;
@@ -1429,9 +1812,47 @@ Environment::Environment() :
 	volumetric_fog_samples = 48;
 	volumetric_fog_temporal_blend = 0.9;
 
+	dynamic_gi_enabled = false;
+	dynamic_gi_cascades = 4;
+	dynamic_gi_voxel_size = 0.25;
+	dynamic_gi_energy = 1.0;
+	dynamic_gi_bounce_feedback = 0.8;
+	dynamic_gi_normal_bias = 1.1;
+	dynamic_gi_hysteresis = 0.95;
+	dynamic_gi_rays = 64;
+	dynamic_gi_reflection_occlusion = true;
+	dynamic_gi_cull_mask = 0xFFFFF;
+	dynamic_gi_debug = DYNAMIC_GI_DEBUG_DISABLED;
+	ssgi_enabled = false;
+	ssgi_radius = 4.0;
+	ssgi_intensity = 1.0;
+	ssgi_rays = 4;
+	ssgi_steps = 12;
+	ssgi_thickness = 0.5;
+	ssgi_temporal_blend = 0.95;
+	ssgi_half_resolution = true;
+
+	// Defaults mirror the ExpHeightFog node's own field defaults.
+	exp_height_fog_enabled = false;
+	exp_height_fog_density = 0.04;
+	exp_height_fog_falloff = 0.15;
+	exp_height_fog_ref_height = 0.0;
+	exp_height_fog_ref_height_relative = false;
+	exp_height_fog_start_distance = 0.0;
+	exp_height_fog_max_opacity = 1.0;
+	exp_height_fog_inscatter = Color(0.55, 0.62, 0.72);
+	exp_height_fog_directional_enabled = false;
+	exp_height_fog_directional_color = Color(1.0, 0.9, 0.7);
+	exp_height_fog_light_direction = Vector3(0, -1, 0);
+	exp_height_fog_directional_exponent = 4.0;
+
 	set_fog_color(Color(0.5, 0.6, 0.7));
 	set_fog_sun_color(Color(1.0, 0.9, 0.7));
 	_update_volumetric_fog();
+	VS::get_singleton()->environment_set_volumetric_fog_height_relative(environment, volumetric_fog_height_relative);
+	_update_dynamic_gi();
+	_update_ssgi();
+	_update_exp_height_fog();
 }
 
 Environment::~Environment() {

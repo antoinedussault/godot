@@ -5,6 +5,7 @@
 #include "editor/editor_plugin.h"
 #include "core/map.h"
 #include "core/pool_vector.h"
+#include "editor_ui_helpers.h"
 #include "tree_importer.h"
 
 class FoliageManager;
@@ -17,9 +18,9 @@ class EditorSpinSlider;
 class ButtonGroup;
 class Button;
 
-// Activates when a FoliageManager is selected. Left dock panel for painting
-// foliage: a mode grid (Scatter / Single / Erase), a type picker, and
-// radius/strength sliders. Mirrors TerrainEditorPlugin's dock structure and raycast.
+// Activates when a FoliageManager is selected. Its UI sits in the viewport
+// top toolbar: icon mode buttons (Scatter / Single / Erase), a type picker and
+// radius/strength sliders. Mirrors TerrainEditorPlugin.
 class FoliageEditorPlugin : public EditorPlugin {
 	GDCLASS(FoliageEditorPlugin, EditorPlugin);
 
@@ -27,10 +28,10 @@ class FoliageEditorPlugin : public EditorPlugin {
 
 	FoliageManager *manager = nullptr;
 
-	Control *dock_root = nullptr;
-	VBoxContainer *dock_content = nullptr;
-
-	GridContainer *mode_grid = nullptr;
+	// The whole UI lives in the viewport top bar next to the mode icons, same
+	// as TerrainEditorPlugin - there is no bottom panel, so make_visible()
+	// showing/hiding this one HBox covers everything.
+	class HBoxContainer *icon_toolbar = nullptr;
 	Ref<ButtonGroup> mode_group;
 	Button *mode_buttons[3] = {};
 	OptionButton *type_select = nullptr;
@@ -45,10 +46,20 @@ class FoliageEditorPlugin : public EditorPlugin {
 
 	Camera *cached_camera = nullptr;
 
+	// Viewport brush ring. The foliage tool had none at all, so there was no way
+	// to see where or how wide you were painting - the terrain tool has had one
+	// all along (TerrainEditorPlugin::_update_brush_viz).
+	CSViewportOverlay brush_viz;
+	Vector3 _last_hit;
+	bool _has_hit = false;
+	void _update_brush_viz(const Vector3 &world_hit);
+	void _clear_brush_viz();
+
 	Map<int64_t, PoolRealArray> _stroke_before;
 	Ref<TreeImporter> _tree_importer;
 
-	void _build_dock();
+	void _build_icon_toolbar();
+	void _build_toolbar_settings();
 	bool _raycast(Camera *cam, const Point2 &screen, Vector3 &out_hit, Vector3 &out_normal);
 	void _refresh_type_list();
 	void _apply_at(const Vector3 &hit, const Vector3 &normal);

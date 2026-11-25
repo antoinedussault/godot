@@ -1,0 +1,9 @@
+[gd_scene load_steps=2 format=2]
+
+[ext_resource path="res://probe.gd" type="Script" id=1]
+
+[node name="Ext" type="GameWorld"]
+format_version = 2
+
+[node name="Probe" type="Node" parent="."]
+script = ExtResource( 1 )

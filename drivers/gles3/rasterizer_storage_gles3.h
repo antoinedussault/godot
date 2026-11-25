@@ -569,6 +569,9 @@ public:
 			bool writes_modelview_or_projection;
 			bool uses_vertex_lighting;
 			bool uses_world_coordinates;
+			// Shader declares tess_control()/tess_eval(); drives USE_TESSELLATION
+			// and makes the draw path emit GL_PATCHES instead of GL_TRIANGLES.
+			bool uses_tessellation;
 
 		} spatial;
 
@@ -1039,9 +1042,74 @@ public:
 			float weight = 1.0;
 			float temporal_blend = 0.0;
 		} light_shaft;
+
+		// Anamorphic lens streak (all light types, GLES3 post-process).
+		struct LensStreak {
+			bool enabled = false;
+			Color color = Color(1, 1, 1);
+			float intensity = 1.0;
+			float length = 0.6;
+			float thickness = 0.02;
+			float angle = 0.0;
+			float source_size = 0.1;
+			float max_distance = 100.0;
+		} lens_streak;
 	};
 
 	mutable RID_Owner<Light> light_owner;
+
+	/* LIGHT PROJECTOR ATLAS */
+
+	// Omni and spot lights can each carry a "cookie" texture that modulates the
+	// light. The forward renderer batches lights into a UBO array with no
+	// per-light texture binding, so every cookie in the scene is packed into one
+	// atlas and each light stores its UV rect (see LightData::projector_rect in
+	// scene.glsl). Omni cookies are authored as equirectangular panoramas and
+	// baked into a stacked dual-paraboloid pair, matching Godot 4.
+	struct ProjectorAtlas {
+		struct Key {
+			RID texture;
+			bool dual_paraboloid;
+
+			bool operator<(const Key &p_key) const {
+				if (texture == p_key.texture) {
+					return !dual_paraboloid && p_key.dual_paraboloid;
+				}
+				return texture < p_key.texture;
+			}
+
+			Key(RID p_texture = RID(), bool p_dp = false) :
+					texture(p_texture), dual_paraboloid(p_dp) {}
+		};
+
+		struct Entry {
+			int users;
+			Rect2 uv_rect;
+
+			Entry() :
+					users(0) {}
+		};
+
+		Map<Key, Entry> entries;
+		bool dirty;
+		int size;
+		int mipmaps;
+		GLuint texture;
+		GLuint fbo;
+
+		ProjectorAtlas() :
+				dirty(true), size(0), mipmaps(0), texture(0), fbo(0) {}
+	} projector_atlas;
+
+	void _projector_atlas_reference(RID p_texture, bool p_dual_paraboloid);
+	void _projector_atlas_unreference(RID p_texture, bool p_dual_paraboloid);
+	void _projector_atlas_clear();
+
+	// Rebuilds the atlas if anything changed; called once per frame before lights
+	// are pushed into their UBOs.
+	void update_projector_atlas();
+	GLuint projector_atlas_get_texture() const { return projector_atlas.texture; }
+	bool projector_atlas_get_rect(RID p_texture, bool p_dual_paraboloid, Rect2 &r_uv_rect) const;
 
 	virtual RID light_create(VS::LightType p_type);
 
@@ -1050,6 +1118,8 @@ public:
 	virtual void light_set_shadow(RID p_light, bool p_enabled);
 	virtual void light_set_shadow_color(RID p_light, const Color &p_color);
 	virtual void light_set_projector(RID p_light, RID p_texture);
+	virtual void light_set_lens_streak(RID p_light, bool p_enabled, const Color &p_color, float p_intensity, float p_length, float p_thickness, float p_angle, float p_source_size, float p_max_distance);
+	virtual bool light_has_lens_streak(RID p_light) const;
 	virtual void light_set_negative(RID p_light, bool p_enable);
 	virtual void light_set_cull_mask(RID p_light, uint32_t p_mask);
 	virtual void light_set_reverse_cull_face_mode(RID p_light, bool p_enabled);
@@ -1403,6 +1473,10 @@ public:
 			GLuint effect_fbo;
 			GLuint effect;
 
+			// Only allocated once SSGI is used.
+			GLuint gi_albedo = 0;
+			GLuint gi_ambient = 0;
+
 		} buffers;
 
 		struct Effects {
@@ -1496,6 +1570,25 @@ public:
 					color[1] = 0;
 				}
 			} volumetric_fog;
+
+			// Screen space GI: resolved inputs, history ping-pong and denoise scratch.
+			struct SSGI {
+				GLuint color = 0;
+				GLuint albedo = 0;
+				GLuint ambient = 0;
+				GLuint resolve_fbo[3] = { 0, 0, 0 };
+				GLuint work[4] = { 0, 0, 0, 0 };
+				GLuint history_depth[2] = { 0, 0 };
+				GLuint result = 0; // one of work[], not owned
+				int mips = 1;
+				int width = 0;
+				int height = 0;
+				int frame = 0;
+				int still_frames = 0;
+				bool history_valid = false;
+				Transform prev_camera;
+				CameraMatrix prev_projection;
+			} ssgi;
 
 			Effects() {}
 

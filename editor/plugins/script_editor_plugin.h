@@ -48,6 +48,8 @@
 #include "scene/main/timer.h"
 #include "scene/resources/text_file.h"
 
+class EditorWindowWrapper;
+
 class ScriptEditorQuickOpen : public ConfirmationDialog {
 	GDCLASS(ScriptEditorQuickOpen, ConfirmationDialog);
 
@@ -236,6 +238,7 @@ class ScriptEditor : public PanelContainer {
 	TextureRect *script_icon;
 	Label *script_name_label;
 
+	ToolButton *make_floating;
 	ToolButton *script_back;
 	ToolButton *script_forward;
 
@@ -286,6 +289,7 @@ class ScriptEditor : public PanelContainer {
 	bool _test_script_times_on_disk(RES p_for_script = Ref<Resource>());
 
 	void _add_recent_script(String p_path);
+	void _request_float();
 	void _update_recent_scripts();
 	void _open_recent_script(int p_idx);
 
@@ -459,6 +463,8 @@ public:
 
 	ScriptEditorDebugger *get_debugger() { return debugger; }
 	void set_live_auto_reload_running_scripts(bool p_enabled);
+	// Reflects whether the editor is currently hosted in its own OS window.
+	void set_floating(bool p_floating);
 
 	static void register_create_syntax_highlighter_function(CreateSyntaxHighlighterFunc p_func);
 	static void register_create_script_editor_function(CreateScriptEditorFunc p_func);
@@ -472,6 +478,13 @@ class ScriptEditorPlugin : public EditorPlugin {
 
 	ScriptEditor *script_editor;
 	EditorNode *editor;
+	EditorWindowWrapper *window_wrapper;
+
+	void _float_toggled();
+	void _docked_back();
+
+protected:
+	static void _bind_methods();
 
 public:
 	virtual String get_name() const { return "Script"; }

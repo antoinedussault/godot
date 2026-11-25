@@ -15,7 +15,9 @@ if "GLES3_GLSL" in env["BUILDERS"]:
     env.GLES3_GLSL("screen_space_reflection.glsl")
     env.GLES3_GLSL("effect_blur.glsl")
     env.GLES3_GLSL("light_shaft.glsl")
+    env.GLES3_GLSL("lens_streak.glsl")
     env.GLES3_GLSL("volumetric_fog.glsl")
+    env.GLES3_GLSL("exp_height_fog.glsl")
     env.GLES3_GLSL("subsurf_scattering.glsl")
     env.GLES3_GLSL("ssao.glsl")
     env.GLES3_GLSL("ssao_minify.glsl")
@@ -25,3 +27,25 @@ if "GLES3_GLSL" in env["BUILDERS"]:
     env.GLES3_GLSL("particles.glsl")
     env.GLES3_GLSL("lens_distorted.glsl")
     env.Depends(Glob("*.glsl.gen.h"), "#gles_builders.py")
+
+    # scene.glsl includes the shared dynamic GI sampling code.
+    env.Depends("scene.glsl.gen.h", "gi/gi_common.glsl")
+
+
+def build_gi_sources(target, source, env):
+    # Byte arrays rather than string literals: MSVC caps literal length.
+    import os
+
+    with open(str(target[0]), "w") as out:
+        out.write("/* WARNING, THIS FILE WAS GENERATED, DO NOT EDIT */\n#pragma once\n")
+        for src in source:
+            name = os.path.basename(str(src)).replace(".glsl", "")
+            with open(str(src), "rb") as f:
+                data = bytearray(f.read().replace(b"\r\n", b"\n"))
+            out.write("static const char %s_source[] = {\n" % name)
+            for i in range(0, len(data), 32):
+                out.write(",".join(str(b) for b in data[i : i + 32]) + ",\n")
+            out.write("0 };\n")
+
+
+env.Command("gi/gi_sources.gen.h", sorted(Glob("gi/*.glsl"), key=str), build_gi_sources)

@@ -18,6 +18,14 @@ class MeshInstance;
 class Camera;
 class CellTerrainLayer;
 
+// Opt-in tracing shared with the editor plugin, gated by TUNA_CELL_TRACE=1.
+// See the definitions in cell_terrain_manager.cpp.
+bool cs_trace_enabled();
+// Runtime toggle so the trace can be switched on from the editor Debug menu.
+// TUNA_CELL_TRACE=1 still sets the initial state for headless runs.
+void cs_trace_set_enabled(bool p_enabled);
+void cs_trace_report(const char *p_what, uint64_t p_start_usec, const String &p_extra = String());
+
 class CellTerrainManager : public Spatial {
 	GDCLASS(CellTerrainManager, Spatial);
 
@@ -33,6 +41,12 @@ private:
 	int load_radius = 1;
 	// Tier 2: LOD cells (reduced mesh, no collision).
 	int lod_radius = 4;
+	// Cap on the LOD level the distance mapping will hand out. Each ring beyond
+	// load_radius gets its own level (ring 1 -> LOD 1, ring 2 -> LOD 2, ...), so
+	// this is how you stop the far rings getting so coarse that the transition
+	// pops. The grid itself is the hard limit: verts_per_side=65 cannot go past
+	// level 6.
+	int max_lod_level = 8;
 	// Tier 3: HLOD baked chunks.
 	int hlod_chunk_size = 4; // NxN cells per chunk
 	int hlod_radius = 3;    // in chunks, not cells
@@ -127,6 +141,11 @@ private:
 	// knob as well as a look control. Pushed live — no cell rebuild needed.
 	float parallax_max_distance = 48.0f;
 	void _push_parallax_live();
+	// These were silently no-ops: height_blend_sharpness only ever wrote to the
+	// shared terrain_material (which no cell actually uses for rendering), and
+	// texture_scale wrote to nothing at all.
+	void _push_height_blend_live();
+	void _push_texture_scale_live();
 	// Terrain debug overlay (see terrain_shader.h's debug_view uniform):
 	// 0 = off, 1 = splatmap/layer blend, 2 = detail normal map, 3 = nav mask.
 	// Shader-only, pushed live — changes no geometry, collision or nav data.
@@ -140,11 +159,19 @@ private:
 	// bake doesn't apply (HLOD chunks, the shared base material) — the shader
 	// always needs a valid detail_normal_map texture, never an unbound sampler.
 	Ref<ImageTexture> _neutral_normal_tex;
+	Ref<ImageTexture> _neutral_white_tex;
 	Ref<ImageTexture> _get_neutral_normal_texture();
+	// White = the identity for the shader's colour_map multiply. Needed
+	// anywhere the terrain shader is used WITHOUT a per-cell painted tint
+	// (the shared base material, HLOD chunks): an unbound sampler2D samples
+	// black, which would multiply those surfaces to black.
+	Ref<ImageTexture> _get_neutral_white_texture();
 
 	// Navmesh: only cells within load_radius (same tier as collision) ever
 	// carry a nav region — see CellTerrain::_rebuild_navmesh().
 	bool enable_navmesh = true;
+	// How far raycast_terrain() marches before giving up.
+	float raycast_max_distance = 20000.0f;
 	float nav_max_slope_deg = 55.0f;
 	// Navmesh grid step relative to the render grid — see
 	// CellTerrain::ComputeInput::nav_downsample. Measured: building the navmesh
@@ -153,6 +180,31 @@ private:
 	// the whole map on every region change. This is the single biggest
 	// streaming cost in the module; do not set it to 1.
 	int nav_downsample = 4;
+
+	// --- Ground blend pages (the practical stand-in for Unreal's Runtime
+	// Virtual Texture; Godot 3.x has no sparse/virtual texturing) ---
+	// Baked world-space pages that OTHER meshes sample so they can blend into
+	// the ground they sit on:
+	//   albedo = low-frequency terrain tint (each layer's average colour,
+	//            splat-blended) - high-frequency detail is meant to come from
+	//            resampling the real tiling layer texture at runtime, since the
+	//            page is magnified hard at the contact point.
+	//   height = terrain world height, so a mesh masks by distance ABOVE the
+	//            ground instead of a flat local-Y band. Without this, uneven
+	//            terrain cuts the blend across the object at the wrong place -
+	//            it is the same reason Unreal's RVT has a World Height output.
+	// Stored as one raw binary file next to the cell data rather than imported
+	// images: the height page is float, and a PNG round-trip through the
+	// importer (sRGB conversion, filtering) would corrupt it. Same convention
+	// as .heights / .navmask.
+	float ground_texels_per_unit = 1.0f;
+	int ground_max_size = 4096;
+	Ref<ImageTexture> ground_albedo_tex;
+	Ref<ImageTexture> ground_height_tex;
+	Rect2 ground_bounds; // manager-LOCAL XZ region the pages cover
+	bool _ground_load_attempted = false;
+	void _load_ground_pages();
+	Color _layer_average_color(int idx) const;
 
 	// "Bake Navmesh": persistent NavigationServer regions for every saved cell
 	// OUTSIDE the live streaming radius, so AI can path across the whole saved
@@ -214,11 +266,31 @@ private:
 		CellTerrain *target = nullptr;
 		PoolRealArray heights;
 		PoolRealArray nav_mask;
+		PoolRealArray hole_mask;
+		// set_cell_nav_obstacles() reaches the navmesh THROUGH a recompute job,
+		// so dropping this field here would silently undo the obstacle carve
+		// on the very path that triggers it.
+		PoolRealArray nav_obstacles;
 		PoolRealArray edge_n, edge_s, edge_e, edge_w;
 		Ref<Image> splatmaps[4];
+		Ref<Image> color_map;
 		CellTerrain::ComputedData computed;
 	};
-	Thread    _load_thread;
+	// A POOL, not a single worker. compute() is a static function over an
+	// immutable ComputeInput snapshot and touches no node/VisualServer/
+	// NavigationServer state, and the queues below are mutex-guarded, so N
+	// workers can prepare N cells concurrently. With one thread the streamer
+	// pinned exactly one hardware thread (6.3% of a 16-thread CPU) while the
+	// rest of the machine idled.
+	//
+	// NOTE this speeds up PREPARATION only. The hand-off - ArrayMesh upload and
+	// the NavigationServer re-sync - is main-thread by construction in Godot
+	// 3.x and stays serial no matter how many workers feed it.
+	Vector<Thread *> _load_threads;
+	// 0 = auto (half the logical cores, capped). Exposed so it can be tuned
+	// without a rebuild.
+	int streaming_threads = 0;
+	int _active_thread_count = 0;
 	Mutex     _load_mutex;
 	Semaphore _load_sem;
 	List<PendingLoad *> _load_queue;   // worker input  (guarded by _load_mutex)
@@ -227,6 +299,15 @@ private:
 	// Already-active cells with a recompute job in flight (see _submit_recompute)
 	// — separate from _loading, which only ever gates cells NOT YET in _active.
 	Set<int64_t> _recomputing;
+	// Cells whose edge data changed again WHILE a recompute was already in
+	// flight. That job snapshotted the cell before the newer neighbour was
+	// recorded, so applying it leaves the seam against that neighbour stale -
+	// and nothing else ever re-triggers it, so the crack is permanent. Dropping
+	// the second request (which is what an early-out does) is therefore not
+	// safe; it has to be deferred and re-issued once the in-flight job lands.
+	// The bool is update_collision, OR-ed across the coalesced requests so a
+	// cheap edge-only request cannot downgrade a real collision rebuild.
+	Map<int64_t, bool> _recompute_again;
 	bool _thread_running = false;
 	bool _thread_exit = false;
 	// Wall-clock budget for _integrate_ready(), replacing what used to be a
@@ -244,6 +325,11 @@ private:
 	// glitch can't turn into an infinite loop.
 	static const int _max_integrate_admission = 64;
 
+	// Pool lifecycle, factored out so the size can be changed at RUNTIME rather
+	// than only at NOTIFICATION_READY.
+	void _start_workers(int p_count);
+	void _stop_workers();
+	int _resolve_thread_count() const;
 	static void _load_worker(void *p_self);
 	void _submit_load(int cx, int cz, int lod, bool collision);
 	// Re-stitches an already-active cell's mesh/navmesh/detail-normal-map off
@@ -255,7 +341,7 @@ private:
 	void _submit_recompute(int cx, int cz, bool p_update_collision = true);
 	void _integrate_ready();
 	CellTerrain *_create_cell_from_data(int cx, int cz, int lod, bool collision,
-			const PoolRealArray &heights, const PoolRealArray &nav_mask, Ref<Image> *p_splatmaps);
+			const PoolRealArray &heights, const PoolRealArray &nav_mask, const PoolRealArray &hole_mask, Ref<Image> *p_splatmaps, const Ref<Image> &color_map);
 	// Edge rows/columns for stitching, read from the 4 neighbors' saved
 	// .heights files directly rather than their live nodes (which aren't
 	// safe to touch off the main thread) — safe to call from the worker
@@ -293,7 +379,12 @@ private:
 	CellTerrain *_spawn_cell(int cx, int cz, int lod, bool collision);
 	PoolRealArray _load_heights(int cx, int cz) const;
 	PoolRealArray _load_nav_mask(int cx, int cz) const;
+	// Painted holes. Same file-per-cell pattern; missing file means "solid".
+	PoolRealArray _load_hole_mask(int cx, int cz) const;
 	Ref<Image> _load_splatmap(int cx, int cz, int idx) const;
+	// Painted albedo tint. Missing file means "unpainted", returned as a null
+	// Ref rather than a full white image so an untouched cell costs nothing.
+	Ref<Image> _load_color_map(int cx, int cz) const;
 	bool _save_cell(int cx, int cz);
 	void _update_neighbor_edges(int cx, int cz);
 	void _evaluate(int cx, int cz);
@@ -311,11 +402,49 @@ protected:
 
 public:
 	CellTerrain *get_cell(int cx, int cz) const;
+	// Same lookup from a WORLD position, converted with THIS manager's own
+	// cell_size and origin.
+	//
+	// Prefer this from any other node. A cell index is meaningless without the
+	// grid that produced it, and the nodes around this one deliberately run
+	// their own cell sizes (CellPlayerBody and FoliageManager at 256, terrain
+	// at 64), so an index handed across a node boundary names a different
+	// place. That mistake has produced a frozen player, foliage that never
+	// streamed, and objects loading around the wrong point.
+	CellTerrain *get_cell_at_world(const Vector3 &p_world_pos) const;
 	void rebuild_at(int cx, int cz);
 	void mark_dirty(int cx, int cz);
 	void save_dirty();
 	void stream_to(const Vector3 &world_pos);
 	void ensure_cell_sync(int cx, int cz);
+	// Synchronously builds every collision-bearing cell around a WORLD position
+	// and returns how many it had to build. Indices are derived with the
+	// terrain's own cell_size, so callers cannot pass indices computed against a
+	// different grid (CellPlayerBody and CellWorld both run their own cell_size).
+	int ensure_collision_at_world(const Vector3 &p_world_pos);
+	// Runtime only: on the first stream, build the collision ring synchronously
+	// so physics has ground on frame 0. Without it every RigidBody and the
+	// player free-fall while the async streamer catches up.
+	bool preload_collision_on_start = true;
+	void set_preload_collision_on_start(bool e) { preload_collision_on_start = e; }
+	bool get_preload_collision_on_start() const { return preload_collision_on_start; }
+
+	// Set by a parent GameWorld. With it on, this manager stops looking for a
+	// camera of its own at runtime and streams only when the GameWorld calls
+	// stream_to() - so the terrain, the foliage and the objects all follow the
+	// same position, read once per frame in one place.
+	bool external_focus = false;
+	void set_external_focus(bool e) { external_focus = e; }
+	bool get_external_focus() const { return external_focus; }
+	// Off = no terrain at all (GameWorld.has_terrain unchecked): nothing
+	// streams, loaded cells are dropped and the node is hidden. Settings are
+	// kept, so switching it back on brings the terrain back as it was.
+	bool streaming_enabled = true;
+	void set_streaming_enabled(bool e);
+	bool get_streaming_enabled() const { return streaming_enabled; }
+	// True when the cell under a WORLD position is loaded AND carries collision.
+	// GameWorld uses it to keep loose bodies parked until there is ground.
+	bool has_collision_at_world(const Vector3 &p_world_pos) const;
 	void editor_focus(const Vector3 &world_pos);
 	void editor_clear();
 
@@ -341,6 +470,18 @@ public:
 	// field comment. Safe to call from the editor (dock button) or at
 	// runtime (e.g. your own game-start script) if you want this automatic
 	// in a shipped build; it is NOT called automatically by this module.
+	// Bakes the ground blend pages described above for every SAVED cell (not
+	// just the streamed-in ones), so the result covers the whole authored world.
+	void bake_ground_texture();
+	void clear_ground_texture();
+	bool has_ground_texture();
+	Ref<Texture> get_ground_albedo_texture();
+	Ref<Texture> get_ground_height_texture();
+	// World-space XZ rect the pages cover (manager origin already applied), for
+	// feeding a blend shader its world -> page UV mapping.
+	Rect2 get_ground_bounds();
+	void set_ground_texels_per_unit(float v); float get_ground_texels_per_unit() const;
+
 	void bake_navmesh();
 	void clear_baked_navmesh();
 	bool has_baked_navmesh() const { return !_baked_nav_regions.empty(); }
@@ -354,6 +495,7 @@ public:
 	void set_height_scale(float s);          float get_height_scale() const;
 	void set_load_radius(int r);             int get_load_radius() const;
 	void set_lod_radius(int r);              int get_lod_radius() const;
+	void set_max_lod_level(int l);           int get_max_lod_level() const { return max_lod_level; }
 	void set_hlod_chunk_size(int s);         int get_hlod_chunk_size() const;
 	void set_hlod_radius(int r);             int get_hlod_radius() const;
 	void set_hlod_height_offset(float o);    float get_hlod_height_offset() const;
@@ -364,6 +506,13 @@ public:
 	void set_preload_collision_upgrade(bool e) { preload_collision_upgrade = e; }
 	bool get_preload_collision_upgrade() const { return preload_collision_upgrade; }
 	void set_integrate_budget_ms(float ms);  float get_integrate_budget_ms() const { return integrate_budget_ms; }
+	void set_streaming_threads(int n);        int get_streaming_threads() const { return streaming_threads; }
+	// How many workers are actually running (after the auto-resolve).
+	int get_active_thread_count() const { return _active_thread_count; }
+	// Number of streamed-in cells. Changes exactly when a cell is added or
+	// removed, which makes it a cheap O(1) "did the streamed set change?"
+	// signal for dependents like FoliageManager.
+	int get_loaded_cell_count() const { return _active.size(); }
 	void set_texture_scale(float s);         float get_texture_scale() const;
 	int get_num_layers() const { return num_layers; } // derived from layers.size()
 	void set_brush_texture(const Ref<Texture> &t); Ref<Texture> get_brush_texture() const;
@@ -401,6 +550,22 @@ public:
 	// (see CellTerrain::nav_debug_view for why that alone isn't enough here).
 	void set_debug_navmesh(bool enabled);
 	float get_height_at_world(float wx, float wz) const;
+	// Ray vs heightmap, bounded cost - see the comment on the definition for
+	// why this exists instead of a physics raycast. Works on cells without
+	// collision too. Returns false if the ray never meets the ground.
+	bool raycast_terrain(const Vector3 &p_from, const Vector3 &p_dir, Vector3 &r_hit) const;
+	// Replaces a cell nav-obstacle list and rebuilds its navmesh OFF the main
+	// thread (see _submit_recompute) - the nav rebuild is the single most
+	// expensive thing in this module, so it never runs synchronously here.
+	void set_cell_nav_obstacles(int cx, int cz, const PoolRealArray &p_obstacles);
+
+	// Cells the streamer still owes: queued, computed-but-not-yet-applied, and
+	// re-stitching. Drives the editor status readout - this work is async, so
+	// the editor stays responsive and a passive label can actually paint.
+	int get_pending_count();
+	// Script-facing form: ClassDB cannot bind an out-reference, so this returns
+	// the hit Vector3 or nil when the ray never meets the ground.
+	Variant raycast_terrain_v(const Vector3 &p_from, const Vector3 &p_dir) const;
 
 	CellTerrainManager();
 };

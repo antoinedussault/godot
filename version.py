@@ -1,5 +1,5 @@
 short_name = "godot"
-name = "LowDot"
+name = "Tuna"
 major = 3
 minor = 5
 patch = 4

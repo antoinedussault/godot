@@ -149,8 +149,27 @@ class EditorFileSystem : public Node {
 	bool first_scan;
 	bool scan_changes_pending;
 	float scan_total;
+
+	// Written by the scan thread, read by the startup loading screen.
+	SafeNumeric<uint32_t> scan_file_count;
+	SafeNumeric<uint32_t> scan_file_estimate; // From the previous session's cache.
+	mutable Mutex scan_current_file_mutex;
+	String scan_current_file;
+
+	// Frames left between the first scan's thread finishing and the blocking work
+	// that follows, so the loading screen can draw what is about to happen.
+	int first_scan_settle_frames;
 	String filesystem_settings_version_for_import;
 	bool revalidate_import_files;
+
+	// _scan_new_dir() only calls are_import_settings_valid() when
+	// revalidate_import_files says the global importer settings hash moved.
+	// _scan_fs_changes() had no such gate and ran the much heavier
+	// _test_for_reimport() for every imported asset on every change scan, even
+	// though its extra checks can only start failing when that same hash moves.
+	// Track the hash per session so the change scan matches the full scan.
+	String last_validated_import_settings_hash;
+	bool revalidate_import_settings;
 
 	void _scan_filesystem();
 
@@ -162,6 +181,8 @@ class EditorFileSystem : public Node {
 	EditorFileSystemDirectory *filesystem;
 
 	static EditorFileSystem *singleton;
+
+	enum { FIRST_SCAN_SETTLE_FRAMES = 3 };
 
 	/* Used for reading the filesystem cache file */
 	struct FileCache {
@@ -217,6 +238,11 @@ class EditorFileSystem : public Node {
 	void _reimport_file(const String &p_file);
 	Error _reimport_group(const String &p_group_file, const Vector<String> &p_files);
 
+	// reimport_files() is a re-entrancy guard around this; see the comment there.
+	void _reimport_files_internal(const Vector<String> &p_files);
+	Set<String> pending_reimports;
+	bool reimport_reentrant_guard;
+
 	bool _test_for_reimport(const String &p_path, bool p_only_imported_files);
 
 	bool reimport_on_missing_imported_files;
@@ -234,6 +260,19 @@ class EditorFileSystem : public Node {
 	void _scan_script_classes(EditorFileSystemDirectory *p_dir);
 	SafeFlag update_script_classes_queued;
 	void _queue_update_script_classes();
+
+	// Coalesces the deferred "filesystem_changed" emissions from update_file():
+	// each one costs a full FileSystemDock tree + file list rebuild, and a single
+	// operation (a rename, say) legitimately touches more than one path.
+	SafeFlag filesystem_changed_queued;
+	void _queue_filesystem_changed();
+	void _emit_filesystem_changed();
+
+	// update_file() hits this on every save of an already-known file; the writer
+	// rewrites the whole list each time, so coalesce it to once per frame.
+	SafeFlag late_update_files_queued;
+	void _queue_save_late_updated_files();
+	void _save_late_updated_files_deferred();
 
 	String _get_global_script_class(const String &p_type, const String &p_path, String *r_extends, String *r_icon_path) const;
 
@@ -258,6 +297,10 @@ public:
 	bool is_scanning() const;
 	bool is_importing() const { return importing; }
 	float get_scanning_progress() const;
+	int get_scan_file_count() const { return scan_file_count.get(); }
+	int get_scan_file_estimate() const { return scan_file_estimate.get(); }
+	String get_scan_current_file() const;
+	bool is_first_scan_settling() const { return first_scan && first_scan_settle_frames < FIRST_SCAN_SETTLE_FRAMES; }
 	void scan();
 	void scan_changes();
 	void get_changed_sources(List<String> *r_changed);

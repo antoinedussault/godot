@@ -22,7 +22,10 @@
 			Height falloff. Larger values confine fog closer to [member ref_height]; smaller values let it rise higher. UE "Fog Height Falloff".
 		</member>
 		<member name="ref_height" type="float" setter="set_ref_height" getter="get_ref_height" default="0.0">
-			World-space Y where density equals [member density] (the fog "sea level").
+			World-space Y where density equals [member density] (the fog "sea level"). If [member ref_height_relative] is [code]true[/code], this is instead an offset from the camera's Y.
+		</member>
+		<member name="ref_height_relative" type="bool" setter="set_ref_height_relative" getter="is_ref_height_relative" default="false">
+			If [code]true[/code], [member ref_height] is treated as an offset from the camera's height rather than an absolute world Y, so the fog "sea level" follows the camera and the density at eye level stays constant regardless of altitude. Useful in tall or open scenes where absolute height fog would thin out as the camera climbs.
 		</member>
 		<member name="start_distance" type="float" setter="set_start_distance" getter="get_start_distance" default="0.0">
 			Distance from the camera before fog begins. UE "Start Distance".

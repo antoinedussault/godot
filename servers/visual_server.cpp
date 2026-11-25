@@ -1967,6 +1967,7 @@ void VisualServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("light_set_shadow", "light", "enabled"), &VisualServer::light_set_shadow);
 	ClassDB::bind_method(D_METHOD("light_set_shadow_color", "light", "color"), &VisualServer::light_set_shadow_color);
 	ClassDB::bind_method(D_METHOD("light_set_projector", "light", "texture"), &VisualServer::light_set_projector);
+	ClassDB::bind_method(D_METHOD("light_set_lens_streak", "light", "enabled", "color", "intensity", "length", "thickness", "angle", "source_size", "max_distance"), &VisualServer::light_set_lens_streak);
 	ClassDB::bind_method(D_METHOD("light_set_negative", "light", "enable"), &VisualServer::light_set_negative);
 	ClassDB::bind_method(D_METHOD("light_set_cull_mask", "light", "mask"), &VisualServer::light_set_cull_mask);
 	ClassDB::bind_method(D_METHOD("light_set_reverse_cull_face_mode", "light", "enabled"), &VisualServer::light_set_reverse_cull_face_mode);
@@ -2125,6 +2126,10 @@ void VisualServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("environment_set_fog_height", "env", "enable", "min_height", "max_height", "height_curve"), &VisualServer::environment_set_fog_height);
 
 	ClassDB::bind_method(D_METHOD("environment_set_volumetric_fog", "env", "enable", "density", "height_falloff", "height_ref", "albedo", "ambient", "sun_energy", "anisotropy", "length", "extinction", "samples", "temporal_blend"), &VisualServer::environment_set_volumetric_fog);
+	ClassDB::bind_method(D_METHOD("environment_set_volumetric_fog_height_relative", "env", "relative"), &VisualServer::environment_set_volumetric_fog_height_relative);
+	ClassDB::bind_method(D_METHOD("environment_set_dynamic_gi", "env", "enable", "cascades", "voxel_size", "energy", "bounce_feedback", "normal_bias", "hysteresis", "rays", "reflection_occlusion", "cull_mask", "debug"), &VisualServer::environment_set_dynamic_gi);
+	ClassDB::bind_method(D_METHOD("environment_set_ssgi", "env", "enable", "radius", "intensity", "rays", "steps", "thickness", "temporal_blend", "half_resolution"), &VisualServer::environment_set_ssgi);
+	ClassDB::bind_method(D_METHOD("environment_set_exp_height_fog", "env", "enable", "density", "falloff", "ref_height", "ref_height_relative", "start_distance", "max_opacity", "inscatter", "directional_enabled", "directional_color", "light_direction", "directional_exponent"), &VisualServer::environment_set_exp_height_fog);
 
 	ClassDB::bind_method(D_METHOD("scenario_create"), &VisualServer::scenario_create);
 	ClassDB::bind_method(D_METHOD("scenario_set_debug", "scenario", "debug_mode"), &VisualServer::scenario_set_debug);
@@ -2530,6 +2535,12 @@ void VisualServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(ENV_SSAO_QUALITY_MEDIUM);
 	BIND_ENUM_CONSTANT(ENV_SSAO_QUALITY_HIGH);
 
+	BIND_ENUM_CONSTANT(ENV_DYNAMIC_GI_DEBUG_DISABLED);
+	BIND_ENUM_CONSTANT(ENV_DYNAMIC_GI_DEBUG_LIGHTING);
+	BIND_ENUM_CONSTANT(ENV_DYNAMIC_GI_DEBUG_ALBEDO);
+	BIND_ENUM_CONSTANT(ENV_DYNAMIC_GI_DEBUG_IRRADIANCE);
+	BIND_ENUM_CONSTANT(ENV_DYNAMIC_GI_DEBUG_SSGI);
+
 	BIND_ENUM_CONSTANT(ENV_SSAO_BLUR_DISABLED);
 	BIND_ENUM_CONSTANT(ENV_SSAO_BLUR_1x1);
 	BIND_ENUM_CONSTANT(ENV_SSAO_BLUR_2x2);
@@ -2636,6 +2647,12 @@ VisualServer::VisualServer() {
 	GLOBAL_DEF("rendering/quality/directional_shadow/size", 4096);
 	GLOBAL_DEF("rendering/quality/directional_shadow/size.mobile", 2048);
 	ProjectSettings::get_singleton()->set_custom_property_info("rendering/quality/directional_shadow/size", PropertyInfo(Variant::INT, "rendering/quality/directional_shadow/size", PROPERTY_HINT_RANGE, "256,16384,256"));
+	// Resolution each OmniLight/SpotLight projector texture is packed at inside the
+	// shared projector atlas. Omni cookies occupy twice this height (one dual-
+	// paraboloid half above the other).
+	GLOBAL_DEF("rendering/quality/lights/projector_size", 512);
+	ProjectSettings::get_singleton()->set_custom_property_info("rendering/quality/lights/projector_size", PropertyInfo(Variant::INT, "rendering/quality/lights/projector_size", PROPERTY_HINT_RANGE, "32,4096,32"));
+
 	GLOBAL_DEF_RST("rendering/quality/shadow_atlas/size", 4096);
 	GLOBAL_DEF("rendering/quality/shadow_atlas/size.mobile", 2048);
 	ProjectSettings::get_singleton()->set_custom_property_info("rendering/quality/shadow_atlas/size", PropertyInfo(Variant::INT, "rendering/quality/shadow_atlas/size", PROPERTY_HINT_RANGE, "256,16384,256"));

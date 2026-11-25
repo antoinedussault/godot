@@ -5,7 +5,7 @@
 	</brief_description>
 	<description>
 		Point [member item] at an item resource (a [code].tres[/code] whose script extends [code]ItemResource[/code], authored in the Items &amp; Recipes editor tab). On entering the tree the body instances the item's [code]scene_path[/code] for visuals, and — when [member auto_build] is on — generates a single box [CollisionShape] sized to that scene's combined visual bounds, taking its mass from the item's [code]weight[/code].
-		[CellWorld] already routes any [RigidBody] into its [code]DynamicObjects[/code] container, so a [CellItemBody] streams with the rest of the cell. A [CellPlayerBody] walking into it shoves it (scaled by the player's speed and [member push_strength]); [method push] does the same from code and [method pickup] removes it.
+		[GameWorld] treats any [RigidBody] as a dynamic object, so a [CellItemBody] follows the cell it is actually in, is parked while the ground under it has no collision, and keeps its position in the world's persistent state. Hand one created at runtime to [method GameWorld.add_object]. A [CellPlayerBody] walking into it shoves it (scaled by the player's speed and [member push_strength]); [method push] does the same from code and [method pickup] removes it.
 	</description>
 	<tutorials>
 	</tutorials>

@@ -45,7 +45,7 @@ class ShaderCacheGLES3 {
 	void _purge_excess();
 
 public:
-	static String hash_program(const char *const *p_platform_strings, const LocalVector<const char *> &p_vertex_strings, const LocalVector<const char *> &p_fragment_strings);
+	static String hash_program(const char *const *p_platform_strings, const LocalVector<const char *> *p_stage_strings, int p_stage_count);
 
 	bool retrieve(const String &p_program_hash, uint32_t *r_format, PoolByteArray *r_data);
 	void store(const String &p_program_hash, uint32_t p_program_format, const PoolByteArray &p_program_data);

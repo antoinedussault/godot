@@ -59,6 +59,15 @@
 #include "platform/register_platform_apis.h"
 #include "scene/debugger/script_debugger_remote.h"
 #include "scene/main/scene_tree.h"
+#ifdef TOOLS_ENABLED
+#include "main/tuna_edit_bridge.h"
+#include "main/tuna_edit_camera.h"
+#include "main/tuna_edit_cell_bounds.h"
+#include "main/tuna_edit_gizmo.h"
+#include "main/tuna_edit_selection.h"
+#include "scene/3d/visual_instance.h"
+#include "scene/main/viewport.h"
+#endif
 #include "scene/main/viewport.h"
 #include "scene/register_scene_types.h"
 #include "scene/resources/packed_scene.h"
@@ -127,6 +136,72 @@ static int audio_driver_idx = -1;
 
 static bool editor = false;
 static bool project_manager = false;
+// Boots the project for the external Tuna editor: the scene is loaded and rendered, but its
+// scripts and autoloads never run and physics is frozen. Distinct from `editor`, which also
+// builds Godot's own EditorNode.
+static bool tuna_edit = false;
+// Fly-speed limits for the edit camera, settable from the editor's View menu.
+static float tuna_edit_speed_min = 0.25f;
+static float tuna_edit_speed_max = 4000.0f;
+
+#ifdef TOOLS_ENABLED
+// How many nodes actually got a script instance. In edit mode this must be zero: scripting is
+// switched off before the scene loads, so GDScript::can_instance() refuses every non-tool
+// script. Reported at load so "is the game running?" is answerable from the editor instead of
+// inferred from what the viewport looks like -- an inert player model and HUD still render.
+static int _tuna_count_live_scripts(Node *p_node) {
+	int count = (p_node->get_script_instance() != nullptr) ? 1 : 0;
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		count += _tuna_count_live_scripts(p_node->get_child(i));
+	}
+	return count;
+}
+
+// Whether anything of this class exists in the loaded scene.
+static bool _tuna_has_class(Node *p_node, const String &p_class) {
+	if (p_node->is_class(p_class)) {
+		return true;
+	}
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		if (_tuna_has_class(p_node->get_child(i), p_class)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// World bounds of the loaded scene, used to aim the edit camera and size its clip planes.
+//
+// Nested Viewports are skipped deliberately: a first-person project keeps its viewmodel camera
+// and hands in one (player.tscn has a Camera with far = 10), and neither describes the world.
+static void _tuna_scene_bounds(Node *p_node, AABB &r_bounds, bool &r_has, int &r_budget) {
+	if (r_budget <= 0) {
+		return;
+	}
+	r_budget--;
+
+	if (Object::cast_to<Viewport>(p_node)) {
+		return;
+	}
+
+	VisualInstance *visual = Object::cast_to<VisualInstance>(p_node);
+	if (visual && visual->is_visible_in_tree()) {
+		AABB world = visual->get_transformed_aabb();
+		if (world.size != Vector3()) {
+			if (r_has) {
+				r_bounds.merge_with(world);
+			} else {
+				r_bounds = world;
+				r_has = true;
+			}
+		}
+	}
+
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		_tuna_scene_bounds(p_node->get_child(i), r_bounds, r_has, r_budget);
+	}
+}
+#endif
 static String locale;
 static bool show_help = false;
 static bool auto_quit = false;
@@ -741,6 +816,29 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		} else if (I->get() == "-e" || I->get() == "--editor") { // starts editor
 
 			editor = true;
+		} else if (I->get() == "--tuna-edit") { // edit mode for the external Tuna editor
+
+			tuna_edit = true;
+		} else if (I->get() == "--tuna-edit-speed-min") { // slowest the edit camera can fly
+
+			if (I->next()) {
+				tuna_edit_speed_min = I->next()->get().to_double();
+				N = I->next()->next();
+			} else {
+				OS::get_singleton()->print("Missing minimum speed argument, aborting.\n");
+				goto error;
+			}
+
+		} else if (I->get() == "--tuna-edit-speed-max") { // fastest the edit camera can fly
+
+			if (I->next()) {
+				tuna_edit_speed_max = I->next()->get().to_double();
+				N = I->next()->next();
+			} else {
+				OS::get_singleton()->print("Missing maximum speed argument, aborting.\n");
+				goto error;
+			}
+
 		} else if (I->get() == "-p" || I->get() == "--project-manager") { // starts project manager
 
 			project_manager = true;
@@ -1006,6 +1104,13 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 #endif
 
 #ifdef TOOLS_ENABLED
+	// Deliberately NOT set_editor_hint(true) here. Throughout this codebase is_editor_hint() is
+	// used as a proxy for "an EditorNode exists" -- cell_terrain_manager.cpp:585 gates an
+	// EditorNode::progress_add_task() call on it, and there are ~20 similar sites in
+	// modules/cell_system alone. Edit mode builds no EditorNode, so raising the hint null-derefs
+	// on the first terrain stream. Scripting is stopped via ScriptServer instead, which does not
+	// depend on the hint. If edit-mode-only node behaviour is ever needed, it wants its own flag.
+
 	if (editor) {
 		Engine::get_singleton()->set_editor_hint(true);
 		main_args.push_back("--editor");
@@ -1526,6 +1631,15 @@ Error Main::setup2(Thread::ID p_main_tid_override) {
 	register_scene_types();
 
 #ifdef TOOLS_ENABLED
+	// Registered here with the other scene types, not at scene-load time: SceneTree dispatches
+	// input by name through ClassDB, and every engine class that handles _input this way is
+	// registered before set_current_api(API_NONE) below.
+	ClassDB::register_class<TunaEditCamera>();
+	ClassDB::register_class<TunaEditSelection>();
+	ClassDB::register_class<TunaEditCellBounds>();
+	ClassDB::register_class<TunaEditBridge>();
+	ClassDB::register_class<TunaEditGizmo>();
+
 	ClassDB::set_current_api(ClassDB::API_EDITOR);
 	EditorNode::register_editor_types();
 
@@ -1861,7 +1975,7 @@ bool Main::start() {
 		ResourceLoader::add_custom_loaders();
 		ResourceSaver::add_custom_savers();
 
-		if (!project_manager && !editor) { // game
+		if (!project_manager && !editor && !tuna_edit) { // game
 			if (game_path != "" || script != "") {
 				if (script_debugger && script_debugger->is_remote()) {
 					ScriptDebuggerRemote *remote_debugger = static_cast<ScriptDebuggerRemote *>(script_debugger);
@@ -1957,6 +2071,29 @@ bool Main::start() {
 				editor_node->export_preset(_export_preset, positional_arg, export_debug, export_pack_only);
 				game_path = ""; // Do not load anything.
 			}
+		}
+
+		if (tuna_edit) {
+			// The same switch EditorNode throws. GDScript::can_instance() is
+			// `valid && (tool || ScriptServer::is_scripting_enabled())`, so with this off the
+			// scene's nodes and properties still load but no non-tool script is ever instanced
+			// -- the world appears without the game running.
+			ScriptServer::set_scripting_enabled(false);
+
+			// Nothing should simulate while editing: no bodies falling, no areas firing.
+			PhysicsServer::get_singleton()->set_active(false);
+			Physics2DServer::get_singleton()->set_active(false);
+
+			// The editor reads our stdout through a pipe, and the CRT block-buffers a pipe by
+			// default: a short protocol line sits in the buffer until 4 KB of unrelated log
+			// accumulates behind it, so acks arrived late or not at all. MSVC treats _IOLBF as
+			// full buffering, so unbuffered is the only setting that actually flushes per write.
+			setvbuf(stdout, nullptr, _IONBF, 0);
+
+			// Wireframe debug draw needs the extra index buffers generated as meshes are
+			// created, so this has to be on before the scene loads -- switching it on later
+			// leaves already-built meshes with nothing to draw.
+			VisualServer::get_singleton()->set_debug_generate_wireframes(true);
 		}
 #endif
 
@@ -2106,6 +2243,56 @@ bool Main::start() {
 
 				ERR_FAIL_COND_V_MSG(!scene, false, "Failed loading scene: " + local_game_path);
 				sml->add_current_scene(scene);
+
+#ifdef TOOLS_ENABLED
+				if (tuna_edit) {
+					// Added to the root rather than into the scene, so the edited scene is not
+					// modified, and after it so its set_current() wins over any camera the
+					// scene brought with it.
+					AABB bounds;
+					bool has_bounds = false;
+					int budget = 4000; // Enough to characterise the scene without walking a streamed world.
+					_tuna_scene_bounds(scene, bounds, has_bounds, budget);
+
+					TunaEditCamera *edit_camera = memnew(TunaEditCamera);
+					// Limits first: frame() picks a speed from the scene size and must land
+					// inside the range the user asked for.
+					edit_camera->set_speed_limits(tuna_edit_speed_min, tuna_edit_speed_max);
+					edit_camera->frame(has_bounds ? bounds : AABB(Vector3(-20, -20, -20), Vector3(40, 40, 40)));
+					sml->get_root()->add_child(edit_camera);
+
+					// Picking lives beside the camera, also outside the edited scene.
+					TunaEditSelection *selection = memnew(TunaEditSelection);
+					sml->get_root()->add_child(selection);
+
+					// Added AFTER the selection node on purpose: SceneTree walks the input
+					// group in reverse, so the gizmo sees a click first and can claim it
+					// before picking would replace the selection under the cursor.
+					TunaEditGizmo *gizmo = memnew(TunaEditGizmo);
+					gizmo->set_selection(selection);
+					sml->get_root()->add_child(gizmo);
+
+					TunaEditCellBounds *cell_bounds = memnew(TunaEditCellBounds);
+					sml->get_root()->add_child(cell_bounds);
+
+					// Gives the external editor a live handle on the overlays above.
+					TunaEditBridge *bridge = memnew(TunaEditBridge);
+					bridge->set_cell_bounds(cell_bounds);
+					sml->get_root()->add_child(bridge);
+
+					// The window exists long before this point, so "attached" tells the editor
+					// nothing about whether the world is up. Until this line the bridge does not
+					// exist and commands just sit in the pipe.
+					print_line("TUNA_READY:" + local_game_path
+							+ "|scripts=" + itos(_tuna_count_live_scripts(scene))
+							+ "|scripting=" + String(ScriptServer::is_scripting_enabled() ? "on" : "off")
+							+ "|physics=off"
+							// Exterior means the world is laid out on the cell grid; a scene
+							// with no CellWorld is a self-contained interior. Derived from the
+							// scene itself rather than a naming convention.
+							+ "|kind=" + String(_tuna_has_class(scene, "CellWorld") ? "Exterior" : "Interior"));
+				}
+#endif
 
 #ifdef OSX_ENABLED
 				String mac_iconpath = GLOBAL_DEF("application/config/macos_native_icon", "Variant()");

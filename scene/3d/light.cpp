@@ -105,6 +105,92 @@ Color Light::get_shadow_color() const {
 	return shadow_color;
 }
 
+void Light::set_projector(const Ref<Texture> &p_texture) {
+	projector = p_texture;
+	VS::get_singleton()->light_set_projector(light, projector.is_valid() ? projector->get_rid() : RID());
+	update_configuration_warning();
+}
+
+Ref<Texture> Light::get_projector() const {
+	return projector;
+}
+
+void Light::_update_lens_streak() {
+	VS::get_singleton()->light_set_lens_streak(light, lens_streak_enabled, lens_streak_color, lens_streak_intensity, lens_streak_length, lens_streak_thickness, lens_streak_angle, lens_streak_source_size, lens_streak_max_distance);
+}
+
+void Light::set_lens_streak_enabled(bool p_enabled) {
+	lens_streak_enabled = p_enabled;
+	_update_lens_streak();
+}
+
+bool Light::is_lens_streak_enabled() const {
+	return lens_streak_enabled;
+}
+
+void Light::set_lens_streak_color(const Color &p_color) {
+	lens_streak_color = p_color;
+	_update_lens_streak();
+}
+
+Color Light::get_lens_streak_color() const {
+	return lens_streak_color;
+}
+
+void Light::set_lens_streak_intensity(float p_intensity) {
+	lens_streak_intensity = MAX(p_intensity, 0.0f);
+	_update_lens_streak();
+}
+
+float Light::get_lens_streak_intensity() const {
+	return lens_streak_intensity;
+}
+
+void Light::set_lens_streak_length(float p_length) {
+	lens_streak_length = MAX(p_length, 0.0f);
+	_update_lens_streak();
+}
+
+float Light::get_lens_streak_length() const {
+	return lens_streak_length;
+}
+
+void Light::set_lens_streak_thickness(float p_thickness) {
+	lens_streak_thickness = MAX(p_thickness, 0.0f);
+	_update_lens_streak();
+}
+
+float Light::get_lens_streak_thickness() const {
+	return lens_streak_thickness;
+}
+
+void Light::set_lens_streak_angle(float p_angle) {
+	lens_streak_angle = p_angle;
+	_update_lens_streak();
+}
+
+float Light::get_lens_streak_angle() const {
+	return lens_streak_angle;
+}
+
+void Light::set_lens_streak_source_size(float p_source_size) {
+	lens_streak_source_size = MAX(p_source_size, 0.0f);
+	_update_lens_streak();
+}
+
+float Light::get_lens_streak_source_size() const {
+	return lens_streak_source_size;
+}
+
+void Light::set_lens_streak_max_distance(float p_max_distance) {
+	lens_streak_max_distance = MAX(p_max_distance, 0.0f);
+	_update_lens_streak();
+}
+
+float Light::get_lens_streak_max_distance() const {
+	return lens_streak_max_distance;
+}
+
 void Light::set_shadow_reverse_cull_face(bool p_enable) {
 	reverse_cull = p_enable;
 	VS::get_singleton()->light_set_reverse_cull_face_mode(light, reverse_cull);
@@ -202,6 +288,17 @@ void Light::_validate_property(PropertyInfo &property) const {
 	if (bake_mode != BAKE_ALL && property.name == "light_size") {
 		property.usage = PROPERTY_USAGE_NOEDITOR | PROPERTY_USAGE_INTERNAL;
 	}
+
+	// Lens streaks are GLES3 only, and the sun has no distance to fade over.
+	if (property.name.begins_with("lens_streak_") && (VisualServer::get_singleton()->is_low_end() || (type == VS::LIGHT_DIRECTIONAL && property.name == "lens_streak_max_distance"))) {
+		property.usage = PROPERTY_USAGE_NOEDITOR | PROPERTY_USAGE_INTERNAL;
+	}
+
+	// Projectors are a GLES3 omni/spot feature; nothing consumes them on
+	// directional lights or in the GLES2 renderer.
+	if (property.name == "light_projector" && (type == VS::LIGHT_DIRECTIONAL || VisualServer::get_singleton()->is_low_end())) {
+		property.usage = PROPERTY_USAGE_NOEDITOR | PROPERTY_USAGE_INTERNAL;
+	}
 }
 
 void Light::_bind_methods() {
@@ -229,8 +326,28 @@ void Light::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_shadow_color", "shadow_color"), &Light::set_shadow_color);
 	ClassDB::bind_method(D_METHOD("get_shadow_color"), &Light::get_shadow_color);
 
+	ClassDB::bind_method(D_METHOD("set_projector", "projector"), &Light::set_projector);
+	ClassDB::bind_method(D_METHOD("get_projector"), &Light::get_projector);
+
 	ClassDB::bind_method(D_METHOD("set_bake_mode", "bake_mode"), &Light::set_bake_mode);
 	ClassDB::bind_method(D_METHOD("get_bake_mode"), &Light::get_bake_mode);
+
+	ClassDB::bind_method(D_METHOD("set_lens_streak_enabled", "enabled"), &Light::set_lens_streak_enabled);
+	ClassDB::bind_method(D_METHOD("is_lens_streak_enabled"), &Light::is_lens_streak_enabled);
+	ClassDB::bind_method(D_METHOD("set_lens_streak_color", "color"), &Light::set_lens_streak_color);
+	ClassDB::bind_method(D_METHOD("get_lens_streak_color"), &Light::get_lens_streak_color);
+	ClassDB::bind_method(D_METHOD("set_lens_streak_intensity", "intensity"), &Light::set_lens_streak_intensity);
+	ClassDB::bind_method(D_METHOD("get_lens_streak_intensity"), &Light::get_lens_streak_intensity);
+	ClassDB::bind_method(D_METHOD("set_lens_streak_length", "length"), &Light::set_lens_streak_length);
+	ClassDB::bind_method(D_METHOD("get_lens_streak_length"), &Light::get_lens_streak_length);
+	ClassDB::bind_method(D_METHOD("set_lens_streak_thickness", "thickness"), &Light::set_lens_streak_thickness);
+	ClassDB::bind_method(D_METHOD("get_lens_streak_thickness"), &Light::get_lens_streak_thickness);
+	ClassDB::bind_method(D_METHOD("set_lens_streak_angle", "angle"), &Light::set_lens_streak_angle);
+	ClassDB::bind_method(D_METHOD("get_lens_streak_angle"), &Light::get_lens_streak_angle);
+	ClassDB::bind_method(D_METHOD("set_lens_streak_source_size", "source_size"), &Light::set_lens_streak_source_size);
+	ClassDB::bind_method(D_METHOD("get_lens_streak_source_size"), &Light::get_lens_streak_source_size);
+	ClassDB::bind_method(D_METHOD("set_lens_streak_max_distance", "max_distance"), &Light::set_lens_streak_max_distance);
+	ClassDB::bind_method(D_METHOD("get_lens_streak_max_distance"), &Light::get_lens_streak_max_distance);
 
 	ADD_GROUP("Light", "light_");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "light_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_color", "get_color");
@@ -241,6 +358,16 @@ void Light::_bind_methods() {
 	ADD_PROPERTYI(PropertyInfo(Variant::REAL, "light_specular", PROPERTY_HINT_RANGE, "0,16,0.001,or_greater"), "set_param", "get_param", PARAM_SPECULAR);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "light_bake_mode", PROPERTY_HINT_ENUM, "Disable,Indirect Only,All (Direct + Indirect)"), "set_bake_mode", "get_bake_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "light_cull_mask", PROPERTY_HINT_LAYERS_3D_RENDER), "set_cull_mask", "get_cull_mask");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "light_projector", PROPERTY_HINT_RESOURCE_TYPE, "Texture"), "set_projector", "get_projector");
+	ADD_GROUP("Lens Streak", "lens_streak_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "lens_streak_enabled"), "set_lens_streak_enabled", "is_lens_streak_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "lens_streak_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_lens_streak_color", "get_lens_streak_color");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "lens_streak_intensity", PROPERTY_HINT_RANGE, "0,16,0.01,or_greater"), "set_lens_streak_intensity", "get_lens_streak_intensity");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "lens_streak_length", PROPERTY_HINT_RANGE, "0,2,0.001,or_greater"), "set_lens_streak_length", "get_lens_streak_length");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "lens_streak_thickness", PROPERTY_HINT_RANGE, "0,0.5,0.001,or_greater"), "set_lens_streak_thickness", "get_lens_streak_thickness");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "lens_streak_angle", PROPERTY_HINT_RANGE, "-180,180,0.1"), "set_lens_streak_angle", "get_lens_streak_angle");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "lens_streak_source_size", PROPERTY_HINT_RANGE, "0,5,0.01,or_greater"), "set_lens_streak_source_size", "get_lens_streak_source_size");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "lens_streak_max_distance", PROPERTY_HINT_RANGE, "0,4096,0.1,or_greater"), "set_lens_streak_max_distance", "get_lens_streak_max_distance");
 	ADD_GROUP("Shadow", "shadow_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "shadow_enabled"), "set_shadow", "has_shadow");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "shadow_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_shadow_color", "get_shadow_color");
@@ -361,6 +488,100 @@ bool DirectionalLight::is_blend_splits_enabled() const {
 	return blend_splits;
 }
 
+void DirectionalLight::_update_godrays() {
+	VS::get_singleton()->light_directional_set_light_shafts(light, godrays_enabled, godrays_intensity, godrays_threshold, godrays_tint, godrays_occlusion, godrays_samples, godrays_density, godrays_decay, godrays_weight, godrays_temporal_blend);
+}
+
+void DirectionalLight::set_godrays_enabled(bool p_enabled) {
+	godrays_enabled = p_enabled;
+	_update_godrays();
+}
+
+bool DirectionalLight::is_godrays_enabled() const {
+	return godrays_enabled;
+}
+
+void DirectionalLight::set_godrays_intensity(float p_intensity) {
+	godrays_intensity = MAX(p_intensity, 0.0f);
+	_update_godrays();
+}
+
+float DirectionalLight::get_godrays_intensity() const {
+	return godrays_intensity;
+}
+
+void DirectionalLight::set_godrays_threshold(float p_threshold) {
+	godrays_threshold = MAX(p_threshold, 0.0f);
+	_update_godrays();
+}
+
+float DirectionalLight::get_godrays_threshold() const {
+	return godrays_threshold;
+}
+
+void DirectionalLight::set_godrays_tint(const Color &p_tint) {
+	godrays_tint = p_tint;
+	_update_godrays();
+}
+
+Color DirectionalLight::get_godrays_tint() const {
+	return godrays_tint;
+}
+
+void DirectionalLight::set_godrays_occlusion(float p_occlusion) {
+	godrays_occlusion = CLAMP(p_occlusion, 0.0f, 1.0f);
+	_update_godrays();
+}
+
+float DirectionalLight::get_godrays_occlusion() const {
+	return godrays_occlusion;
+}
+
+void DirectionalLight::set_godrays_samples(int p_samples) {
+	godrays_samples = CLAMP(p_samples, 4, 128);
+	_update_godrays();
+}
+
+int DirectionalLight::get_godrays_samples() const {
+	return godrays_samples;
+}
+
+void DirectionalLight::set_godrays_density(float p_density) {
+	godrays_density = CLAMP(p_density, 0.01f, 1.0f);
+	_update_godrays();
+}
+
+float DirectionalLight::get_godrays_density() const {
+	return godrays_density;
+}
+
+void DirectionalLight::set_godrays_decay(float p_decay) {
+	godrays_decay = CLAMP(p_decay, 0.0f, 1.0f);
+	_update_godrays();
+}
+
+float DirectionalLight::get_godrays_decay() const {
+	return godrays_decay;
+}
+
+void DirectionalLight::set_godrays_weight(float p_weight) {
+	godrays_weight = MAX(p_weight, 0.0f);
+	_update_godrays();
+}
+
+float DirectionalLight::get_godrays_weight() const {
+	return godrays_weight;
+}
+
+void DirectionalLight::set_godrays_temporal_blend(float p_temporal_blend) {
+	godrays_temporal_blend = CLAMP(p_temporal_blend, 0.0f, 0.95f);
+	_update_godrays();
+}
+
+float DirectionalLight::get_godrays_temporal_blend() const {
+	return godrays_temporal_blend;
+}
+
 void DirectionalLight::_validate_property(PropertyInfo &property) const {
 	if (shadow_mode == SHADOW_ORTHOGONAL && (property.name == "directional_shadow_split_1" || property.name == "directional_shadow_blend_splits" || property.name == "directional_shadow_bias_split_scale")) {
 		// Split 2, split blending and bias split scale are only used with the PSSM 2 Splits and PSSM 4 Splits shadow modes.
@@ -370,6 +591,10 @@ void DirectionalLight::_validate_property(PropertyInfo &property) const {
 	if ((shadow_mode == SHADOW_ORTHOGONAL || shadow_mode == SHADOW_PARALLEL_2_SPLITS) && (property.name == "directional_shadow_split_2" || property.name == "directional_shadow_split_3")) {
 		// Splits 3 and 4 are only used with the PSSM 4 Splits shadow mode.
 		property.usage = PROPERTY_USAGE_NOEDITOR;
+	}
+
+	if (property.name.begins_with("godrays_") && VisualServer::get_singleton()->is_low_end()) {
+		property.usage = PROPERTY_USAGE_NOEDITOR | PROPERTY_USAGE_INTERNAL;
 	}
 
 	Light::_validate_property(property);
@@ -385,6 +610,27 @@ void DirectionalLight::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_blend_splits", "enabled"), &DirectionalLight::set_blend_splits);
 	ClassDB::bind_method(D_METHOD("is_blend_splits_enabled"), &DirectionalLight::is_blend_splits_enabled);
 
+	ClassDB::bind_method(D_METHOD("set_godrays_enabled", "enabled"), &DirectionalLight::set_godrays_enabled);
+	ClassDB::bind_method(D_METHOD("is_godrays_enabled"), &DirectionalLight::is_godrays_enabled);
+	ClassDB::bind_method(D_METHOD("set_godrays_intensity", "intensity"), &DirectionalLight::set_godrays_intensity);
+	ClassDB::bind_method(D_METHOD("get_godrays_intensity"), &DirectionalLight::get_godrays_intensity);
+	ClassDB::bind_method(D_METHOD("set_godrays_threshold", "threshold"), &DirectionalLight::set_godrays_threshold);
+	ClassDB::bind_method(D_METHOD("get_godrays_threshold"), &DirectionalLight::get_godrays_threshold);
+	ClassDB::bind_method(D_METHOD("set_godrays_tint", "tint"), &DirectionalLight::set_godrays_tint);
+	ClassDB::bind_method(D_METHOD("get_godrays_tint"), &DirectionalLight::get_godrays_tint);
+	ClassDB::bind_method(D_METHOD("set_godrays_occlusion", "occlusion"), &DirectionalLight::set_godrays_occlusion);
+	ClassDB::bind_method(D_METHOD("get_godrays_occlusion"), &DirectionalLight::get_godrays_occlusion);
+	ClassDB::bind_method(D_METHOD("set_godrays_samples", "samples"), &DirectionalLight::set_godrays_samples);
+	ClassDB::bind_method(D_METHOD("get_godrays_samples"), &DirectionalLight::get_godrays_samples);
+	ClassDB::bind_method(D_METHOD("set_godrays_density", "density"), &DirectionalLight::set_godrays_density);
+	ClassDB::bind_method(D_METHOD("get_godrays_density"), &DirectionalLight::get_godrays_density);
+	ClassDB::bind_method(D_METHOD("set_godrays_decay", "decay"), &DirectionalLight::set_godrays_decay);
+	ClassDB::bind_method(D_METHOD("get_godrays_decay"), &DirectionalLight::get_godrays_decay);
+	ClassDB::bind_method(D_METHOD("set_godrays_weight", "weight"), &DirectionalLight::set_godrays_weight);
+	ClassDB::bind_method(D_METHOD("get_godrays_weight"), &DirectionalLight::get_godrays_weight);
+	ClassDB::bind_method(D_METHOD("set_godrays_temporal_blend", "temporal_blend"), &DirectionalLight::set_godrays_temporal_blend);
+	ClassDB::bind_method(D_METHOD("get_godrays_temporal_blend"), &DirectionalLight::get_godrays_temporal_blend);
+
 	ADD_GROUP("Directional Shadow", "directional_shadow_");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "directional_shadow_mode", PROPERTY_HINT_ENUM, "Orthogonal (Fast),PSSM 2 Splits (Average),PSSM 4 Splits (Slow)"), "set_shadow_mode", "get_shadow_mode");
 	ADD_PROPERTYI(PropertyInfo(Variant::REAL, "directional_shadow_split_1", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_param", "get_param", PARAM_SHADOW_SPLIT_1_OFFSET);
@@ -395,6 +641,18 @@ void DirectionalLight::_bind_methods() {
 	ADD_PROPERTYI(PropertyInfo(Variant::REAL, "directional_shadow_bias_split_scale", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_param", "get_param", PARAM_SHADOW_BIAS_SPLIT_SCALE);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "directional_shadow_depth_range", PROPERTY_HINT_ENUM, "Stable,Optimized"), "set_shadow_depth_range", "get_shadow_depth_range");
 	ADD_PROPERTYI(PropertyInfo(Variant::REAL, "directional_shadow_max_distance", PROPERTY_HINT_EXP_RANGE, "0,8192,0.1,or_greater"), "set_param", "get_param", PARAM_SHADOW_MAX_DISTANCE);
+	ADD_GROUP("God Rays", "godrays_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "godrays_enabled"), "set_godrays_enabled", "is_godrays_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "godrays_intensity", PROPERTY_HINT_RANGE, "0,8,0.01"), "set_godrays_intensity", "get_godrays_intensity");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "godrays_threshold", PROPERTY_HINT_RANGE, "0,4,0.01"), "set_godrays_threshold", "get_godrays_threshold");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "godrays_tint", PROPERTY_HINT_COLOR_NO_ALPHA), "set_godrays_tint", "get_godrays_tint");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "godrays_occlusion", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_godrays_occlusion", "get_godrays_occlusion");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "godrays_samples", PROPERTY_HINT_RANGE, "4,128,1"), "set_godrays_samples", "get_godrays_samples");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "godrays_density", PROPERTY_HINT_RANGE, "0.01,1,0.001"), "set_godrays_density", "get_godrays_density");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "godrays_decay", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_godrays_decay", "get_godrays_decay");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "godrays_weight", PROPERTY_HINT_RANGE, "0,4,0.01"), "set_godrays_weight", "get_godrays_weight");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "godrays_temporal_blend", PROPERTY_HINT_RANGE, "0,0.95,0.01"), "set_godrays_temporal_blend", "get_godrays_temporal_blend");
+	ADD_GROUP("", "");
 
 	BIND_ENUM_CONSTANT(SHADOW_ORTHOGONAL);
 	BIND_ENUM_CONSTANT(SHADOW_PARALLEL_2_SPLITS);
@@ -414,6 +672,9 @@ DirectionalLight::DirectionalLight() :
 	set_shadow_depth_range(SHADOW_DEPTH_RANGE_STABLE);
 
 	blend_splits = false;
+
+	// Degrees here: the angular radius of the sun disc.
+	set_lens_streak_source_size(0.5);
 }
 
 void OmniLight::set_shadow_mode(ShadowMode p_mode) {

@@ -1,5 +1,8 @@
 # light_shafts module
 
+> `DirectionalLight` now has god rays built in (`godrays_*`). This node is kept so
+> existing scenes load; it forwards its older properties to them.
+
 Adds **`DirectionalLightShaft`**, a `DirectionalLight` that also renders
 Unreal-style **light shafts / god rays** as a real post-process stage in the
 GLES3 renderer.

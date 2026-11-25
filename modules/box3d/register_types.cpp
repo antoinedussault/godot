@@ -16,6 +16,11 @@ void register_box3d_types() {
 	// purpose: Bullet stays the default, so building this module cannot change
 	// the behaviour of any existing project. Opt in per project with
 	// physics/3d/physics_engine = "Box3D".
+	// Threads Box3D may use for one world. Every active world gets its own.
+	GLOBAL_DEF("physics/3d/box3d/worker_count", 1);
+	ProjectSettings::get_singleton()->set_custom_property_info("physics/3d/box3d/worker_count",
+			PropertyInfo(Variant::INT, "physics/3d/box3d/worker_count", PROPERTY_HINT_RANGE, "1,16,1"));
+
 	PhysicsServerManager::register_server("Box3D", &_create_box3d_physics_callback);
 #endif
 }

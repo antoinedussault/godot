@@ -33,10 +33,12 @@
 #include "core/io/resource_importer.h"
 #include "core/io/resource_loader.h"
 #include "core/io/resource_saver.h"
+#include "core/message_queue.h"
 #include "core/os/file_access.h"
 #include "core/os/os.h"
 #include "core/project_settings.h"
 #include "core/variant_parser.h"
+#include "editor_fs_trace.h"
 #include "editor_node.h"
 #include "editor_resource_preview.h"
 #include "editor_settings.h"
@@ -283,6 +285,9 @@ void EditorFileSystem::_scan_filesystem() {
 		d->remove(update_cache); //bye bye update cache
 	}
 
+	scan_file_count.set(0);
+	scan_file_estimate.set(file_cache.size());
+
 	EditorProgressBG scan_progress("efs", "ScanFS", 1000);
 
 	ScanProgress sp;
@@ -420,7 +425,14 @@ bool EditorFileSystem::_test_for_reimport(const String &p_path, bool p_only_impo
 	VariantParser::StreamFile md5_stream;
 	md5_stream.f = md5s;
 
-	while (true) {
+	// When p_only_imported_files is set, every assignment this loop produces is
+	// discarded (the body is gated on !p_only_imported_files, and so is the only
+	// place source_md5/dest_md5 are read, at the end of this function). All that
+	// mode needs from the .md5 is that it opened at all, checked just above.
+	// _scan_fs_changes() takes this path for every imported asset in the project
+	// on every change scan, so skipping the parse turns a full VariantParser pass
+	// per file back into a single open.
+	while (!p_only_imported_files) {
 		assign = Variant();
 		next_tag.fields.clear();
 		next_tag.name = String();
@@ -637,6 +649,7 @@ void EditorFileSystem::scan() {
 
 void EditorFileSystem::ScanProgress::update(int p_current, int p_total) const {
 	float ratio = low + ((hi - low) / p_total) * p_current;
+	ratio = CLAMP(ratio, 0.0f, 1.0f);
 	progress->step(ratio * 1000);
 	EditorFileSystem::singleton->scan_total = ratio;
 }
@@ -645,7 +658,11 @@ EditorFileSystem::ScanProgress EditorFileSystem::ScanProgress::get_sub(int p_cur
 	ScanProgress sp = *this;
 	float slice = (sp.hi - sp.low) / p_total;
 	sp.low += slice * p_current;
-	sp.hi = slice;
+	// `hi` is an absolute position in [0..1], not a width, so it has to be
+	// offset by the new `low`. Assigning the bare slice made `hi` fall below
+	// `low` for any p_current > 0, which drove update() backwards and pinned
+	// the reported progress at 0 for deep directory trees.
+	sp.hi = sp.low + slice;
 	return sp;
 }
 
@@ -738,6 +755,12 @@ void EditorFileSystem::_scan_new_dir(EditorFileSystemDirectory *p_dir, DirAccess
 		fi->file = E->get();
 
 		String path = cd.plus_file(fi->file);
+
+		scan_file_count.increment();
+		{
+			MutexLock lock(scan_current_file_mutex);
+			scan_current_file = path;
+		}
 
 		FileCache *fc = file_cache.getptr(path);
 		uint64_t mt = FileAccess::get_modified_time(path);
@@ -873,7 +896,7 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, const 
 					efd->name = f;
 					DirAccess *d = DirAccess::create(DirAccess::ACCESS_RESOURCES);
 					d->change_dir(cd.plus_file(f));
-					_scan_new_dir(efd, d, p_progress.get_sub(1, 1));
+					_scan_new_dir(efd, d, p_progress);
 					memdelete(d);
 
 					ItemAction ia;
@@ -962,7 +985,12 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, const 
 				uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
 				if (import_mt != p_dir->files[i]->import_modified_time) {
 					reimport = true;
-				} else if (_test_for_reimport(path, true)) {
+				} else if (revalidate_import_settings && _test_for_reimport(path, true)) {
+					// Both the source and its .import are byte-for-byte as we last
+					// saw them, so the only thing left for _test_for_reimport() to
+					// catch is a global importer settings change -- gated above --
+					// or a generated file deleted from the import cache behind the
+					// editor's back, which the next full scan picks up.
 					reimport = true;
 				}
 			}
@@ -990,7 +1018,12 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, const 
 		}
 	}
 
-	for (int i = 0; i < p_dir->subdirs.size(); i++) {
+	// Split the progress range across the subdirectories, the same way
+	// _scan_new_dir() does, otherwise scan_total is never written at all
+	// during a changes scan and the FileSystem dock sits at 0% for its
+	// whole duration.
+	const int subdir_count = p_dir->subdirs.size();
+	for (int i = 0; i < subdir_count; i++) {
 		if ((updated_dir && !p_dir->subdirs[i]->verified) || _should_skip_directory(p_dir->subdirs[i]->get_path())) {
 			//this directory was removed or ignored, add action to remove it
 			ItemAction ia;
@@ -999,7 +1032,8 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, const 
 			scan_actions.push_back(ia);
 			continue;
 		}
-		_scan_fs_changes(p_dir->get_subdir(i), p_progress);
+		_scan_fs_changes(p_dir->get_subdir(i), p_progress.get_sub(i, subdir_count));
+		p_progress.update(i + 1, subdir_count);
 	}
 }
 
@@ -1042,6 +1076,17 @@ void EditorFileSystem::scan_changes() {
 	}
 
 	_update_extensions();
+
+	{
+		// Recompute once per scan rather than letting every imported asset
+		// re-derive it from disk. The startup full scan already validated against
+		// its own cached hash (revalidate_import_files), so the first change scan
+		// of a session only has to seed the baseline.
+		const String settings_hash = ResourceFormatImporter::get_singleton()->get_import_settings_hash();
+		revalidate_import_settings = !last_validated_import_settings_hash.empty() && settings_hash != last_validated_import_settings_hash;
+		last_validated_import_settings_hash = settings_hash;
+	}
+
 	sources_changed.clear();
 	scanning_changes = true;
 	scanning_changes_done = false;
@@ -1120,6 +1165,11 @@ void EditorFileSystem::_notification(int p_what) {
 						first_scan = false;
 					}
 				} else if (!scanning) {
+					if (first_scan && first_scan_settle_frames > 0) {
+						first_scan_settle_frames--;
+						break;
+					}
+
 					set_process(false);
 
 					if (filesystem) {
@@ -1147,6 +1197,11 @@ void EditorFileSystem::_notification(int p_what) {
 bool EditorFileSystem::is_scanning() const {
 	return scanning || scanning_changes;
 }
+String EditorFileSystem::get_scan_current_file() const {
+	MutexLock lock(scan_current_file_mutex);
+	return scan_current_file;
+}
+
 float EditorFileSystem::get_scanning_progress() const {
 	return scan_total;
 }
@@ -1404,6 +1459,7 @@ void EditorFileSystem::update_script_classes() {
 	if (!update_script_classes_queued.is_set()) {
 		return;
 	}
+	FS_TRACE("EditorFileSystem::update_script_classes");
 
 	update_script_classes_queued.clear();
 	ScriptServer::global_classes_clear();
@@ -1423,6 +1479,42 @@ void EditorFileSystem::update_script_classes() {
 	ResourceSaver::add_custom_savers();
 }
 
+void EditorFileSystem::_emit_filesystem_changed() {
+	filesystem_changed_queued.clear();
+	emit_signal("filesystem_changed");
+}
+
+void EditorFileSystem::_queue_filesystem_changed() {
+	if (filesystem_changed_queued.is_set()) {
+		return;
+	}
+
+	filesystem_changed_queued.set();
+	if (MessageQueue::get_singleton()->push_call(this, "_emit_filesystem_changed") != OK) {
+		// The message queue overflowed and dropped the call. Unlatch, or the flag
+		// would stay set for the rest of the session and the dock would never
+		// refresh again; the next caller then gets a fresh attempt.
+		filesystem_changed_queued.clear();
+	}
+}
+
+void EditorFileSystem::_save_late_updated_files_deferred() {
+	late_update_files_queued.clear();
+	_save_late_updated_files();
+}
+
+void EditorFileSystem::_queue_save_late_updated_files() {
+	if (late_update_files_queued.is_set()) {
+		return;
+	}
+
+	late_update_files_queued.set();
+	if (MessageQueue::get_singleton()->push_call(this, "_save_late_updated_files_deferred") != OK) {
+		late_update_files_queued.clear();
+		_save_late_updated_files(); // Fall back to writing it straight away.
+	}
+}
+
 void EditorFileSystem::_queue_update_script_classes() {
 	if (update_script_classes_queued.is_set()) {
 		return;
@@ -1433,6 +1525,7 @@ void EditorFileSystem::_queue_update_script_classes() {
 }
 
 void EditorFileSystem::update_file(const String &p_file) {
+	FS_TRACE("EditorFileSystem::update_file");
 	EditorFileSystemDirectory *fs = nullptr;
 	int cpos = -1;
 
@@ -1445,13 +1538,19 @@ void EditorFileSystem::update_file(const String &p_file) {
 	if (!FileAccess::exists(p_file)) {
 		//was removed
 		_delete_internal_files(p_file);
+		bool was_global_class = false;
 		if (cpos != -1) { // Might've never been part of the editor file system (*.* files deleted in Open dialog).
+			was_global_class = !fs->files[cpos]->script_class_name.empty();
 			memdelete(fs->files[cpos]);
 			fs->files.remove(cpos);
 		}
 
-		call_deferred("emit_signal", "filesystem_changed"); //update later
-		_queue_update_script_classes();
+		_queue_filesystem_changed(); //update later
+		// Same reasoning as at the end of this function: only a file that was in
+		// the global class list can change it by disappearing.
+		if (was_global_class) {
+			_queue_update_script_classes();
+		}
 		return;
 	}
 
@@ -1486,8 +1585,10 @@ void EditorFileSystem::update_file(const String &p_file) {
 		//the file exists and it was updated, and was not added in this step.
 		//this means we must force upon next restart to scan it again, to get proper type and dependencies
 		late_update_files.insert(p_file);
-		_save_late_updated_files(); //files need to be updated in the re-scan
+		_queue_save_late_updated_files(); //files need to be updated in the re-scan
 	}
+
+	const String prev_script_class_name = fs->files[cpos]->script_class_name;
 
 	fs->files[cpos]->type = type;
 	fs->files[cpos]->script_class_name = _get_global_script_class(type, p_file, &fs->files[cpos]->script_class_extends, &fs->files[cpos]->script_class_icon_path);
@@ -1499,8 +1600,15 @@ void EditorFileSystem::update_file(const String &p_file) {
 	// Update preview
 	EditorResourcePreview::get_singleton()->check_for_invalidation(p_file);
 
-	call_deferred("emit_signal", "filesystem_changed"); //update later
-	_queue_update_script_classes();
+	_queue_filesystem_changed(); //update later
+
+	// update_script_classes() walks the whole res:// tree and re-registers every
+	// custom ResourceFormatLoader/Saver. That is only meaningful when this file
+	// takes part in the global class list; a plain resource (.tres, .res, ...)
+	// never does, so saving one should not drag the entire project through it.
+	if (!prev_script_class_name.empty() || !fs->files[cpos]->script_class_name.empty()) {
+		_queue_update_script_classes();
+	}
 }
 
 Set<String> EditorFileSystem::get_valid_extensions() const {
@@ -1924,6 +2032,62 @@ void EditorFileSystem::_create_project_data_dir_if_necessary() {
 }
 
 void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
+	// _reimport_files_internal() drives a foreground EditorProgress, and
+	// ProgressDialog::task_step() runs Main::iteration(). That re-enters the main
+	// loop, so a reimport can be requested again from inside one that is still
+	// running -- either from _update_scan_actions() on the NOTIFICATION_PROCESS
+	// that the nested iteration delivers, or from ResourceImporterTexture's
+	// detect_3d/srgb pass. The nested call used to build a second EditorProgress
+	// for the same "reimport" task; ProgressDialog::add_task() rejects it as a
+	// duplicate, but the nested object's destructor still ends the task, so the
+	// outer loop's next pr.step() trips
+	// ERR_FAIL_COND_V(!tasks.has(p_task)) in ProgressDialog::task_step().
+	// Collect nested requests instead and run them once the current pass is done.
+	// Note this cannot use `importing`: that is cleared near the end of
+	// _reimport_files_internal(), before it emits filesystem_changed and
+	// resources_reimported, while its EditorProgress is still alive -- a listener
+	// reimporting from one of those emissions would slip straight through.
+	if (reimport_reentrant_guard) {
+		for (int i = 0; i < p_files.size(); i++) {
+			pending_reimports.insert(p_files[i]);
+		}
+		return;
+	}
+
+	reimport_reentrant_guard = true;
+
+	_reimport_files_internal(p_files);
+
+	// Drained only once the EditorProgress above has been destroyed, so each
+	// batch owns the "reimport" task outright. A file is run at most once per
+	// drain: a source that fails to import keeps looking stale to
+	// _update_scan_actions(), so without this the loop would never terminate.
+	Set<String> attempted;
+	for (int i = 0; i < p_files.size(); i++) {
+		attempted.insert(p_files[i]);
+	}
+
+	while (!pending_reimports.empty()) {
+		Vector<String> deferred;
+		for (Set<String>::Element *E = pending_reimports.front(); E; E = E->next()) {
+			if (!attempted.has(E->get())) {
+				attempted.insert(E->get());
+				deferred.push_back(E->get());
+			}
+		}
+		pending_reimports.clear();
+
+		if (deferred.empty()) {
+			break;
+		}
+		_reimport_files_internal(deferred);
+	}
+
+	pending_reimports.clear();
+	reimport_reentrant_guard = false;
+}
+
+void EditorFileSystem::_reimport_files_internal(const Vector<String> &p_files) {
 	_create_project_data_dir_if_necessary();
 
 	importing = true;
@@ -2069,6 +2233,8 @@ void EditorFileSystem::move_group_file(const String &p_path, const String &p_new
 
 void EditorFileSystem::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_filesystem"), &EditorFileSystem::get_filesystem);
+	ClassDB::bind_method(D_METHOD("_emit_filesystem_changed"), &EditorFileSystem::_emit_filesystem_changed);
+	ClassDB::bind_method(D_METHOD("_save_late_updated_files_deferred"), &EditorFileSystem::_save_late_updated_files_deferred);
 	ClassDB::bind_method(D_METHOD("is_scanning"), &EditorFileSystem::is_scanning);
 	ClassDB::bind_method(D_METHOD("get_scanning_progress"), &EditorFileSystem::get_scanning_progress);
 	ClassDB::bind_method(D_METHOD("scan"), &EditorFileSystem::scan);
@@ -2127,9 +2293,14 @@ EditorFileSystem::EditorFileSystem() {
 
 	scan_total = 0;
 	update_script_classes_queued.clear();
+	filesystem_changed_queued.clear();
+	late_update_files_queued.clear();
 	first_scan = true;
+	first_scan_settle_frames = FIRST_SCAN_SETTLE_FRAMES;
 	scan_changes_pending = false;
 	revalidate_import_files = false;
+	revalidate_import_settings = false;
+	reimport_reentrant_guard = false;
 }
 
 EditorFileSystem::~EditorFileSystem() {

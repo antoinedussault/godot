@@ -192,7 +192,15 @@ private:
 	float hit_radius = 0.2f;
 	bool collision_enabled = true;
 	uint32_t collision_layer = 1;
-	uint32_t collision_mask = 0;
+	// GodotPhysics/Bullet ray queries only check the *target's* collision_layer
+	// against the query's mask (servers/physics/space_sw.cpp:_can_collide_with),
+	// so a body's own collision_mask is irrelevant to being hit and 0 would be
+	// harmless there. Box3D's b3QueryFilter is bidirectional (Box2D-style: the
+	// shape's own maskBits must also match the query's category), so a 0 mask
+	// makes the cable invisible to every query under that backend specifically.
+	// Default to 1 (matching collision_layer, and Godot's own CollisionObject
+	// default) so the cable is hittable out of the box on every backend.
+	uint32_t collision_mask = 1;
 
 	Vector<Strand> _strands;
 	ImmediateGeometry *_geom = nullptr;

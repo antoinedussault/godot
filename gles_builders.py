@@ -12,6 +12,8 @@ class LegacyGLHeaderStruct:
     def __init__(self):
         self.vertex_lines = []
         self.fragment_lines = []
+        self.tess_control_lines = []
+        self.tess_eval_lines = []
         self.uniforms = []
         self.attributes = []
         self.feedbacks = []
@@ -25,11 +27,15 @@ class LegacyGLHeaderStruct:
 
         self.vertex_included_files = []
         self.fragment_included_files = []
+        self.tess_control_included_files = []
+        self.tess_eval_included_files = []
 
         self.reading = ""
         self.line_offset = 0
         self.vertex_offset = 0
         self.fragment_offset = 0
+        self.tess_control_offset = 0
+        self.tess_eval_offset = 0
 
 
 def include_file_in_legacygl_header(filename, header_data, depth):
@@ -52,6 +58,20 @@ def include_file_in_legacygl_header(filename, header_data, depth):
             header_data.fragment_offset = header_data.line_offset
             continue
 
+        if line.find("[tess_control]") != -1:
+            header_data.reading = "tess_control"
+            line = fs.readline()
+            header_data.line_offset += 1
+            header_data.tess_control_offset = header_data.line_offset
+            continue
+
+        if line.find("[tess_eval]") != -1:
+            header_data.reading = "tess_eval"
+            line = fs.readline()
+            header_data.line_offset += 1
+            header_data.tess_eval_offset = header_data.line_offset
+            continue
+
         while line.find("#include ") != -1:
             includeline = line.replace("#include ", "").strip()[1:-1]
 
@@ -64,6 +84,14 @@ def include_file_in_legacygl_header(filename, header_data, depth):
                     print("Error in file '" + filename + "': #include " + includeline + "could not be found!")
             elif not included_file in header_data.fragment_included_files and header_data.reading == "fragment":
                 header_data.fragment_included_files += [included_file]
+                if include_file_in_legacygl_header(included_file, header_data, depth + 1) is None:
+                    print("Error in file '" + filename + "': #include " + includeline + "could not be found!")
+            elif not included_file in header_data.tess_control_included_files and header_data.reading == "tess_control":
+                header_data.tess_control_included_files += [included_file]
+                if include_file_in_legacygl_header(included_file, header_data, depth + 1) is None:
+                    print("Error in file '" + filename + "': #include " + includeline + "could not be found!")
+            elif not included_file in header_data.tess_eval_included_files and header_data.reading == "tess_eval":
+                header_data.tess_eval_included_files += [included_file]
                 if include_file_in_legacygl_header(included_file, header_data, depth + 1) is None:
                     print("Error in file '" + filename + "': #include " + includeline + "could not be found!")
 
@@ -180,6 +208,10 @@ def include_file_in_legacygl_header(filename, header_data, depth):
             header_data.vertex_lines += [line]
         if header_data.reading == "fragment":
             header_data.fragment_lines += [line]
+        if header_data.reading == "tess_control":
+            header_data.tess_control_lines += [line]
+        if header_data.reading == "tess_eval":
+            header_data.tess_eval_lines += [line]
 
         line = fs.readline()
         header_data.line_offset += 1
@@ -515,6 +547,33 @@ def build_legacygl_header(filename, include, class_suffix, output_attribs, gles2
 
     fd.write("\t\tstatic const int _fragment_code_start=" + str(header_data.fragment_offset) + ";\n")
 
+    # Tessellation stages are optional and GLES3-only; shaders that declare no
+    # [tess_control]/[tess_eval] sections emit nothing and call setup() unchanged.
+    has_tess = (not gles2) and len(header_data.tess_control_lines) > 0 and len(header_data.tess_eval_lines) > 0
+    tess_args = ""
+    if has_tess:
+        fd.write("\t\tstatic const char _tess_control_code[]={\n")
+        for x in header_data.tess_control_lines:
+            for c in x:
+                fd.write(str(ord(c)) + ",")
+            fd.write(str(ord("\n")) + ",")
+        fd.write("\t\t0};\n\n")
+
+        fd.write("\t\tstatic const char _tess_eval_code[]={\n")
+        for x in header_data.tess_eval_lines:
+            for c in x:
+                fd.write(str(ord(c)) + ",")
+            fd.write(str(ord("\n")) + ",")
+        fd.write("\t\t0};\n\n")
+
+        tess_args = (
+            ",_tess_control_code,_tess_eval_code,"
+            + str(header_data.tess_control_offset)
+            + ","
+            + str(header_data.tess_eval_offset)
+        )
+
+
     if output_attribs:
         if gles2:
             fd.write(
@@ -526,7 +585,9 @@ def build_legacygl_header(filename, include, class_suffix, output_attribs, gles2
                 + str(len(header_data.attributes))
                 + ", _texunit_pairs,"
                 + str(len(header_data.texunits))
-                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start);\n"
+                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start"
+                + tess_args
+                + ");\n"
             )
         else:
             fd.write(
@@ -542,7 +603,9 @@ def build_legacygl_header(filename, include, class_suffix, output_attribs, gles2
                 + str(len(header_data.ubos))
                 + ",_feedbacks,"
                 + str(feedback_count)
-                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start);\n"
+                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start"
+                + tess_args
+                + ");\n"
             )
     else:
         if gles2:
@@ -557,7 +620,9 @@ def build_legacygl_header(filename, include, class_suffix, output_attribs, gles2
                 + str(len(header_data.enums))
                 + ",_enum_values,"
                 + str(enum_value_count)
-                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start);\n"
+                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start"
+                + tess_args
+                + ");\n"
             )
         else:
             fd.write(
@@ -575,7 +640,9 @@ def build_legacygl_header(filename, include, class_suffix, output_attribs, gles2
                 + str(len(header_data.ubos))
                 + ",_feedbacks,"
                 + str(feedback_count)
-                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start);\n"
+                + ",_vertex_code,_fragment_code,_vertex_code_start,_fragment_code_start"
+                + tess_args
+                + ");\n"
             )
 
     fd.write("\t}\n\n")

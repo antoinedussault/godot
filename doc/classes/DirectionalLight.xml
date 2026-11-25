@@ -28,7 +28,7 @@
 			The light's shadow rendering algorithm. See [enum ShadowMode].
 		</member>
 		<member name="directional_shadow_normal_bias" type="float" setter="set_param" getter="get_param" default="0.8">
-			Can be used to fix special cases of self shadowing when objects are perpendicular to the light.
+			Offsets the shadow lookup along the surface normal, measured in shadow map texels, to stop surfaces from shadowing themselves. It is applied at the receiving surface and scaled by each cascade's texel size, so one value holds up across all splits and does not detach shadows from their casters. Raise it if striped self-shadowing remains; lower it if thin objects leak light.
 		</member>
 		<member name="directional_shadow_split_1" type="float" setter="set_param" getter="get_param" default="0.1">
 			The distance from camera to shadow split 1. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_2_SPLITS] or [constant SHADOW_PARALLEL_4_SPLITS].
@@ -39,6 +39,38 @@
 		<member name="directional_shadow_split_3" type="float" setter="set_param" getter="get_param" default="0.5">
 			The distance from shadow split 2 to split 3. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_4_SPLITS].
 		</member>
+		<member name="godrays_decay" type="float" setter="set_godrays_decay" getter="get_godrays_decay" default="0.9">
+			How slowly the rays fade along their length.
+		</member>
+		<member name="godrays_density" type="float" setter="set_godrays_density" getter="get_godrays_density" default="0.7">
+			How far the rays reach.
+		</member>
+		<member name="godrays_enabled" type="bool" setter="set_godrays_enabled" getter="is_godrays_enabled" default="false">
+			If [code]true[/code], screen-space god rays are scattered from the sun's position on screen. Only the first such directional light is used.
+			[b]Note:[/b] Only supported by the GLES3 renderer.
+		</member>
+		<member name="godrays_intensity" type="float" setter="set_godrays_intensity" getter="get_godrays_intensity" default="0.6">
+			Brightness of the rays. [code]0[/code] disables them, leaving only [member godrays_occlusion].
+		</member>
+		<member name="godrays_occlusion" type="float" setter="set_godrays_occlusion" getter="get_godrays_occlusion" default="0.35">
+			How much the scene is darkened around the sun where geometry blocks it. [code]0[/code] disables it.
+		</member>
+		<member name="godrays_samples" type="int" setter="set_godrays_samples" getter="get_godrays_samples" default="64">
+			Number of samples along each ray. Higher is smoother and slower.
+		</member>
+		<member name="godrays_temporal_blend" type="float" setter="set_godrays_temporal_blend" getter="get_godrays_temporal_blend" default="0.0">
+			Amount of the previous frame blended in to hide shimmer. Drops automatically while the camera moves.
+		</member>
+		<member name="godrays_threshold" type="float" setter="set_godrays_threshold" getter="get_godrays_threshold" default="1.0">
+			Brightness a pixel near the sun must have to cast rays.
+		</member>
+		<member name="godrays_tint" type="Color" setter="set_godrays_tint" getter="get_godrays_tint" default="Color( 1, 0.95, 0.85, 1 )">
+			Color of the rays.
+		</member>
+		<member name="godrays_weight" type="float" setter="set_godrays_weight" getter="get_godrays_weight" default="1.0">
+			Gain applied while the rays are accumulated.
+		</member>
+		<member name="lens_streak_source_size" type="float" setter="set_lens_streak_source_size" getter="get_lens_streak_source_size" overrides="Light" default="0.5" />
 		<member name="shadow_bias" type="float" setter="set_param" getter="get_param" overrides="Light" default="0.1" />
 	</members>
 	<constants>

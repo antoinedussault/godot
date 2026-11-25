@@ -457,6 +457,8 @@ String ShaderCompilerGLES3::_dump_node_code(const SL::Node *p_node, int p_level,
 
 				r_gen_code.vertex_global += struct_code;
 				r_gen_code.fragment_global += struct_code;
+				r_gen_code.tess_control_global += struct_code;
+				r_gen_code.tess_eval_global += struct_code;
 			}
 
 			int max_texture_uniforms = 0;
@@ -496,6 +498,8 @@ String ShaderCompilerGLES3::_dump_node_code(const SL::Node *p_node, int p_level,
 				if (SL::is_sampler_type(E.get().type)) {
 					r_gen_code.vertex_global += ucode;
 					r_gen_code.fragment_global += ucode;
+					r_gen_code.tess_control_global += ucode;
+					r_gen_code.tess_eval_global += ucode;
 					r_gen_code.texture_uniforms.write[E.get().texture_order] = _mkid(E.key());
 					r_gen_code.texture_hints.write[E.get().texture_order] = E.get().hint;
 					r_gen_code.texture_types.write[E.get().texture_order] = E.get().type;
@@ -594,6 +598,8 @@ String ShaderCompilerGLES3::_dump_node_code(const SL::Node *p_node, int p_level,
 				gcode += ";\n";
 				r_gen_code.vertex_global += gcode;
 				r_gen_code.fragment_global += gcode;
+				r_gen_code.tess_control_global += gcode;
+				r_gen_code.tess_eval_global += gcode;
 			}
 
 			Map<StringName, String> function_code;
@@ -611,6 +617,8 @@ String ShaderCompilerGLES3::_dump_node_code(const SL::Node *p_node, int p_level,
 
 			Set<StringName> added_vtx;
 			Set<StringName> added_fragment; //share for light
+			Set<StringName> added_tess_control;
+			Set<StringName> added_tess_eval;
 
 			for (int i = 0; i < pnode->functions.size(); i++) {
 				SL::FunctionNode *fnode = pnode->functions[i].function;
@@ -632,6 +640,18 @@ String ShaderCompilerGLES3::_dump_node_code(const SL::Node *p_node, int p_level,
 				if (fnode->name == light_name) {
 					_dump_function_deps(pnode, fnode->name, function_code, r_gen_code.fragment_global, added_fragment);
 					r_gen_code.light = function_code[light_name];
+				}
+
+				if (fnode->name == tess_control_name) {
+					_dump_function_deps(pnode, fnode->name, function_code, r_gen_code.tess_control_global, added_tess_control);
+					r_gen_code.tess_control = function_code[tess_control_name];
+					r_gen_code.uses_tessellation = true;
+				}
+
+				if (fnode->name == tess_eval_name) {
+					_dump_function_deps(pnode, fnode->name, function_code, r_gen_code.tess_eval_global, added_tess_eval);
+					r_gen_code.tess_eval = function_code[tess_eval_name];
+					r_gen_code.uses_tessellation = true;
 				}
 
 				function = nullptr;
@@ -1092,6 +1112,7 @@ Error ShaderCompilerGLES3::compile(VS::ShaderMode p_mode, const String &p_code, 
 	r_gen_code.light = String();
 	r_gen_code.uses_fragment_time = false;
 	r_gen_code.uses_vertex_time = false;
+	r_gen_code.uses_tessellation = false;
 
 	used_name_defines.clear();
 	used_rmode_defines.clear();
@@ -1190,6 +1211,16 @@ ShaderCompilerGLES3::ShaderCompilerGLES3() {
 	//builtins
 
 	actions[VS::SHADER_SPATIAL].renames["TIME"] = "time";
+
+	actions[VS::SHADER_SPATIAL].renames["PATCH_VERTEX"] = "patch_vertex";
+	actions[VS::SHADER_SPATIAL].renames["PATCH_NORMAL"] = "patch_normal";
+	actions[VS::SHADER_SPATIAL].renames["PATCH_UV"] = "patch_uv";
+	actions[VS::SHADER_SPATIAL].renames["INVOCATION_ID"] = "gl_InvocationID";
+	actions[VS::SHADER_SPATIAL].renames["TESS_LEVEL_OUTER"] = "gl_TessLevelOuter";
+	actions[VS::SHADER_SPATIAL].renames["TESS_LEVEL_INNER"] = "gl_TessLevelInner";
+	actions[VS::SHADER_SPATIAL].renames["TESS_COORD"] = "gl_TessCoord";
+	actions[VS::SHADER_SPATIAL].renames["CAMERA_POSITION_WORLD"] = "camera_pos_world";
+
 	actions[VS::SHADER_SPATIAL].renames["VIEWPORT_SIZE"] = "viewport_size";
 
 	actions[VS::SHADER_SPATIAL].renames["FRAGCOORD"] = "gl_FragCoord";
@@ -1341,6 +1372,8 @@ ShaderCompilerGLES3::ShaderCompilerGLES3() {
 	vertex_name = "vertex";
 	fragment_name = "fragment";
 	light_name = "light";
+	tess_control_name = "tess_control";
+	tess_eval_name = "tess_eval";
 	time_name = "TIME";
 
 	List<String> func_list;

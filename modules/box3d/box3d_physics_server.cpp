@@ -1,4 +1,5 @@
 #include "box3d_physics_server.h"
+#include "box3d_collide.h"
 #include "box3d_types_converter.h"
 
 #include "box3d/constants.h"
@@ -9,14 +10,6 @@
 
 #include <float.h> // FLT_MAX, for fully rigid mover planes
 
-// Two distinct kinds of "not done":
-//
-//   B3_TODO         — planned, needs the Box3D solver underneath it.
-//   B3_UNSUPPORTED  — Box3D has no equivalent and none is planned (soft bodies).
-//
-// Both warn once per call site, so a play session prints a precise, deduplicated
-// list of what the project actually exercises.
-#define B3_TODO(m_what) WARN_PRINT_ONCE("Box3D: " m_what " is not implemented yet.")
 #define B3_UNSUPPORTED(m_what) WARN_PRINT_ONCE("Box3D: " m_what " is not supported by this backend.")
 
 Box3DPhysicsServer::Box3DPhysicsServer() :
@@ -79,6 +72,18 @@ static b3BodyType b3_body_type_from_godot(PhysicsServer::BodyMode p_mode) {
 	}
 }
 
+static b3MotionLocks b3_motion_locks(const Box3DBody *p_body) {
+	b3MotionLocks locks;
+	const bool character = p_body->mode == PhysicsServer::BODY_MODE_CHARACTER;
+	locks.linearX = (p_body->locked_axis & PhysicsServer::BODY_AXIS_LINEAR_X) != 0;
+	locks.linearY = (p_body->locked_axis & PhysicsServer::BODY_AXIS_LINEAR_Y) != 0;
+	locks.linearZ = (p_body->locked_axis & PhysicsServer::BODY_AXIS_LINEAR_Z) != 0;
+	locks.angularX = character || (p_body->locked_axis & PhysicsServer::BODY_AXIS_ANGULAR_X) != 0;
+	locks.angularY = character || (p_body->locked_axis & PhysicsServer::BODY_AXIS_ANGULAR_Y) != 0;
+	locks.angularZ = character || (p_body->locked_axis & PhysicsServer::BODY_AXIS_ANGULAR_Z) != 0;
+	return locks;
+}
+
 void Box3DPhysicsServer::_body_enter_world(Box3DBody *p_body, Box3DSpace *p_space) {
 	ERR_FAIL_NULL(p_body);
 	ERR_FAIL_NULL(p_space);
@@ -108,31 +113,29 @@ void Box3DPhysicsServer::_body_enter_world(Box3DBody *p_body, Box3DSpace *p_spac
 	def.linearDamping = p_body->linear_damp >= 0 ? (float)p_body->linear_damp : 0.0f;
 	def.angularDamping = p_body->angular_damp >= 0 ? (float)p_body->angular_damp : 0.0f;
 
-	if (p_body->mode == PhysicsServer::BODY_MODE_CHARACTER) {
-		def.motionLocks.angularX = true;
-		def.motionLocks.angularY = true;
-		def.motionLocks.angularZ = true;
-	} else {
-		def.motionLocks.linearX = (p_body->locked_axis & BODY_AXIS_LINEAR_X) != 0;
-		def.motionLocks.linearY = (p_body->locked_axis & BODY_AXIS_LINEAR_Y) != 0;
-		def.motionLocks.linearZ = (p_body->locked_axis & BODY_AXIS_LINEAR_Z) != 0;
-		def.motionLocks.angularX = (p_body->locked_axis & BODY_AXIS_ANGULAR_X) != 0;
-		def.motionLocks.angularY = (p_body->locked_axis & BODY_AXIS_ANGULAR_Y) != 0;
-		def.motionLocks.angularZ = (p_body->locked_axis & BODY_AXIS_ANGULAR_Z) != 0;
-	}
+	def.motionLocks = b3_motion_locks(p_body);
+	def.isBullet = p_body->ccd_enabled;
 
 	p_body->body_id = b3CreateBody(p_space->world_id, &def);
 	p_space->add_body(p_body);
+	p_body->kinematic_moved = false;
+	p_body->kinematic_settle = false;
 
 	_body_rebuild_shapes(p_body);
+	_body_create_joints(p_body);
 }
 
 void Box3DPhysicsServer::_body_exit_world(Box3DBody *p_body) {
 	ERR_FAIL_NULL(p_body);
 
-	if (Box3DSpace *space = space_owner.getornull(p_body->space)) {
+	// A body that never joined a space has no RID to look up.
+	Box3DSpace *space = p_body->space.is_valid() ? space_owner.getornull(p_body->space) : nullptr;
+	if (space) {
+		space->forget_body(p_body);
 		space->remove_body(p_body);
 	}
+	p_body->areas.clear();
+	_body_destroy_joints(p_body);
 
 	if (p_body->in_world()) {
 		// Destroying the body takes its shapes with it, so the shape ids only
@@ -147,19 +150,71 @@ void Box3DPhysicsServer::_body_exit_world(Box3DBody *p_body) {
 	}
 }
 
+static b3Filter b3_body_filter(const Box3DBody *p_body) {
+	// Godot collides a pair when EITHER side's mask matches; Box3D requires both. So
+	// Box3D is told to accept everything and b3_custom_filter decides. The layer
+	// still goes into the category, because that is what scene queries match on.
+	b3Filter filter;
+	filter.categoryBits = (uint64_t)p_body->collision_layer | B3_CATEGORY_BODY;
+	filter.maskBits = ~(uint64_t)0;
+	filter.groupIndex = 0;
+	return filter;
+}
+
 void Box3DPhysicsServer::_body_update_filters(Box3DBody *p_body) {
+	_body_refilter(p_body);
+}
+
+void Box3DPhysicsServer::_body_refilter(Box3DBody *p_body) {
 	if (!p_body->in_world()) {
 		return;
 	}
 
-	b3Filter filter;
-	filter.categoryBits = p_body->collision_layer;
-	filter.maskBits = p_body->collision_mask;
-	filter.groupIndex = 0;
+	const b3Filter filter = b3_body_filter(p_body);
 
 	for (int i = 0; i < p_body->shapes.size(); i++) {
+		const b3ShapeId id = p_body->shapes[i].shape_id;
+		if (B3_IS_NULL(id)) {
+			continue;
+		}
+		// Box3D ignores a filter equal to the current one, but what the custom
+		// filter depends on may have changed without it. Always flip one bit.
+		b3Filter f = filter;
+		f.categoryBits |= ~b3Shape_GetFilter(id).categoryBits & B3_CATEGORY_TOGGLE;
+		b3Shape_SetFilter(id, f, true);
+	}
+}
+
+void Box3DPhysicsServer::_body_apply_locks(Box3DBody *p_body) {
+	if (p_body->in_world()) {
+		b3Body_SetMotionLocks(p_body->body_id, b3_motion_locks(p_body));
+	}
+}
+
+b3SurfaceMaterial Box3DPhysicsServer::_body_make_material(const Box3DBody *p_body) const {
+	b3SurfaceMaterial material = b3DefaultSurfaceMaterial();
+	// Godot encodes PhysicsMaterial's "rough" and "absorbent" flags as a
+	// NEGATIVE friction/bounce (scene/resources/physics_material.h:57-69).
+	// Box3D asserts both are finite and non-negative and aborts the process
+	// otherwise, so the sign travels separately to the mixing callbacks.
+	material.friction = b3_sanitize_material(p_body->friction);
+	material.restitution = b3_sanitize_material(p_body->bounce);
+	material.userMaterialId = (p_body->friction < 0 ? B3_MATERIAL_ROUGH : 0) | (p_body->bounce < 0 ? B3_MATERIAL_ABSORBENT : 0);
+	if (p_body->mode == BODY_MODE_STATIC) {
+		// StaticBody.constant_linear_velocity. Box3D has no angular equivalent.
+		material.tangentVelocity = b3_from_godot(p_body->transform.basis.orthonormalized().xform_inv(p_body->linear_velocity));
+	}
+	return material;
+}
+
+void Box3DPhysicsServer::_body_update_material(Box3DBody *p_body) {
+	if (!p_body->in_world()) {
+		return;
+	}
+	const b3SurfaceMaterial material = _body_make_material(p_body);
+	for (int i = 0; i < p_body->shapes.size(); i++) {
 		if (!B3_IS_NULL(p_body->shapes[i].shape_id)) {
-			b3Shape_SetFilter(p_body->shapes[i].shape_id, filter, true);
+			b3Shape_SetSurfaceMaterial(p_body->shapes[i].shape_id, material);
 		}
 	}
 }
@@ -171,18 +226,13 @@ void Box3DPhysicsServer::_body_sync_transform(Box3DBody *p_body) {
 	const Transform t = p_body->get_solver_transform();
 
 	// A KINEMATIC body is moved by Godot as a teleport every frame. Box3D moves
-	// kinematic bodies by velocity, and it is the velocity that contacts read --
-	// so teleporting alone makes a moving platform or a pushing character slide
-	// through dynamic bodies without imparting anything. Give the solver the
-	// implied velocity as well so contacts push, while the teleport keeps the
-	// position exactly where Godot wants it.
-	if (p_body->mode == BODY_MODE_KINEMATIC) {
-		Box3DSpace *space = space_owner.getornull(p_body->space);
-		const real_t dt = space ? space->last_step_delta : 0.0;
-		if (dt > 0) {
-			const Transform now = b3_transform_to_godot(b3Body_GetTransform(p_body->body_id));
-			b3Body_SetLinearVelocity(p_body->body_id, b3_from_godot((t.origin - now.origin) / dt));
-		}
+	// kinematic bodies by velocity, and it is the velocity that contacts read, so a
+	// teleport alone slides through dynamic bodies without imparting anything. Queries
+	// do need the new position right away, so teleport now and have the next step
+	// replay the motion from where the body was (Box3DSpace::begin_kinematics).
+	if (p_body->mode == BODY_MODE_KINEMATIC && !p_body->kinematic_moved) {
+		p_body->kinematic_moved = true;
+		p_body->kinematic_from = b3_transform_to_godot(b3Body_GetTransform(p_body->body_id));
 	}
 
 	b3Body_SetTransform(p_body->body_id,
@@ -292,23 +342,22 @@ void Box3DPhysicsServer::_body_rebuild_shape_at(Box3DBody *p_body, int p_index) 
 		return;
 	}
 
+	if (shape->type == SHAPE_HEIGHTMAP && p_body->mode != BODY_MODE_STATIC) {
+		// Box3D only allows them on static bodies. _body_update_shape_origin_offset warns.
+		return;
+	}
+
 	Transform scale_xf;
 	scale_xf.basis.scale(p_body->baked_scale);
 
 	b3ShapeDef def = b3DefaultShapeDef();
 	def.density = 1.0f;
-	// Godot encodes PhysicsMaterial's "rough" and "absorbent" flags as a
-	// NEGATIVE friction/bounce (scene/resources/physics_material.h:57-69).
-	// Box3D asserts both are finite and non-negative and aborts the process
-	// otherwise, so take the magnitude.
-	def.baseMaterial.friction = b3_sanitize_material(p_body->friction);
-	def.baseMaterial.restitution = b3_sanitize_material(p_body->bounce);
-	def.filter.categoryBits = p_body->collision_layer;
-	def.filter.maskBits = p_body->collision_mask;
+	def.baseMaterial = _body_make_material(p_body);
+	def.filter = b3_body_filter(p_body);
+	def.enableCustomFiltering = true;
 	// Sensor events are opt-in on BOTH sides -- "This applies to sensors and
 	// non-sensors. False by default, even for sensors." Without this on the
-	// visiting body, an Area sees nothing enter it. Only convex shapes can act
-	// as visitors, so a trimesh or height field body never triggers an Area.
+	// visiting body, an Area sees nothing enter it.
 	def.enableSensorEvents = true;
 	// Mass is recomputed by the caller once, after all edits.
 	def.updateBodyMass = false;
@@ -322,9 +371,24 @@ void Box3DPhysicsServer::_body_finish_shape_edit(Box3DBody *p_body) {
 	if (!p_body->in_world()) {
 		return;
 	}
+	const bool had_offset = p_body->has_shape_origin_offset;
 	_body_update_shape_origin_offset(p_body);
-	_body_sync_transform(p_body);
+	if (had_offset || p_body->has_shape_origin_offset) {
+		// Nothing but a height field moves the solver body on a shape edit.
+		_body_sync_transform(p_body);
+		_body_create_joints(p_body);
+	}
 	_body_apply_mass(p_body);
+
+	p_body->ray_shape_count = 0;
+	for (int i = 0; i < p_body->shapes.size(); i++) {
+		if (!p_body->shapes[i].disabled) {
+			Box3DShape *shape = shape_owner.getornull(p_body->shapes[i].shape);
+			if (shape && shape->type == SHAPE_RAY) {
+				p_body->ray_shape_count++;
+			}
+		}
+	}
 }
 
 void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
@@ -346,10 +410,11 @@ void Box3DPhysicsServer::_body_rebuild_shapes(Box3DBody *p_body) {
 }
 
 void Box3DPhysicsServer::_body_apply_mass(Box3DBody *p_body) {
-	if (!p_body->in_world() || p_body->mode != BODY_MODE_RIGID) {
-		if (p_body->in_world()) {
-			b3Body_ApplyMassFromShapes(p_body->body_id);
-		}
+	if (!p_body->in_world()) {
+		return;
+	}
+	if (!p_body->is_dynamic()) {
+		b3Body_ApplyMassFromShapes(p_body->body_id);
 		return;
 	}
 
@@ -360,7 +425,19 @@ void Box3DPhysicsServer::_body_apply_mass(Box3DBody *p_body) {
 	b3Body_ApplyMassFromShapes(p_body->body_id);
 
 	b3MassData md = b3Body_GetMassData(p_body->body_id);
-	if (md.mass <= 0.0f || p_body->mass <= 0) {
+	if (p_body->mass <= 0) {
+		return;
+	}
+	if (md.mass <= 0.0f) {
+		// No shape with a volume: only rays, or a trimesh. Without mass Box3D would
+		// not move it at all, so stand in for a half meter sphere.
+		const float i = 0.4f * (float)p_body->mass * 0.25f;
+		md = {};
+		md.mass = (float)p_body->mass;
+		md.inertia.cx.x = i;
+		md.inertia.cy.y = i;
+		md.inertia.cz.z = i;
+		b3Body_SetMassData(p_body->body_id, md);
 		return;
 	}
 
@@ -391,42 +468,79 @@ void Box3DPhysicsServer::_area_sync_transform(Box3DArea *p_area) {
 			b3_quat_from_godot(rigid.basis.get_rotation_quat()));
 }
 
-void Box3DPhysicsServer::_area_rebuild_shapes(Box3DArea *p_area) {
+void Box3DPhysicsServer::_area_drop_shape(Box3DArea *p_area, int p_index) {
+	Box3DShapeEntry &entry = p_area->shapes.write[p_index];
+	if (!B3_IS_NULL(entry.shape_id)) {
+		if (Box3DSpace *space = space_owner.getornull(p_area->space)) {
+			space->forget_sensor(entry.shape_id);
+		}
+		b3DestroyShape(entry.shape_id, false);
+		entry.shape_id = b3_nullShapeId;
+	}
+	// Free after the shape referencing it is gone, never before.
+	entry.free_owned_geometry();
+}
+
+void Box3DPhysicsServer::_area_rebuild_shape_at(Box3DArea *p_area, int p_index) {
 	if (!p_area->in_world()) {
+		return;
+	}
+	_area_drop_shape(p_area, p_index);
+
+	Box3DShapeEntry &entry = p_area->shapes.write[p_index];
+	if (entry.disabled) {
+		return;
+	}
+	Box3DShape *shape = shape_owner.getornull(entry.shape);
+	if (!shape) {
+		return;
+	}
+	if (shape->type == SHAPE_HEIGHTMAP) {
+		WARN_PRINT_ONCE("Box3D: HeightMapShape is not supported on an Area.");
 		return;
 	}
 
 	Transform scale_xf;
-	scale_xf.basis.scale(p_area->transform.basis.get_scale());
+	scale_xf.basis.scale(p_area->baked_scale);
 
+	b3ShapeDef def = b3DefaultShapeDef();
+	def.density = 0.0f;
+	// A sensor detects overlap without resolving it, which is exactly what an
+	// Area is. Sensor events are what the monitor callbacks are driven from.
+	def.isSensor = true;
+	def.enableSensorEvents = true;
+	def.enableCustomFiltering = true;
+	def.filter.categoryBits = (uint64_t)p_area->collision_layer | B3_CATEGORY_AREA;
+	def.filter.maskBits = ~(uint64_t)0;
+	def.updateBodyMass = false;
+
+	entry.shape_id = shape->attach(p_area->body_id, &def, scale_xf * entry.xform, &entry);
+}
+
+void Box3DPhysicsServer::_area_rebuild_shapes(Box3DArea *p_area) {
+	if (!p_area->in_world()) {
+		return;
+	}
+	p_area->baked_scale = p_area->transform.basis.get_scale();
 	for (int i = 0; i < p_area->shapes.size(); i++) {
-		Box3DShapeEntry &entry = p_area->shapes.write[i];
+		_area_rebuild_shape_at(p_area, i);
+	}
+}
 
-		if (!B3_IS_NULL(entry.shape_id)) {
-			b3DestroyShape(entry.shape_id, false);
-			entry.shape_id = b3_nullShapeId;
+// Drops the back-reference from a shape once no entry of its owner uses it any
+// more. RIDs are recycled, so a stale owner would later point shape_set_data() at
+// whatever object inherited the id.
+void Box3DPhysicsServer::_release_shape(RID p_owner, RID p_shape) {
+	Box3DCollisionObject *object = get_collision_object(p_owner);
+	if (object) {
+		for (int i = 0; i < object->shapes.size(); i++) {
+			if (object->shapes[i].shape == p_shape) {
+				return;
+			}
 		}
-		entry.free_owned_geometry();
-		if (entry.disabled) {
-			continue;
-		}
-
-		Box3DShape *shape = shape_owner.getornull(entry.shape);
-		if (!shape) {
-			continue;
-		}
-
-		b3ShapeDef def = b3DefaultShapeDef();
-		def.density = 0.0f;
-		// A sensor detects overlap without resolving it, which is exactly what an
-		// Area is. Sensor events are what the monitor callbacks are driven from.
-		def.isSensor = true;
-		def.enableSensorEvents = true;
-		def.filter.categoryBits = p_area->collision_layer;
-		def.filter.maskBits = p_area->collision_mask;
-		def.updateBodyMass = false;
-
-		entry.shape_id = shape->attach(p_area->body_id, &def, scale_xf * entry.xform, &entry);
+	}
+	if (shape_owner.owns(p_shape)) {
+		shape_owner.getornull(p_shape)->owners.erase(p_owner);
 	}
 }
 
@@ -456,10 +570,11 @@ void Box3DPhysicsServer::_area_enter_world(Box3DArea *p_area, Box3DSpace *p_spac
 void Box3DPhysicsServer::_area_exit_world(Box3DArea *p_area) {
 	ERR_FAIL_NULL(p_area);
 
-	if (Box3DSpace *space = space_owner.getornull(p_area->space)) {
-		space->remove_area(p_area);
+	Box3DSpace *space = p_area->space.is_valid() ? space_owner.getornull(p_area->space) : nullptr;
+	if (space) {
 		// Bodies hold raw pointers to overlapping areas for the gravity override.
 		space->forget_area(p_area);
+		space->remove_area(p_area);
 	}
 	if (p_area->in_world()) {
 		b3DestroyBody(p_area->body_id);
@@ -492,46 +607,27 @@ void Box3DPhysicsServer::shape_set_data(RID p_shape, const Variant &p_data) {
 	// Solver geometry built from the old data is now stale. This is the hot path
 	// for streamed terrain: CellTerrain reassigns a HeightMapShape's data every
 	// time a cell loads.
-	//
-	// Order matters. The height field blob is shared by every body this shape is
-	// attached to, so every referencing b3 shape must be destroyed BEFORE the
-	// blob is freed — otherwise rebuilding one body leaves another holding a
-	// dangling pointer into freed height data.
-	if (shape->owners.empty()) {
-		return;
-	}
-
 	for (Set<RID>::Element *E = shape->owners.front(); E; E = E->next()) {
-		Box3DBody *body = body_owner.getornull(E->get());
-		if (!body || !body->in_world()) {
-			continue;
-		}
-		for (int i = 0; i < body->shapes.size(); i++) {
-			if (body->shapes[i].shape != p_shape) {
-				continue;
-			}
-			if (!B3_IS_NULL(body->shapes[i].shape_id)) {
-				b3DestroyShape(body->shapes[i].shape_id, false);
-				body->shapes.write[i].shape_id = b3_nullShapeId;
-			}
-		body->shapes.write[i].free_owned_geometry();
-		}
-	}
-
-	for (Set<RID>::Element *E = shape->owners.front(); E; E = E->next()) {
-		Box3DBody *body = body_owner.getornull(E->get());
-		if (!body) {
+		Box3DCollisionObject *object = get_collision_object(E->get());
+		if (!object) {
 			continue;
 		}
 		// Only the entries referencing this shape are stale. A terrain body
 		// carrying several shapes should not rebuild them all because one
-		// height field's data changed -- this is the cell-streaming hot path.
-		for (int i = 0; i < body->shapes.size(); i++) {
-			if (body->shapes[i].shape == E->get() || body->shapes[i].shape == p_shape) {
-				_body_rebuild_shape_at(body, i);
+		// height field's data changed.
+		for (int i = 0; i < object->shapes.size(); i++) {
+			if (object->shapes[i].shape != p_shape) {
+				continue;
+			}
+			if (object->type == Box3DCollisionObject::TYPE_BODY) {
+				_body_rebuild_shape_at(static_cast<Box3DBody *>(object), i);
+			} else {
+				_area_rebuild_shape_at(static_cast<Box3DArea *>(object), i);
 			}
 		}
-		_body_finish_shape_edit(body);
+		if (object->type == Box3DCollisionObject::TYPE_BODY) {
+			_body_finish_shape_edit(static_cast<Box3DBody *>(object));
+		}
 	}
 }
 
@@ -628,6 +724,9 @@ void Box3DPhysicsServer::space_set_param(RID p_space, SpaceParameter p_param, re
 			break;
 		case SPACE_PARAM_BODY_LINEAR_VELOCITY_SLEEP_THRESHOLD:
 			space->body_linear_velocity_sleep_threshold = p_value;
+			for (int i = 0; i < space->bodies.size(); i++) {
+				b3Body_SetSleepThreshold(space->bodies[i]->body_id, MAX(0.0f, (float)p_value));
+			}
 			break;
 		case SPACE_PARAM_BODY_ANGULAR_VELOCITY_SLEEP_THRESHOLD:
 			space->body_angular_velocity_sleep_threshold = p_value;
@@ -675,7 +774,7 @@ real_t Box3DPhysicsServer::space_get_param(RID p_space, SpaceParameter p_param) 
 PhysicsDirectSpaceState *Box3DPhysicsServer::space_get_direct_state(RID p_space) {
 	Box3DSpace *space = space_owner.getornull(p_space);
 	ERR_FAIL_NULL_V(space, nullptr);
-	ERR_FAIL_COND_V_MSG(is_flushing_queries(), nullptr, "Space state is inaccessible right now, wait for iteration or physics process notification.");
+	ERR_FAIL_COND_V_MSG(space->locked, nullptr, "Space state is inaccessible right now, wait for iteration or physics process notification.");
 	return space->direct_state;
 }
 
@@ -755,7 +854,7 @@ void Box3DPhysicsServer::area_add_shape(RID p_area, RID p_shape, const Transform
 	entry.disabled = p_disabled;
 	area->shapes.push_back(entry);
 	shape->owners.insert(p_area);
-	_area_rebuild_shapes(area);
+	_area_rebuild_shape_at(area, area->shapes.size() - 1);
 }
 
 void Box3DPhysicsServer::area_set_shape(RID p_area, int p_shape_idx, RID p_shape) {
@@ -765,8 +864,11 @@ void Box3DPhysicsServer::area_set_shape(RID p_area, int p_shape_idx, RID p_shape
 	Box3DShape *shape = shape_owner.getornull(p_shape);
 	ERR_FAIL_NULL(shape);
 
+	const RID old = area->shapes[p_shape_idx].shape;
 	area->shapes.write[p_shape_idx].shape = p_shape;
 	shape->owners.insert(p_area);
+	_release_shape(p_area, old);
+	_area_rebuild_shape_at(area, p_shape_idx);
 }
 
 void Box3DPhysicsServer::area_set_shape_transform(RID p_area, int p_shape_idx, const Transform &p_transform) {
@@ -774,6 +876,7 @@ void Box3DPhysicsServer::area_set_shape_transform(RID p_area, int p_shape_idx, c
 	ERR_FAIL_NULL(area);
 	ERR_FAIL_INDEX(p_shape_idx, area->shapes.size());
 	area->shapes.write[p_shape_idx].xform = p_transform;
+	_area_rebuild_shape_at(area, p_shape_idx);
 }
 
 int Box3DPhysicsServer::area_get_shape_count(RID p_area) const {
@@ -800,20 +903,29 @@ void Box3DPhysicsServer::area_remove_shape(RID p_area, int p_shape_idx) {
 	Box3DArea *area = area_owner.getornull(p_area);
 	ERR_FAIL_NULL(area);
 	ERR_FAIL_INDEX(p_shape_idx, area->shapes.size());
+	const RID removed = area->shapes[p_shape_idx].shape;
+	_area_drop_shape(area, p_shape_idx);
 	area->shapes.remove(p_shape_idx);
+	_release_shape(p_area, removed);
 }
 
 void Box3DPhysicsServer::area_clear_shapes(RID p_area) {
 	Box3DArea *area = area_owner.getornull(p_area);
 	ERR_FAIL_NULL(area);
-	area->shapes.clear();
+	while (area->shapes.size()) {
+		area_remove_shape(p_area, area->shapes.size() - 1);
+	}
 }
 
 void Box3DPhysicsServer::area_set_shape_disabled(RID p_area, int p_shape_idx, bool p_disabled) {
 	Box3DArea *area = area_owner.getornull(p_area);
 	ERR_FAIL_NULL(area);
 	ERR_FAIL_INDEX(p_shape_idx, area->shapes.size());
+	if (area->shapes[p_shape_idx].disabled == p_disabled) {
+		return;
+	}
 	area->shapes.write[p_shape_idx].disabled = p_disabled;
+	_area_rebuild_shape_at(area, p_shape_idx);
 }
 
 void Box3DPhysicsServer::area_attach_object_instance_id(RID p_area, ObjectID p_id) {
@@ -920,6 +1032,9 @@ void Box3DPhysicsServer::area_set_transform(RID p_area, const Transform &p_trans
 	ERR_FAIL_NULL(area);
 	area->transform = p_transform;
 	_area_sync_transform(area);
+	if (area->in_world() && !p_transform.basis.get_scale().is_equal_approx(area->baked_scale)) {
+		_area_rebuild_shapes(area);
+	}
 }
 
 Transform Box3DPhysicsServer::area_get_transform(RID p_area) const {
@@ -931,6 +1046,7 @@ Transform Box3DPhysicsServer::area_get_transform(RID p_area) const {
 void Box3DPhysicsServer::area_set_collision_mask(RID p_area, uint32_t p_mask) {
 	Box3DArea *area = area_owner.getornull(p_area);
 	ERR_FAIL_NULL(area);
+	// Sensors re-run the custom filter every step, so there is nothing to push.
 	area->collision_mask = p_mask;
 }
 
@@ -938,6 +1054,15 @@ void Box3DPhysicsServer::area_set_collision_layer(RID p_area, uint32_t p_layer) 
 	Box3DArea *area = area_owner.getornull(p_area);
 	ERR_FAIL_NULL(area);
 	area->collision_layer = p_layer;
+
+	// Scene queries match the category directly.
+	for (int i = 0; i < area->shapes.size(); i++) {
+		if (!B3_IS_NULL(area->shapes[i].shape_id)) {
+			b3Filter filter = b3Shape_GetFilter(area->shapes[i].shape_id);
+			filter.categoryBits = (uint64_t)p_layer | B3_CATEGORY_AREA;
+			b3Shape_SetFilter(area->shapes[i].shape_id, filter, true);
+		}
+	}
 }
 
 void Box3DPhysicsServer::area_set_monitorable(RID p_area, bool p_monitorable) {
@@ -951,6 +1076,10 @@ void Box3DPhysicsServer::area_set_monitor_callback(RID p_area, Object *p_receive
 	ERR_FAIL_NULL(area);
 	area->monitor_callback_id = p_receiver ? p_receiver->get_instance_id() : 0;
 	area->monitor_callback_method = p_method;
+	Box3DSpace *space = area->space.is_valid() ? space_owner.getornull(area->space) : nullptr;
+	if (space) {
+		space->monitor_changed(area, false);
+	}
 }
 
 void Box3DPhysicsServer::area_set_area_monitor_callback(RID p_area, Object *p_receiver, const StringName &p_method) {
@@ -958,6 +1087,10 @@ void Box3DPhysicsServer::area_set_area_monitor_callback(RID p_area, Object *p_re
 	ERR_FAIL_NULL(area);
 	area->area_monitor_callback_id = p_receiver ? p_receiver->get_instance_id() : 0;
 	area->area_monitor_callback_method = p_method;
+	Box3DSpace *space = area->space.is_valid() ? space_owner.getornull(area->space) : nullptr;
+	if (space) {
+		space->monitor_changed(area, true);
+	}
 }
 
 void Box3DPhysicsServer::area_set_ray_pickable(RID p_area, bool p_enable) {
@@ -1013,11 +1146,50 @@ RID Box3DPhysicsServer::body_get_space(RID p_body) const {
 void Box3DPhysicsServer::body_set_mode(RID p_body, BodyMode p_mode) {
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
-	body->mode = p_mode;
+	if (body->mode == p_mode) {
+		return;
+	}
 
-	if (body->in_world()) {
-		b3Body_SetType(body->body_id, b3_body_type_from_godot(p_mode));
-		_body_apply_mass(body);
+	const b3BodyType old_type = b3_body_type_from_godot(body->mode);
+	const b3BodyType new_type = b3_body_type_from_godot(p_mode);
+	body->mode = p_mode;
+	body->kinematic_moved = false;
+	body->kinematic_settle = false;
+	body->kinematic_has_velocity = false;
+	if (p_mode == BODY_MODE_STATIC) {
+		body->linear_velocity = Vector3();
+		body->angular_velocity = Vector3();
+	}
+	if (!body->in_world()) {
+		return;
+	}
+
+	if (old_type != new_type) {
+		bool has_heightmap = false;
+		for (int i = 0; i < body->shapes.size(); i++) {
+			Box3DShape *shape = shape_owner.getornull(body->shapes[i].shape);
+			has_heightmap = has_heightmap || (shape && shape->type == SHAPE_HEIGHTMAP);
+		}
+		if (has_heightmap) {
+			// Box3D refuses to change the type of a body that carries one.
+			Box3DSpace *space = space_owner.getornull(body->space);
+			_body_exit_world(body);
+			_body_enter_world(body, space);
+			return;
+		}
+		b3Body_SetType(body->body_id, new_type);
+		if (new_type != b3_staticBody) {
+			b3Body_SetLinearVelocity(body->body_id, b3_from_godot(body->linear_velocity));
+			b3Body_SetAngularVelocity(body->body_id, b3_from_godot(body->angular_velocity));
+		}
+	}
+
+	_body_apply_locks(body);
+	_body_apply_mass(body);
+	_body_update_material(body);
+	if (body->is_dynamic()) {
+		body->sleeping = false;
+		b3Body_SetAwake(body->body_id, true);
 	}
 }
 
@@ -1052,8 +1224,10 @@ void Box3DPhysicsServer::body_set_shape(RID p_body, int p_shape_idx, RID p_shape
 	Box3DShape *shape = shape_owner.getornull(p_shape);
 	ERR_FAIL_NULL(shape);
 
+	const RID old = body->shapes[p_shape_idx].shape;
 	body->shapes.write[p_shape_idx].shape = p_shape;
 	shape->owners.insert(p_body);
+	_release_shape(p_body, old);
 	_body_rebuild_shape_at(body, p_shape_idx);
 	_body_finish_shape_edit(body);
 }
@@ -1091,6 +1265,9 @@ void Box3DPhysicsServer::body_set_shape_disabled(RID p_body, int p_shape_idx, bo
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	ERR_FAIL_INDEX(p_shape_idx, body->shapes.size());
+	if (body->shapes[p_shape_idx].disabled == p_disabled) {
+		return;
+	}
 	body->shapes.write[p_shape_idx].disabled = p_disabled;
 	_body_rebuild_shape_at(body, p_shape_idx);
 	_body_finish_shape_edit(body);
@@ -1104,26 +1281,12 @@ void Box3DPhysicsServer::body_remove_shape(RID p_body, int p_shape_idx) {
 	if (body->in_world() && !B3_IS_NULL(body->shapes[p_shape_idx].shape_id)) {
 		b3DestroyShape(body->shapes[p_shape_idx].shape_id, false);
 	}
-		body->shapes.write[p_shape_idx].free_owned_geometry();
+	body->shapes.write[p_shape_idx].free_owned_geometry();
 
 	const RID removed = body->shapes[p_shape_idx].shape;
 	body->shapes.remove(p_shape_idx);
 
-	// Drop the back-reference once no entry uses this shape any more. RIDs are
-	// recycled, so a stale owner would later point shape_set_data() at whatever
-	// body inherited the id.
-	bool still_used = false;
-	for (int i = 0; i < body->shapes.size(); i++) {
-		if (body->shapes[i].shape == removed) {
-			still_used = true;
-			break;
-		}
-	}
-	if (!still_used) {
-		if (Box3DShape *shape = shape_owner.getornull(removed)) {
-			shape->owners.erase(p_body);
-		}
-	}
+	_release_shape(p_body, removed);
 
 	// The surviving entries keep their b3 shapes; only the body-level state
 	// needs settling.
@@ -1139,15 +1302,13 @@ void Box3DPhysicsServer::body_clear_shapes(RID p_body) {
 			b3DestroyShape(body->shapes[i].shape_id, false);
 		}
 		body->shapes.write[i].free_owned_geometry();
-		if (Box3DShape *shape = shape_owner.getornull(body->shapes[i].shape)) {
-			shape->owners.erase(p_body);
+		if (shape_owner.owns(body->shapes[i].shape)) {
+			shape_owner.getornull(body->shapes[i].shape)->owners.erase(p_body);
 		}
 	}
 	body->shapes.clear();
 
-	_body_update_shape_origin_offset(body);
-	_body_sync_transform(body);
-	_body_apply_mass(body);
+	_body_finish_shape_edit(body);
 }
 
 void Box3DPhysicsServer::body_attach_object_instance_id(RID p_body, uint32_t p_id) {
@@ -1166,6 +1327,9 @@ void Box3DPhysicsServer::body_set_enable_continuous_collision_detection(RID p_bo
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->ccd_enabled = p_enable;
+	if (body->in_world()) {
+		b3Body_SetBullet(body->body_id, p_enable);
+	}
 }
 
 bool Box3DPhysicsServer::body_is_continuous_collision_detection_enabled(RID p_body) const {
@@ -1179,9 +1343,7 @@ void Box3DPhysicsServer::body_set_collision_layer(RID p_body, uint32_t p_layer) 
 	ERR_FAIL_NULL(body);
 	body->collision_layer = p_layer;
 	// Godot sets layer and mask independently of the shape list, and usually
-	// after the shapes already exist. Without this the solver keeps the filter
-	// captured at attach time -- which for a default-constructed body is layer 1,
-	// so anything on another layer silently stops colliding.
+	// after the shapes already exist.
 	_body_update_filters(body);
 }
 
@@ -1223,15 +1385,21 @@ void Box3DPhysicsServer::body_set_param(RID p_body, BodyParameter p_param, float
 	switch (p_param) {
 		case BODY_PARAM_BOUNCE:
 			body->bounce = p_value;
+			_body_update_material(body);
 			break;
 		case BODY_PARAM_FRICTION:
 			body->friction = p_value;
+			_body_update_material(body);
 			break;
 		case BODY_PARAM_MASS:
 			body->mass = p_value;
+			_body_apply_mass(body);
 			break;
 		case BODY_PARAM_GRAVITY_SCALE:
 			body->gravity_scale = p_value;
+			if (body->in_world()) {
+				b3Body_SetGravityScale(body->body_id, p_value);
+			}
 			break;
 		case BODY_PARAM_LINEAR_DAMP:
 			body->linear_damp = p_value;
@@ -1297,26 +1465,35 @@ void Box3DPhysicsServer::body_set_state(RID p_body, BodyState p_state, const Var
 			// moved body, every frame.
 			const Vector3 new_scale = body->transform.basis.get_scale();
 			if (!new_scale.is_equal_approx(body->baked_scale)) {
-				_body_rebuild_shapes(body); // also re-syncs the transform
-			} else {
-				_body_sync_transform(body);
+				_body_rebuild_shapes(body);
+			}
+			_body_sync_transform(body);
+			if (body->mode == BODY_MODE_STATIC && body->linear_velocity != Vector3()) {
+				_body_update_material(body); // The conveyor direction is body-local.
+			}
+			if (body->in_world() && body->is_dynamic()) {
+				b3Body_SetAwake(body->body_id, true);
 			}
 		} break;
 		case BODY_STATE_LINEAR_VELOCITY: {
 			body->linear_velocity = p_variant;
-			if (body->in_world()) {
+			if (body->mode == BODY_MODE_STATIC) {
+				_body_update_material(body);
+			} else if (body->in_world() && body->is_dynamic()) {
+				b3Body_SetAwake(body->body_id, true);
 				b3Body_SetLinearVelocity(body->body_id, b3_from_godot(body->linear_velocity));
 			}
 		} break;
 		case BODY_STATE_ANGULAR_VELOCITY: {
 			body->angular_velocity = p_variant;
-			if (body->in_world()) {
+			if (body->in_world() && body->is_dynamic()) {
+				b3Body_SetAwake(body->body_id, true);
 				b3Body_SetAngularVelocity(body->body_id, b3_from_godot(body->angular_velocity));
 			}
 		} break;
 		case BODY_STATE_SLEEPING: {
 			body->sleeping = p_variant;
-			if (body->in_world()) {
+			if (body->in_world() && body->is_dynamic()) {
 				b3Body_SetAwake(body->body_id, !body->sleeping);
 			}
 		} break;
@@ -1348,10 +1525,24 @@ Variant Box3DPhysicsServer::body_get_state(RID p_body, BodyState p_state) const 
 	return Variant();
 }
 
+static void _wake(Box3DBody *p_body) {
+	if (p_body->in_world() && p_body->is_dynamic()) {
+		b3Body_SetAwake(p_body->body_id, true);
+	}
+}
+
+// Impulses act on the solver at once; keep the cached velocity in step, since that
+// is what body_get_state() and the direct state report.
+static void _refresh_velocity(Box3DBody *p_body) {
+	p_body->linear_velocity = b3_to_godot(b3Body_GetLinearVelocity(p_body->body_id));
+	p_body->angular_velocity = b3_to_godot(b3Body_GetAngularVelocity(p_body->body_id));
+}
+
 void Box3DPhysicsServer::body_set_applied_force(RID p_body, const Vector3 &p_force) {
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->applied_force = p_force;
+	_wake(body);
 }
 
 Vector3 Box3DPhysicsServer::body_get_applied_force(RID p_body) const {
@@ -1364,6 +1555,7 @@ void Box3DPhysicsServer::body_set_applied_torque(RID p_body, const Vector3 &p_to
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->applied_torque = p_torque;
+	_wake(body);
 }
 
 Vector3 Box3DPhysicsServer::body_get_applied_torque(RID p_body) const {
@@ -1382,7 +1574,7 @@ void Box3DPhysicsServer::body_add_force(RID p_body, const Vector3 &p_force, cons
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->applied_force += p_force;
-	body->applied_torque += p_pos.cross(p_force);
+	body->applied_torque += (p_pos - body->get_center_of_mass()).cross(p_force);
 }
 
 void Box3DPhysicsServer::body_add_torque(RID p_body, const Vector3 &p_torque) {
@@ -1397,6 +1589,7 @@ void Box3DPhysicsServer::body_apply_central_impulse(RID p_body, const Vector3 &p
 
 	if (body->in_world()) {
 		b3Body_ApplyLinearImpulseToCenter(body->body_id, b3_from_godot(p_impulse), true);
+		_refresh_velocity(body);
 		return;
 	}
 	// Not in a world yet: fold it into the starting velocity instead of losing it.
@@ -1408,12 +1601,13 @@ void Box3DPhysicsServer::body_apply_impulse(RID p_body, const Vector3 &p_pos, co
 	ERR_FAIL_NULL(body);
 
 	if (body->in_world()) {
-		// Godot passes the application point in body-local space; Box3D wants it
-		// in world space.
+		// Godot's point is an offset from the origin in global axes; Box3D wants a
+		// world position.
 		b3Body_ApplyLinearImpulse(body->body_id,
 				b3_from_godot(p_impulse),
-				b3_pos_from_godot(body->transform.xform(p_pos)),
+				b3_pos_from_godot(body->transform.origin + p_pos),
 				true);
+		_refresh_velocity(body);
 		return;
 	}
 	body->linear_velocity += p_impulse * (body->mass > 0 ? 1.0 / body->mass : 0.0);
@@ -1424,6 +1618,7 @@ void Box3DPhysicsServer::body_apply_torque_impulse(RID p_body, const Vector3 &p_
 	ERR_FAIL_NULL(body);
 	if (body->in_world()) {
 		b3Body_ApplyAngularImpulse(body->body_id, b3_from_godot(p_impulse), true);
+		_refresh_velocity(body);
 	}
 }
 
@@ -1435,7 +1630,7 @@ void Box3DPhysicsServer::body_set_axis_velocity(RID p_body, const Vector3 &p_axi
 	Vector3 velocity = body->linear_velocity;
 	velocity -= axis * axis.dot(velocity);
 	velocity += p_axis_velocity;
-	body->linear_velocity = velocity;
+	body_set_state(p_body, BODY_STATE_LINEAR_VELOCITY, velocity);
 }
 
 void Box3DPhysicsServer::body_set_axis_lock(RID p_body, BodyAxis p_axis, bool p_lock) {
@@ -1446,6 +1641,7 @@ void Box3DPhysicsServer::body_set_axis_lock(RID p_body, BodyAxis p_axis, bool p_
 	} else {
 		body->locked_axis &= ~p_axis;
 	}
+	_body_apply_locks(body);
 }
 
 bool Box3DPhysicsServer::body_is_axis_locked(RID p_body, BodyAxis p_axis) const {
@@ -1458,12 +1654,14 @@ void Box3DPhysicsServer::body_add_collision_exception(RID p_body, RID p_body_b) 
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->collision_exceptions.insert(p_body_b);
+	_body_refilter(body);
 }
 
 void Box3DPhysicsServer::body_remove_collision_exception(RID p_body, RID p_body_b) {
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->collision_exceptions.erase(p_body_b);
+	_body_refilter(body);
 }
 
 void Box3DPhysicsServer::body_get_collision_exceptions(RID p_body, List<RID> *p_exceptions) {
@@ -1502,6 +1700,7 @@ void Box3DPhysicsServer::body_set_omit_force_integration(RID p_body, bool p_omit
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL(body);
 	body->omit_force_integration = p_omit;
+	_wake(body);
 }
 
 bool Box3DPhysicsServer::body_is_omitting_force_integration(RID p_body) const {
@@ -1544,19 +1743,17 @@ PhysicsDirectBodyState *Box3DPhysicsServer::body_get_direct_state(RID p_body) {
 	ERR_FAIL_COND_V_MSG(space->locked, nullptr, "Body state is inaccessible right now, wait for iteration or physics process notification.");
 	ERR_FAIL_NULL_V(Box3DPhysicsDirectBodyState::singleton, nullptr);
 
-	Box3DPhysicsDirectBodyState::singleton->body = body;
+	Box3DPhysicsDirectBodyState::singleton->set_body(body, space->last_step_delta);
 	return Box3DPhysicsDirectBodyState::singleton;
 }
 
 // Depenetration planes gathered by b3World_CollideMover.
 #define B3_MAX_MOVER_PLANES 32
 
-// True for bodies the solver drives itself - a RigidBody, in any of its modes.
-// Static and kinematic geometry is NOT dynamic: a moving platform is expected
-// to carry and shove a character around.
+// Static and kinematic geometry is NOT dynamic: a moving platform is expected to
+// carry and shove a character around.
 static inline bool b3_is_dynamic(const Box3DBody *p_body) {
-	return p_body->mode == PhysicsServer::BODY_MODE_RIGID ||
-			p_body->mode == PhysicsServer::BODY_MODE_CHARACTER;
+	return p_body->is_dynamic();
 }
 
 struct Box3DMoverPlaneContext {
@@ -1631,7 +1828,7 @@ static bool b3_mover_plane_callback(b3ShapeId shapeId, const b3PlaneResult *plan
 // Builds the mover capsule for a body, in world space, if the body is shaped
 // like a character: exactly one enabled capsule or sphere. Returns false
 // otherwise, which costs the body its depenetration but not its motion test.
-static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *p_server, const Transform &p_from, b3Capsule *r_capsule) {
+static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *p_server, const Transform &p_from, b3Capsule *r_capsule, int *r_shape = nullptr) {
 	// Use the first enabled capsule or sphere. A character rig often carries extra
 	// shapes (a hitbox, a crouch volume); requiring exactly one would drop such a
 	// body onto the shape-cast path, where standing on the ground reports impact
@@ -1647,6 +1844,9 @@ static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *
 		}
 
 		const Transform xf = p_from * p_body->shapes[i].xform;
+		if (r_shape) {
+			*r_shape = i;
+		}
 
 		if (shape->type == PhysicsServer::SHAPE_CAPSULE) {
 			Dictionary d = shape->data;
@@ -1658,7 +1858,7 @@ static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *
 			// Godot's capsule is Z-aligned, its height excluding the caps.
 			r_capsule->center1 = b3_from_godot(xf.xform(Vector3(0, 0, height * 0.5)));
 			r_capsule->center2 = b3_from_godot(xf.xform(Vector3(0, 0, -height * 0.5)));
-			r_capsule->radius = (float)radius;
+			r_capsule->radius = (float)(radius * MAX(xf.basis.get_axis(0).length(), xf.basis.get_axis(1).length()));
 			return true;
 		}
 
@@ -1667,7 +1867,7 @@ static bool b3_build_mover_capsule(const Box3DBody *p_body, Box3DPhysicsServer *
 			const b3Vec3 c = b3_from_godot(xf.origin);
 			r_capsule->center1 = c;
 			r_capsule->center2 = c;
-			r_capsule->radius = (float)(real_t)shape->data;
+			r_capsule->radius = (float)((real_t)shape->data * xf.basis.get_axis(0).length());
 			return true;
 		}
 	}
@@ -1687,8 +1887,8 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 	//      because a shape cast treats initial overlap as a miss.
 	//   2. A shape cast along the motion for the time of impact and normal.
 	//
-	// Stage 1 is capsule-only because that is what Box3D's mover API accepts;
-	// other shapes still get stage 2.
+	// Box3D's mover API only accepts capsules. Bodies made of other shapes go through
+	// Box3D's narrow phase instead (b3_collide_query).
 	if (r_result) {
 		r_result->motion = p_motion;
 		r_result->remainder = Vector3();
@@ -1732,7 +1932,8 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 	// So: use the plane solver only to push out of existing penetration (target
 	// delta zero -- no sliding), then sweep.
 	b3Capsule mover;
-	if (b3_build_mover_capsule(body, this, p_from, &mover)) {
+	int mover_shape = 0;
+	if (b3_build_mover_capsule(body, this, p_from, &mover, &mover_shape)) {
 		// 1. Depenetration.
 		Vector3 recover;
 		{
@@ -1892,12 +2093,12 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 			r_result->collision_normal = normal;
 			r_result->collision_point = point;
 			r_result->collision_depth = depth;
-			r_result->collision_local_shape = 0;
+			r_result->collision_local_shape = mover_shape;
 			if (other) {
 				r_result->collider = other->self;
 				r_result->collider_id = other->instance_id;
 				r_result->collider_shape = other_shape;
-				r_result->collider_velocity = other->linear_velocity;
+				r_result->collider_velocity = other->get_velocity_at(point - other->transform.origin);
 			}
 		}
 
@@ -1913,10 +2114,94 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 
 	// --- Generic path: shape cast -----------------------------------------
 	//
-	// Non-capsule bodies get no depenetration, because Box3D's plane gathering is
-	// capsule-only. They still get a correct time of impact.
+	// Same shape as the capsule path: push out of what is already penetrated (but
+	// never because of a RigidBody), then sweep to first contact.
+	Vector3 recover;
+	{
+		const real_t slop = MAX(body->kinematic_safe_margin, (real_t)B3_LINEAR_SLOP);
+		Box3DCollideFilter cf;
+		cf.exclude = &exclude;
+		cf.mask = body->collision_mask;
+		cf.skip_dynamic = true;
+
+		for (int attempt = 0; attempt < 4; attempt++) {
+			Vector<Box3DContact> contacts;
+			for (int i = 0; i < body->shapes.size(); i++) {
+				Box3DShape *shape = body->shapes[i].disabled ? nullptr : shape_owner.getornull(body->shapes[i].shape);
+				if (shape) {
+					Transform xf = p_from * body->shapes[i].xform;
+					xf.origin += recover;
+					b3_collide_query(space->world_id, shape, xf, 0.0, cf, contacts);
+				}
+			}
+
+			Vector3 push;
+			for (int i = 0; i < contacts.size(); i++) {
+				const real_t depth = -contacts[i].separation - slop - push.dot(contacts[i].normal);
+				if (depth > CMP_EPSILON) {
+					push += contacts[i].normal * depth;
+				}
+			}
+			if (push == Vector3()) {
+				break;
+			}
+			recover += push;
+		}
+	}
+	Transform from = p_from;
+	from.origin += recover;
+
+	// Whatever is already touching is found by contact, not by the sweep: a cast that
+	// starts in overlap -- which resting within the slop is -- has no normal to report.
+	if (p_motion.length_squared() > CMP_EPSILON) {
+		Box3DCollideFilter cf;
+		cf.exclude = &exclude;
+		cf.mask = body->collision_mask;
+		cf.skip_dynamic = p_infinite_inertia;
+
+		const Vector3 dir = p_motion.normalized();
+		Box3DContact touching;
+		int touching_shape = 0;
+		real_t most_opposing = -0.001;
+		for (int i = 0; i < body->shapes.size(); i++) {
+			Box3DShape *shape = body->shapes[i].disabled ? nullptr : shape_owner.getornull(body->shapes[i].shape);
+			if (!shape) {
+				continue;
+			}
+			Vector<Box3DContact> contacts;
+			b3_collide_query(space->world_id, shape, from * body->shapes[i].xform, 0.0, cf, contacts);
+			for (int j = 0; j < contacts.size(); j++) {
+				const real_t d = contacts[j].normal.dot(dir);
+				if (d < most_opposing) {
+					most_opposing = d;
+					touching = contacts[j];
+					touching_shape = i;
+				}
+			}
+		}
+		if (touching.other) {
+			if (r_result) {
+				const Box3DBody *other = static_cast<Box3DBody *>(touching.other);
+				r_result->motion = recover;
+				r_result->remainder = p_motion;
+				r_result->collision_safe_fraction = 0;
+				r_result->collision_unsafe_fraction = 0;
+				r_result->collision_point = touching.point_on_other();
+				r_result->collision_normal = touching.normal;
+				r_result->collision_depth = MAX(-touching.separation, (real_t)0.0);
+				r_result->collision_local_shape = touching_shape;
+				r_result->collider = other->self;
+				r_result->collider_id = other->instance_id;
+				r_result->collider_shape = touching.other_shape;
+				r_result->collider_velocity = other->get_velocity_at(r_result->collision_point - other->transform.origin);
+			}
+			return true;
+		}
+	}
+
 	Box3DClosestHitContext best;
 	best.fraction = 1.0f;
+	int best_local_shape = 0;
 
 	for (int i = 0; i < body->shapes.size(); i++) {
 		if (body->shapes[i].disabled) {
@@ -1932,12 +2217,13 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 
 		Vector<b3Vec3> points;
 		b3ShapeProxy proxy;
-		if (!shape->build_proxy(points, p_from * body->shapes[i].xform, &proxy)) {
+		if (!shape->build_proxy(points, from * body->shapes[i].xform, &proxy)) {
 			continue; // concave/heightmap/plane cannot be cast, only cast against
 		}
 
 		Box3DClosestHitContext ctx;
 		ctx.exclude = &exclude;
+		ctx.skip_dynamic = p_infinite_inertia;
 		if (p_motion.length_squared() > CMP_EPSILON) {
 			ctx.reject_non_opposing = true;
 			ctx.motion_dir = p_motion.normalized();
@@ -1947,18 +2233,26 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 
 		if (ctx.hit && ctx.fraction <= best.fraction) {
 			best = ctx;
-			best.shape_index = i;
+			best_local_shape = i;
 		}
 	}
 
-	if (!best.hit || !best.body) {
+	if (!best.hit || !best.object) {
+		if (r_result) {
+			r_result->motion = recover + p_motion;
+			r_result->collision_safe_fraction = 1.0;
+			r_result->collision_unsafe_fraction = 1.0;
+		}
 		return false;
 	}
 
 	if (r_result) {
-		const real_t safe = (real_t)best.fraction;
-		r_result->motion = p_motion * safe;
-		r_result->remainder = p_motion - r_result->motion;
+		real_t safe = (real_t)best.fraction;
+		if (p_motion.length() * safe < (real_t)B3_LINEAR_SLOP) {
+			safe = 0; // Already touching, see the capsule path.
+		}
+		r_result->motion = recover + p_motion * safe;
+		r_result->remainder = p_motion * (1.0 - safe);
 		r_result->collision_safe_fraction = safe;
 		r_result->collision_unsafe_fraction = safe;
 
@@ -1973,32 +2267,32 @@ bool Box3DPhysicsServer::body_test_motion(RID p_body, const Transform &p_from, c
 
 		r_result->collision_point = best.point;
 		r_result->collision_normal = normal;
-		r_result->collision_local_shape = best.shape_index;
-		r_result->collider = best.body->self;
-		r_result->collider_id = best.body->instance_id;
+		const Box3DBody *other = static_cast<Box3DBody *>(best.object);
+		r_result->collision_local_shape = best_local_shape;
+		r_result->collider = other->self;
+		r_result->collider_id = other->instance_id;
 		r_result->collider_shape = best.shape_index;
-		r_result->collider_velocity = best.body->linear_velocity;
+		r_result->collider_velocity = other->get_velocity_at(best.point - other->transform.origin);
 	}
 	return true;
 }
 
 int Box3DPhysicsServer::body_test_ray_separation(RID p_body, const Transform &p_transform, bool p_infinite_inertia, Vector3 &r_recover_motion, SeparationResult *r_results, int p_result_max, float p_margin) {
-	// move_and_slide() calls this to unstick a body before moving it (and for
-	// snap-to-floor). The separation results feed RayShape handling, which Box3D
-	// has no equivalent for, but the recover motion is exactly the mover-plane
-	// depenetration used by body_test_motion -- so that part is real.
+	// Two jobs. move_and_slide() calls this before moving, so a capsule character gets
+	// its depenetration here as well as in body_test_motion -- without it the body
+	// settles twice the slop deep and wobbles there. The rest is RayShape's, as in the
+	// other backends.
 	r_recover_motion = Vector3();
 
 	Box3DBody *body = body_owner.getornull(p_body);
 	ERR_FAIL_NULL_V(body, 0);
 
-	Box3DSpace *space = space_owner.getornull(body->space);
-	if (!space || B3_IS_NULL(space->world_id)) {
-		return 0;
+	for (int i = 0; i < p_result_max; i++) {
+		r_results[i].collision_depth = -1.0;
 	}
 
-	b3Capsule mover;
-	if (!b3_build_mover_capsule(body, this, p_transform, &mover)) {
+	Box3DSpace *space = body->space.is_valid() ? space_owner.getornull(body->space) : nullptr;
+	if (!space || B3_IS_NULL(space->world_id)) {
 		return 0;
 	}
 
@@ -2008,22 +2302,69 @@ int Box3DPhysicsServer::body_test_ray_separation(RID p_body, const Transform &p_
 		exclude.insert(E->get());
 	}
 
-	Box3DMoverPlaneContext pctx;
-	pctx.exclude = &exclude;
-	// Same one-way rule as body_test_motion: move_and_slide() applies this
-	// recover motion to the character directly, so a prop must not contribute
-	// to it.
-	pctx.skip_dynamic = true;
-	b3World_CollideMover(space->world_id, b3_pos_from_godot(Vector3()), &mover,
-			b3_query_filter(body->collision_mask), b3_mover_plane_callback, &pctx);
-
-	if (pctx.count > 0) {
-		b3Vec3 zero = { 0.0f, 0.0f, 0.0f };
-		r_recover_motion = b3_to_godot(b3SolvePlanes(zero, pctx.planes, pctx.count).delta);
+	b3Capsule mover;
+	if (b3_build_mover_capsule(body, this, p_transform, &mover)) {
+		Box3DMoverPlaneContext pctx;
+		pctx.exclude = &exclude;
+		// Same one-way rule as body_test_motion: move_and_slide() applies this
+		// recover motion to the character directly, so a prop must not contribute
+		// to it.
+		pctx.skip_dynamic = true;
+		b3World_CollideMover(space->world_id, b3_pos_from_godot(Vector3()), &mover,
+				b3_query_filter(body->collision_mask), b3_mover_plane_callback, &pctx);
+		if (pctx.count > 0) {
+			b3Vec3 zero = { 0.0f, 0.0f, 0.0f };
+			r_recover_motion = b3_to_godot(b3SolvePlanes(zero, pctx.planes, pctx.count).delta);
+		}
 	}
 
-	// No RayShape support, so no separation results to report.
-	return 0;
+	if (body->ray_shape_count == 0) {
+		return 0;
+	}
+
+	int found = 0;
+	for (int attempt = 0; attempt < 4; attempt++) {
+		Vector3 push;
+		for (int i = 0; i < body->shapes.size(); i++) {
+			Box3DRayHit hit;
+			Transform xf = p_transform;
+			xf.origin += r_recover_motion;
+			if (!space->cast_ray_shape(body, i, xf, exclude, body->collision_mask, p_infinite_inertia, &hit)) {
+				continue;
+			}
+
+			const real_t depth = hit.depth - p_margin - push.dot(hit.normal);
+			if (depth > 0) {
+				push += hit.normal * depth;
+			}
+
+			int index = -1;
+			for (int k = 0; k < found; k++) {
+				if (r_results[k].collision_local_shape == i) {
+					index = k;
+				}
+			}
+			if (index == -1 && found < p_result_max) {
+				index = found++;
+			}
+			if (index != -1 && hit.depth > r_results[index].collision_depth) {
+				SeparationResult &result = r_results[index];
+				result.collision_depth = hit.depth;
+				result.collision_point = hit.point;
+				result.collision_normal = hit.normal;
+				result.collision_local_shape = i;
+				result.collider = hit.body->self;
+				result.collider_id = hit.body->instance_id;
+				result.collider_shape = hit.shape;
+				result.collider_velocity = hit.body->get_velocity_at(hit.point - hit.body->transform.origin);
+			}
+		}
+		if (push == Vector3()) {
+			break;
+		}
+		r_recover_motion += push;
+	}
+	return found;
 }
 
 /* SOFT BODY API */
@@ -2075,146 +2416,27 @@ void Box3DPhysicsServer::soft_body_remove_all_pinned_points(RID p_body) {}
 void Box3DPhysicsServer::soft_body_pin_point(RID p_body, int p_point_index, bool p_pin) {}
 bool Box3DPhysicsServer::soft_body_is_point_pinned(RID p_body, int p_point_index) { return false; }
 
-/* JOINT API */
-
-// Box3D ships parallel, distance, motor, filter, prismatic, revolute, spherical,
-// weld and wheel joints. Godot's set maps onto that well:
-//   hinge      -> b3RevoluteJoint    (direct)
-//   slider     -> b3PrismaticJoint   (direct)
-//   pin        -> b3SphericalJoint   (direct)
-//   cone twist -> b3SphericalJoint with enableConeLimit + enableTwistLimit,
-//                 which carries Godot's whole cone-twist parameter set
-//   6DOF       -> no equivalent; the only real gap
-// Creation returns a valid RID in every case so scenes keep loading.
-
-PhysicsServer::JointType Box3DPhysicsServer::joint_get_type(RID p_joint) const {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL_V(joint, JOINT_PIN);
-	return joint->type;
-}
-
-void Box3DPhysicsServer::joint_set_solver_priority(RID p_joint, int p_priority) {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL(joint);
-	joint->solver_priority = p_priority;
-}
-
-int Box3DPhysicsServer::joint_get_solver_priority(RID p_joint) const {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL_V(joint, 0);
-	return joint->solver_priority;
-}
-
-void Box3DPhysicsServer::joint_disable_collisions_between_bodies(RID p_joint, const bool p_disable) {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL(joint);
-	joint->collisions_disabled = p_disable;
-}
-
-bool Box3DPhysicsServer::joint_is_disabled_collisions_between_bodies(RID p_joint) const {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL_V(joint, false);
-	return joint->collisions_disabled;
-}
-
-RID Box3DPhysicsServer::joint_create_pin(RID p_body_A, const Vector3 &p_local_A, RID p_body_B, const Vector3 &p_local_B) {
-	B3_TODO("PinJoint (maps to b3SphericalJoint)");
-	Box3DJoint *joint = memnew(Box3DJoint(JOINT_PIN));
-	joint->body_a = p_body_A;
-	joint->body_b = p_body_B;
-	joint->pin_local_a = p_local_A;
-	joint->pin_local_b = p_local_B;
-	return joint_owner.make_rid(joint);
-}
-
-void Box3DPhysicsServer::pin_joint_set_param(RID p_joint, PinJointParam p_param, float p_value) {}
-float Box3DPhysicsServer::pin_joint_get_param(RID p_joint, PinJointParam p_param) const { return 0.0; }
-
-void Box3DPhysicsServer::pin_joint_set_local_a(RID p_joint, const Vector3 &p_A) {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL(joint);
-	joint->pin_local_a = p_A;
-}
-
-Vector3 Box3DPhysicsServer::pin_joint_get_local_a(RID p_joint) const {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL_V(joint, Vector3());
-	return joint->pin_local_a;
-}
-
-void Box3DPhysicsServer::pin_joint_set_local_b(RID p_joint, const Vector3 &p_B) {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL(joint);
-	joint->pin_local_b = p_B;
-}
-
-Vector3 Box3DPhysicsServer::pin_joint_get_local_b(RID p_joint) const {
-	Box3DJoint *joint = joint_owner.getornull(p_joint);
-	ERR_FAIL_NULL_V(joint, Vector3());
-	return joint->pin_local_b;
-}
-
-RID Box3DPhysicsServer::joint_create_hinge(RID p_body_A, const Transform &p_hinge_A, RID p_body_B, const Transform &p_hinge_B) {
-	B3_TODO("HingeJoint (maps to b3RevoluteJoint)");
-	Box3DJoint *joint = memnew(Box3DJoint(JOINT_HINGE));
-	joint->body_a = p_body_A;
-	joint->body_b = p_body_B;
-	return joint_owner.make_rid(joint);
-}
-
-RID Box3DPhysicsServer::joint_create_hinge_simple(RID p_body_A, const Vector3 &p_pivot_A, const Vector3 &p_axis_A, RID p_body_B, const Vector3 &p_pivot_B, const Vector3 &p_axis_B) {
-	B3_TODO("HingeJoint (maps to b3RevoluteJoint)");
-	Box3DJoint *joint = memnew(Box3DJoint(JOINT_HINGE));
-	joint->body_a = p_body_A;
-	joint->body_b = p_body_B;
-	return joint_owner.make_rid(joint);
-}
-
-void Box3DPhysicsServer::hinge_joint_set_param(RID p_joint, HingeJointParam p_param, float p_value) {}
-float Box3DPhysicsServer::hinge_joint_get_param(RID p_joint, HingeJointParam p_param) const { return 0.0; }
-void Box3DPhysicsServer::hinge_joint_set_flag(RID p_joint, HingeJointFlag p_flag, bool p_value) {}
-bool Box3DPhysicsServer::hinge_joint_get_flag(RID p_joint, HingeJointFlag p_flag) const { return false; }
-
-RID Box3DPhysicsServer::joint_create_slider(RID p_body_A, const Transform &p_local_frame_A, RID p_body_B, const Transform &p_local_frame_B) {
-	B3_TODO("SliderJoint (maps to b3PrismaticJoint)");
-	Box3DJoint *joint = memnew(Box3DJoint(JOINT_SLIDER));
-	joint->body_a = p_body_A;
-	joint->body_b = p_body_B;
-	return joint_owner.make_rid(joint);
-}
-
-void Box3DPhysicsServer::slider_joint_set_param(RID p_joint, SliderJointParam p_param, float p_value) {}
-float Box3DPhysicsServer::slider_joint_get_param(RID p_joint, SliderJointParam p_param) const { return 0.0; }
-
-RID Box3DPhysicsServer::joint_create_cone_twist(RID p_body_A, const Transform &p_local_frame_A, RID p_body_B, const Transform &p_local_frame_B) {
-	B3_TODO("ConeTwistJoint (maps to b3SphericalJoint cone+twist limits)");
-	Box3DJoint *joint = memnew(Box3DJoint(JOINT_CONE_TWIST));
-	joint->body_a = p_body_A;
-	joint->body_b = p_body_B;
-	return joint_owner.make_rid(joint);
-}
-
-void Box3DPhysicsServer::cone_twist_joint_set_param(RID p_joint, ConeTwistJointParam p_param, float p_value) {}
-float Box3DPhysicsServer::cone_twist_joint_get_param(RID p_joint, ConeTwistJointParam p_param) const { return 0.0; }
-
-RID Box3DPhysicsServer::joint_create_generic_6dof(RID p_body_A, const Transform &p_local_frame_A, RID p_body_B, const Transform &p_local_frame_B) {
-	B3_TODO("Generic6DOFJoint (no Box3D equivalent)");
-	Box3DJoint *joint = memnew(Box3DJoint(JOINT_6DOF));
-	joint->body_a = p_body_A;
-	joint->body_b = p_body_B;
-	return joint_owner.make_rid(joint);
-}
-
-void Box3DPhysicsServer::generic_6dof_joint_set_param(RID p_joint, Vector3::Axis p_axis, G6DOFJointAxisParam p_param, float p_value) {}
-float Box3DPhysicsServer::generic_6dof_joint_get_param(RID p_joint, Vector3::Axis p_axis, G6DOFJointAxisParam p_param) { return 0.0; }
-void Box3DPhysicsServer::generic_6dof_joint_set_flag(RID p_joint, Vector3::Axis p_axis, G6DOFJointAxisFlag p_flag, bool p_enable) {}
-bool Box3DPhysicsServer::generic_6dof_joint_get_flag(RID p_joint, Vector3::Axis p_axis, G6DOFJointAxisFlag p_flag) { return false; }
-
 /* MISC */
 
 void Box3DPhysicsServer::free(RID p_rid) {
 	if (shape_owner.owns(p_rid)) {
 		Box3DShape *shape = shape_owner.getornull(p_rid);
+		// Whoever still uses it loses it, rather than keeping a dead RID around.
+		while (shape->owners.front()) {
+			const RID owner = shape->owners.front()->get();
+			shape->owners.erase(owner);
+			Box3DCollisionObject *object = get_collision_object(owner);
+			for (int i = object ? object->shapes.size() - 1 : -1; i >= 0; i--) {
+				if (object->shapes[i].shape != p_rid) {
+					continue;
+				}
+				if (object->type == Box3DCollisionObject::TYPE_BODY) {
+					body_remove_shape(owner, i);
+				} else {
+					area_remove_shape(owner, i);
+				}
+			}
+		}
 		shape_owner.free(p_rid);
 		memdelete(shape);
 
@@ -2222,23 +2444,36 @@ void Box3DPhysicsServer::free(RID p_rid) {
 		// Leave the world before the bookkeeping goes away, or the space would be
 		// left holding a dangling Box3DBody pointer in its body list.
 		Box3DBody *body = body_owner.getornull(p_rid);
+		_body_break_joints(body);
 		_body_exit_world(body);
+		body_clear_shapes(p_rid);
+		if (Box3DPhysicsDirectBodyState::singleton && Box3DPhysicsDirectBodyState::singleton->body == body) {
+			Box3DPhysicsDirectBodyState::singleton->set_body(nullptr, 0);
+		}
 		body_owner.free(p_rid);
 		memdelete(body);
 
 	} else if (area_owner.owns(p_rid)) {
 		Box3DArea *area = area_owner.getornull(p_rid);
 		_area_exit_world(area);
+		area_clear_shapes(p_rid);
 		area_owner.free(p_rid);
 		memdelete(area);
 
 	} else if (joint_owner.owns(p_rid)) {
 		Box3DJoint *joint = joint_owner.getornull(p_rid);
+		_joint_free(joint);
 		joint_owner.free(p_rid);
 		memdelete(joint);
 
 	} else if (space_owner.owns(p_rid)) {
 		Box3DSpace *space = space_owner.getornull(p_rid);
+		while (space->bodies.size()) {
+			body_set_space(space->bodies[0]->self, RID());
+		}
+		while (space->areas.size()) {
+			area_set_space(space->areas[0]->self, RID());
+		}
 		space_set_active(p_rid, false);
 		if (space->default_area) {
 			memdelete(space->default_area);
@@ -2254,12 +2489,6 @@ void Box3DPhysicsServer::free(RID p_rid) {
 
 void Box3DPhysicsServer::init() {
 	Box3DPhysicsDirectBodyState::init_singleton();
-
-	WARN_PRINT("Box3D physics backend is partially implemented. Working: rigid bodies, "
-			   "KinematicBody movement, height fields, trimesh, and ray/shape/point "
-			   "queries. Not wired up: Areas (so no Area signals or gravity overrides), "
-			   "joints, contact reporting in _integrate_forces, and RayShape. Set "
-			   "physics/3d/physics_engine back to \"DEFAULT\" for a fully working world.");
 }
 
 void Box3DPhysicsServer::step(float p_delta) {
@@ -2296,5 +2525,23 @@ void Box3DPhysicsServer::set_collision_iterations(int p_iterations) {
 }
 
 int Box3DPhysicsServer::get_process_info(ProcessInfo p_info) {
-	return 0;
+	int total = 0;
+	for (int i = 0; i < active_spaces.size(); i++) {
+		const b3WorldId world = active_spaces[i]->world_id;
+		if (B3_IS_NULL(world)) {
+			continue;
+		}
+		switch (p_info) {
+			case INFO_ACTIVE_OBJECTS:
+				total += b3World_GetAwakeBodyCount(world);
+				break;
+			case INFO_COLLISION_PAIRS:
+				total += b3World_GetCounters(world).contactCount;
+				break;
+			case INFO_ISLAND_COUNT:
+				total += b3World_GetCounters(world).islandCount;
+				break;
+		}
+	}
+	return total;
 }

@@ -4218,6 +4218,14 @@ void RasterizerStorageGLES2::light_set_shadow_color(RID p_light, const Color &p_
 	light->shadow_color = p_color;
 }
 
+void RasterizerStorageGLES2::light_set_lens_streak(RID p_light, bool p_enabled, const Color &p_color, float p_intensity, float p_length, float p_thickness, float p_angle, float p_source_size, float p_max_distance) {
+	// Lens streaks are a GLES3-only post-process; no-op on the GLES2 backend.
+}
+
+bool RasterizerStorageGLES2::light_has_lens_streak(RID p_light) const {
+	return false;
+}
+
 void RasterizerStorageGLES2::light_set_projector(RID p_light, RID p_texture) {
 	Light *light = light_owner.getornull(p_light);
 	ERR_FAIL_COND(!light);

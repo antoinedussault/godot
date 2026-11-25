@@ -14,6 +14,9 @@
 #include "scene/gui/scroll_container.h"
 #include "scene/gui/separator.h"
 #include "scene/resources/texture.h"
+#include "scene/3d/spatial.h"
+#include "scene/resources/world.h"
+#include "servers/visual_server.h"
 
 Control *cs_make_dock_root(VBoxContainer **r_content) {
 	ScrollContainer *scroll = memnew(ScrollContainer);
@@ -70,6 +73,21 @@ EditorSpinSlider *cs_add_slider_row(VBoxContainer *p_parent, const String &p_lab
 	s->set_step(p_step);
 	s->set_value(p_default);
 	s->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	s->connect("value_changed", p_target, p_callback);
+	p_parent->add_child(s);
+	return s;
+}
+
+EditorSpinSlider *cs_add_toolbar_slider(Container *p_parent, const String &p_label,
+		double p_min, double p_max, double p_step, double p_default, int p_width,
+		Object *p_target, const StringName &p_callback) {
+	EditorSpinSlider *s = memnew(EditorSpinSlider);
+	s->set_label(p_label);
+	s->set_min(p_min);
+	s->set_max(p_max);
+	s->set_step(p_step);
+	s->set_value(p_default);
+	s->set_custom_minimum_size(Size2(p_width, 0));
 	s->connect("value_changed", p_target, p_callback);
 	p_parent->add_child(s);
 	return s;
@@ -157,6 +175,61 @@ Ref<ImageTexture> cs_icon_to_texture(const Ref<Image> &p_img) {
 	tex.instance();
 	tex->create_from_image(p_img, Texture::FLAG_FILTER);
 	return tex;
+}
+
+
+RID CSViewportOverlay::begin_rebuild(Spatial *p_anchor) {
+	ERR_FAIL_NULL_V(p_anchor, RID());
+	if (!p_anchor->is_inside_tree()) {
+		return RID();
+	}
+	Ref<World> world = p_anchor->get_world();
+	if (world.is_null()) {
+		return RID();
+	}
+
+	VisualServer *vs = VisualServer::get_singleton();
+	if (!immediate.is_valid()) {
+		// Same look the ImmediateGeometry version had: unshaded, vertex-
+		// coloured, transparent, drawn after opaque terrain.
+		material.instance();
+		material->set_flag(SpatialMaterial::FLAG_UNSHADED, true);
+		material->set_flag(SpatialMaterial::FLAG_ALBEDO_FROM_VERTEX_COLOR, true);
+		material->set_feature(SpatialMaterial::FEATURE_TRANSPARENT, true);
+		material->set_render_priority(1);
+
+		immediate = vs->immediate_create();
+		vs->immediate_set_material(immediate, material->get_rid());
+		instance = vs->instance_create2(immediate, world->get_scenario());
+		vs->instance_geometry_set_cast_shadows_setting(instance, VisualServer::SHADOW_CASTING_SETTING_OFF);
+	}
+
+	vs->immediate_clear(immediate);
+	vs->instance_set_transform(instance, p_anchor->get_global_transform());
+	vs->instance_set_visible(instance, true);
+	return immediate;
+}
+
+void CSViewportOverlay::hide() {
+	if (instance.is_valid()) {
+		VisualServer::get_singleton()->instance_set_visible(instance, false);
+	}
+}
+
+void CSViewportOverlay::destroy() {
+	VisualServer *vs = VisualServer::get_singleton();
+	if (!vs) {
+		return;
+	}
+	if (instance.is_valid()) {
+		vs->free(instance);
+		instance = RID();
+	}
+	if (immediate.is_valid()) {
+		vs->free(immediate);
+		immediate = RID();
+	}
+	material.unref();
 }
 
 #endif

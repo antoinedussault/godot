@@ -1339,6 +1339,12 @@ B3_API float b3MotorJoint_GetMaxSpringTorque( b3JointId jointId );
 /// @see b3FilterJointDef for details
 B3_API b3JointId b3CreateFilterJoint( b3WorldId worldId, const b3FilterJointDef* def );
 
+/// Tuna addition: create a generic six degree of freedom joint. Not supported by recordings.
+B3_API b3JointId b3CreateGenericJoint( b3WorldId worldId, const b3GenericJointDef* def );
+
+/// Tuna addition: replace the settings of one axis. 0-2 are linear, 3-5 are angular.
+B3_API void b3GenericJoint_SetAxis( b3JointId jointId, int index, b3GenericAxis axis );
+
 /**@}*/ // filter_joint
 
 /**

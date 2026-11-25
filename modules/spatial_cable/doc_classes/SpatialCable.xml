@@ -96,8 +96,8 @@
 		<member name="collision_layer" type="int" setter="set_collision_layer" getter="get_collision_layer" default="1">
 			Physics layer of the internal collision body.
 		</member>
-		<member name="collision_mask" type="int" setter="set_collision_mask" getter="get_collision_mask" default="0">
-			Physics mask of the internal collision body.
+		<member name="collision_mask" type="int" setter="set_collision_mask" getter="get_collision_mask" default="1">
+			Physics mask of the internal collision body. Only consulted by some physics backends (e.g. Box3D's query filtering is bidirectional), but harmless everywhere — leave it non-zero or the cable can become invisible to queries on a backend that checks it.
 		</member>
 		<member name="damping" type="float" setter="set_damping" getter="get_damping" default="0.02">
 			Velocity lost per step. Higher settles the cable faster and kills jitter; too high looks like it moves through syrup.

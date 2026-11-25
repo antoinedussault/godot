@@ -203,6 +203,7 @@ private:
 
 	Size2 size;
 	Rect2 to_screen_rect;
+	int to_screen_window;
 	bool render_direct_to_screen;
 
 	RID contact_2d_debug;
@@ -544,6 +545,11 @@ public:
 
 	void set_attach_to_screen_rect(const Rect2 &p_rect);
 	Rect2 get_attach_to_screen_rect() const;
+
+	// Which OS window this viewport presents into. Only meaningful together with
+	// set_attach_to_screen_rect(); defaults to the main window.
+	void set_attach_to_window(int p_window);
+	int get_attach_to_window() const;
 
 	void set_use_render_direct_to_screen(bool p_render_direct_to_screen);
 	bool is_using_render_direct_to_screen() const;

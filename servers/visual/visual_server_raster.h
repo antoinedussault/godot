@@ -330,6 +330,7 @@ public:
 	BIND2(light_set_shadow, RID, bool)
 	BIND2(light_set_shadow_color, RID, const Color &)
 	BIND2(light_set_projector, RID, RID)
+	BIND9(light_set_lens_streak, RID, bool, const Color &, float, float, float, float, float, float)
 	BIND2(light_set_negative, RID, bool)
 	BIND2(light_set_cull_mask, RID, uint32_t)
 	BIND2(light_set_reverse_cull_face_mode, RID, bool)
@@ -558,6 +559,10 @@ public:
 	BIND7(environment_set_fog_depth, RID, bool, float, float, float, bool, float)
 	BIND5(environment_set_fog_height, RID, bool, float, float, float)
 	BIND13(environment_set_volumetric_fog, RID, bool, float, float, float, const Color &, const Color &, float, float, float, float, int, float)
+	BIND2(environment_set_volumetric_fog_height_relative, RID, bool)
+	BIND12(environment_set_dynamic_gi, RID, bool, int, float, float, float, float, float, int, bool, uint32_t, EnvironmentDynamicGIDebug)
+	BIND9(environment_set_ssgi, RID, bool, float, float, int, int, float, float, bool)
+	BIND13(environment_set_exp_height_fog, RID, bool, float, float, float, bool, float, float, const Color &, bool, const Color &, const Vector3 &, float)
 
 #undef BINDBASE
 #define BINDBASE VSG::scene

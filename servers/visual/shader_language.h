@@ -749,14 +749,19 @@ public:
 	struct BuiltInInfo {
 		DataType type;
 		bool constant;
+		// Nonzero makes this built-in an array of the given length, indexable
+		// from shader code (used by the tessellation stages for per-patch input).
+		int array_size;
 
 		BuiltInInfo() :
 				type(TYPE_VOID),
-				constant(false) {}
+				constant(false),
+				array_size(0) {}
 
-		BuiltInInfo(DataType p_type, bool p_constant = false) :
+		BuiltInInfo(DataType p_type, bool p_constant = false, int p_array_size = 0) :
 				type(p_type),
-				constant(p_constant) {}
+				constant(p_constant),
+				array_size(p_array_size) {}
 	};
 
 	struct FunctionInfo {

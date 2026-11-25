@@ -88,8 +88,9 @@ class ItemsEditor : public VBoxContainer {
 	LineEdit *dialog_line = nullptr;
 	Vector<String> new_menu_classes;
 
-	// "New item" dialog: name + category + scene; the id is derived from the name.
+	// "New item" dialog: name + category + scene; the id is an auto-assigned FormID.
 	String pending_class;
+	String pending_id;
 	ConfirmationDialog *create_dialog = nullptr;
 	LineEdit *create_name = nullptr;
 	OptionButton *create_main = nullptr;
@@ -117,7 +118,9 @@ class ItemsEditor : public VBoxContainer {
 
 	void _collect_item_ids(Set<String> *r_ids) const;
 	static String _slugify(const String &p_name);
-	String _make_item_id(const String &p_name) const;
+	// Creation-Engine-style FormID (8 uppercase hex digits), one past the
+	// highest existing item id.
+	String _make_form_id() const;
 	Ref<Resource> _instance_scripted(const String &p_global_class);
 
 	void _rebuild_new_menu();

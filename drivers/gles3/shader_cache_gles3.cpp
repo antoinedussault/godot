@@ -37,7 +37,7 @@
 #include "core/sort_array.h"
 #include "core/ustring.h"
 
-String ShaderCacheGLES3::hash_program(const char *const *p_strings_platform, const LocalVector<const char *> &p_vertex_strings, const LocalVector<const char *> &p_fragment_strings) {
+String ShaderCacheGLES3::hash_program(const char *const *p_strings_platform, const LocalVector<const char *> *p_stage_strings, int p_stage_count) {
 	CryptoCore::SHA256Context ctx;
 	ctx.start();
 
@@ -46,11 +46,12 @@ String ShaderCacheGLES3::hash_program(const char *const *p_strings_platform, con
 		uint8_t *bytes = reinterpret_cast<uint8_t *>(const_cast<char *>(*s));
 		ctx.update(bytes, strlen(*s));
 	}
-	for (uint32_t i = 0; i < p_vertex_strings.size(); i++) {
-		ctx.update((uint8_t *)p_vertex_strings[i], strlen(p_vertex_strings[i]));
-	}
-	for (uint32_t i = 0; i < p_fragment_strings.size(); i++) {
-		ctx.update((uint8_t *)p_fragment_strings[i], strlen(p_fragment_strings[i]));
+	// Every stage feeds the key; a program that differs only in its tessellation
+	// code must not collide with one that has none.
+	for (int stage = 0; stage < p_stage_count; stage++) {
+		for (uint32_t i = 0; i < p_stage_strings[stage].size(); i++) {
+			ctx.update((uint8_t *)p_stage_strings[stage][i], strlen(p_stage_strings[stage][i]));
+		}
 	}
 
 	uint8_t hash[32];

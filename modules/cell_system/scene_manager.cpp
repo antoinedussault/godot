@@ -7,6 +7,7 @@
 #include "scene/main/viewport.h"
 #include "scene/resources/packed_scene.h"
 
+#include "game_world.h"
 #include "scene_spawn_point.h"
 #include "scene_transition.h"
 
@@ -125,13 +126,17 @@ void SceneManager::_finish_load() {
 		return;
 	}
 
+	// Old scene out BEFORE the new one goes in. A GameWorld files its persistent
+	// state as it leaves the tree and reads it back as it becomes ready; with
+	// the order the other way round, reloading the current scene would read
+	// the state before the outgoing copy had written it.
 	Node *old_scene = st->get_current_scene();
-	st->get_root()->add_child(new_root);
-	st->set_current_scene(new_root);
 	if (old_scene && old_scene != new_root) {
 		st->get_root()->remove_child(old_scene);
 		old_scene->queue_delete();
 	}
+	st->get_root()->add_child(new_root);
+	st->set_current_scene(new_root);
 
 	current_id = target_id;
 	current_spawn = target_spawn;
@@ -146,6 +151,14 @@ void SceneManager::_finish_load() {
 		if (pt && pt->has_method(player_target_method)) {
 			pt->call(player_target_method, xf, target_spawn);
 		}
+	}
+
+	// Still behind the loading screen: bring in the ground and everything
+	// around the arrival point now, so the screen lifts on a finished world
+	// rather than one that is still filling in.
+	GameWorld *gw = Object::cast_to<GameWorld>(new_root);
+	if (gw) {
+		gw->prime(xf.origin);
 	}
 
 	travelling = false;
@@ -283,6 +296,10 @@ void SceneManager::travel_to(const String &p_scene_id, const String &p_spawn_id)
 		history.push_back(current_id);
 	}
 
+	// A baked world keeps its objects in per-cell files; load the stripped
+	// scene that goes with them instead of the full authoring scene.
+	path = GameWorld::resolve_baked_scene(path);
+
 	Error err = OK;
 	loader = ResourceLoader::load_interactive(path, "", false, &err);
 	if (loader.is_null()) {
@@ -321,7 +338,72 @@ void SceneManager::travel_back() {
 	travel_to(prev, String());
 }
 
+void SceneManager::store_world_state(const String &p_key, const Dictionary &p_state) {
+	world_states[p_key] = p_state;
+}
+
+bool SceneManager::has_world_state(const String &p_key) const {
+	return world_states.has(p_key);
+}
+
+Dictionary SceneManager::get_world_state(const String &p_key) const {
+	return world_states.has(p_key) ? (Dictionary)world_states[p_key] : Dictionary();
+}
+
+Dictionary SceneManager::get_world_states() const {
+	// The current scene's world has not left the tree, so its state is not in
+	// the store yet; fold it in so a save taken right now is complete.
+	Dictionary out = world_states.duplicate();
+	GameWorld *w = get_world_game();
+	if (w) {
+		const Node *root = w->get_owner() ? w->get_owner() : (const Node *)w;
+		const String key = w->get_source_scene().empty() ? root->get_filename() : w->get_source_scene();
+		if (!key.empty()) {
+			out[key] = w->get_world_state();
+		}
+	}
+	return out;
+}
+
+void SceneManager::set_world_states(const Dictionary &p_states) {
+	world_states = p_states.duplicate();
+	GameWorld *w = get_world_game();
+	if (w) {
+		const Node *root = w->get_owner() ? w->get_owner() : (const Node *)w;
+		const String key = w->get_source_scene().empty() ? root->get_filename() : w->get_source_scene();
+		if (world_states.has(key)) {
+			w->set_world_state(world_states[key]);
+		}
+	}
+}
+
+void SceneManager::clear_world_states() {
+	world_states.clear();
+}
+
+GameWorld *SceneManager::get_world_game() const {
+	SceneTree *st = SceneTree::get_singleton();
+	if (!st) {
+		return nullptr;
+	}
+	return Object::cast_to<GameWorld>(st->get_current_scene());
+}
+
+Node *SceneManager::get_location_by_id(const String &p_id) const {
+	GameWorld *w = get_world_game();
+	return w ? w->get_location_by_id(p_id) : nullptr;
+}
+
+Array SceneManager::get_locations() const {
+	GameWorld *w = get_world_game();
+	return w ? w->get_locations() : Array();
+}
+
 void SceneManager::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_world_states"), &SceneManager::get_world_states);
+	ClassDB::bind_method(D_METHOD("set_world_states", "states"), &SceneManager::set_world_states);
+	ClassDB::bind_method(D_METHOD("clear_world_states"), &SceneManager::clear_world_states);
+
 	ClassDB::bind_method(D_METHOD("set_catalog", "catalog"), &SceneManager::set_catalog);
 	ClassDB::bind_method(D_METHOD("get_catalog"), &SceneManager::get_catalog);
 	ClassDB::bind_method(D_METHOD("set_catalog_path", "path"), &SceneManager::set_catalog_path);
@@ -345,6 +427,10 @@ void SceneManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("can_travel_back"), &SceneManager::can_travel_back);
 	ClassDB::bind_method(D_METHOD("is_travelling"), &SceneManager::is_travelling);
 	ClassDB::bind_method(D_METHOD("get_progress"), &SceneManager::get_progress);
+
+	ClassDB::bind_method(D_METHOD("get_world_game"), &SceneManager::get_world_game);
+	ClassDB::bind_method(D_METHOD("get_location_by_id", "id"), &SceneManager::get_location_by_id);
+	ClassDB::bind_method(D_METHOD("get_locations"), &SceneManager::get_locations);
 
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "catalog", PROPERTY_HINT_RESOURCE_TYPE, "SceneCatalog"), "set_catalog", "get_catalog");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "loading_screen", PROPERTY_HINT_FILE, "*.tscn,*.scn"), "set_loading_screen", "get_loading_screen");

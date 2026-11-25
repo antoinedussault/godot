@@ -290,7 +290,7 @@ void CellFoliage::_build_render_nodes() {
 			bk.lod_count = built;
 
 		// -------------------------------------------------------------- TREE
-		} else if (cat == FoliageType::TYPE_TREE) {
+		} else if (cat == FoliageType::TYPE_TREE || cat == FoliageType::TYPE_ROCK) {
 			Ref<PackedScene> scene = bk.type->get_tree_scene();
 			if (scene.is_null()) continue;
 
@@ -414,7 +414,7 @@ void CellFoliage::update_lod(const Vector3 &p_cam_world, const Vector3 &p_cell_w
 		if (inst_count == 0) continue;
 
 		// ---------------------------------------------------- GRASS and TREE
-		if (cat == FoliageType::TYPE_GRASS || cat == FoliageType::TYPE_TREE) {
+		if (cat == FoliageType::TYPE_GRASS || cat == FoliageType::TYPE_TREE || cat == FoliageType::TYPE_ROCK) {
 			int lod_count = bk.lod_count;
 			// Imposter occupies the level index just past the last mesh LOD.
 			const int imposter_level = lod_count;
@@ -525,6 +525,32 @@ void CellFoliage::_rebuild_colliders(const Vector3 &p_cell_world_origin) {
 			collider_bodies.push_back(body);
 		}
 	}
+}
+
+PoolRealArray CellFoliage::collect_nav_obstacles(const Vector3 &p_cell_world_origin) const {
+	// Flattened world-space (x, z, radius) triples for every instance of a type
+	// that declares a nav_obstacle_radius. Returned as plain floats so the
+	// terrain can hand them straight to its off-thread navmesh build.
+	PoolRealArray out;
+	for (int b = 0; b < buckets.size(); b++) {
+		const TypeBucket &bk = buckets[b];
+		if (bk.type.is_null()) continue;
+		float base_r = bk.type->get_nav_obstacle_radius();
+		if (base_r <= 0.0f) continue;
+		for (int i = 0; i < bk.instances.size(); i++) {
+			const Transform &xf = bk.instances[i].xform;
+			// Instances are stored cell-local; the obstacle list is world-space.
+			Vector3 wp = p_cell_world_origin + xf.origin;
+			// Scale is uniform for scattered foliage, so any basis axis length
+			// gives the instance scale.
+			float s = xf.basis.get_axis(0).length();
+			if (s <= 0.0f) s = 1.0f;
+			out.push_back(wp.x);
+			out.push_back(wp.z);
+			out.push_back(base_r * s);
+		}
+	}
+	return out;
 }
 
 void CellFoliage::set_collision_active(bool p_active, const Vector3 &p_cell_world_origin) {

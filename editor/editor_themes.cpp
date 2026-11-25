@@ -455,6 +455,11 @@ Ref<Theme> create_editor_theme(const Ref<Theme> p_theme) {
 		preset_accent_color = Color(0.33, 0.56, 0.82);
 		preset_base_color = Color(0.19, 0.20, 0.22);
 		preset_contrast = 0.2;
+	} else if (preset == "Unreal Engine") {
+		// Flat, near-black modern editor look; minimal-contrast greys, blue accent.
+		preset_accent_color = Color(0.20, 0.45, 0.75);
+		preset_base_color = Color(0.05, 0.05, 0.05);
+		preset_contrast = 0.3;
 	} else { // Default
 		preset_accent_color = Color(0.41, 0.61, 0.91);
 		preset_base_color = Color(0.2, 0.23, 0.31);
@@ -1590,6 +1595,149 @@ Ref<Theme> create_editor_theme(const Ref<Theme> p_theme) {
 		theme->set_color("font_color", "PopupMenu", win_text);
 		theme->set_color("font_color_hover", "PopupMenu", win_text);
 		theme->set_color("font_color_hover", "MenuButton", win_text);
+	}
+
+	// "Unreal Engine" preset: flat modern editor look, no gradients/gloss --
+	// near-black, minimal-contrast greys with a blue accent for hover/focus/selection.
+	if (preset == "Unreal Engine") {
+		const int ue_bw = MAX(1, EDSCALE);
+
+		const Color ue_backdrop = Color(0.035, 0.035, 0.035);
+		const Color ue_field_bg = Color(0.06, 0.06, 0.06);
+		const Color ue_row_hover = Color(0.11, 0.115, 0.12);
+		const Color ue_disabled_bg = Color(0.045, 0.045, 0.045);
+		const Color ue_border = Color(0.10, 0.10, 0.10);
+		const Color ue_border_disabled = Color(0.08, 0.08, 0.08);
+		const Color ue_accent_border = Color(0.20, 0.45, 0.75);
+		const Color ue_selection = Color(0.10, 0.20, 0.32);
+		const Color ue_selection_border = Color(0.20, 0.40, 0.62);
+		const Color ue_text = Color(0.80, 0.80, 0.81);
+		const Color ue_popup_bg = Color(0.05, 0.05, 0.05);
+		const Color ue_popup_hover = Color(0.14, 0.18, 0.24);
+
+		const float ue_wm_h = extra_spacing + 6;
+		const float ue_wm_v = extra_spacing + default_margin_size;
+
+		theme->set_stylebox("Background", "EditorStyles", make_flat_stylebox(ue_backdrop, default_margin_size, default_margin_size, default_margin_size, default_margin_size));
+
+		// Flat buttons/dropdowns: a small value shift on hover/press, blue accent border.
+		Ref<StyleBoxFlat> ueb_normal = make_win_stylebox(Color(0.08, 0.08, 0.08), ue_border, ue_bw, ue_wm_h, ue_wm_v, ue_wm_h, ue_wm_v);
+		Ref<StyleBoxFlat> ueb_hover = make_win_stylebox(Color(0.14, 0.145, 0.15), ue_accent_border, ue_bw, ue_wm_h, ue_wm_v, ue_wm_h, ue_wm_v);
+		Ref<StyleBoxFlat> ueb_pressed = make_win_stylebox(Color(0.05, 0.08, 0.12), ue_accent_border, ue_bw, ue_wm_h, ue_wm_v, ue_wm_h, ue_wm_v);
+		Ref<StyleBoxFlat> ueb_disabled = make_win_stylebox(ue_disabled_bg, ue_border_disabled, ue_bw, ue_wm_h, ue_wm_v, ue_wm_h, ue_wm_v);
+		Ref<StyleBoxTexture> ueb_focus = make_aero_focus_stylebox(Color(0.30, 0.60, 0.90), ue_wm_h, ue_wm_v);
+
+		static const char *ue_wb_classes[] = { "Button", "OptionButton" };
+		for (int i = 0; i < 2; i++) {
+			theme->set_stylebox("normal", ue_wb_classes[i], ueb_normal);
+			theme->set_stylebox("hover", ue_wb_classes[i], ueb_hover);
+			theme->set_stylebox("pressed", ue_wb_classes[i], ueb_pressed);
+			theme->set_stylebox("focus", ue_wb_classes[i], ueb_focus);
+			theme->set_stylebox("disabled", ue_wb_classes[i], ueb_disabled);
+			theme->set_color("font_color_pressed", ue_wb_classes[i], ue_text);
+		}
+
+		// Text fields.
+		Ref<StyleBoxFlat> uef_normal = make_win_stylebox(ue_field_bg, ue_border, ue_bw, ue_wm_h, ue_wm_v, ue_wm_h, ue_wm_v);
+		Ref<StyleBoxFlat> uef_focus = make_win_stylebox(ue_field_bg, ue_accent_border, ue_bw, ue_wm_h, ue_wm_v, ue_wm_h, ue_wm_v);
+		Ref<StyleBoxFlat> uef_readonly = make_win_stylebox(ue_disabled_bg, ue_border_disabled, ue_bw, ue_wm_h, ue_wm_v, ue_wm_h, ue_wm_v);
+		theme->set_stylebox("normal", "LineEdit", uef_normal);
+		theme->set_stylebox("focus", "LineEdit", uef_focus);
+		theme->set_stylebox("read_only", "LineEdit", uef_readonly);
+		theme->set_stylebox("normal", "TextEdit", uef_normal);
+		theme->set_stylebox("focus", "TextEdit", uef_focus);
+		theme->set_stylebox("read_only", "TextEdit", uef_readonly);
+
+		// Trees & item lists.
+		Ref<StyleBoxFlat> uel_bg = make_win_stylebox(ue_field_bg, ue_border, ue_bw, default_margin_size, default_margin_size, default_margin_size, default_margin_size);
+
+		Ref<StyleBoxFlat> uel_selected = make_flat_stylebox(ue_selection, 4, 4, 4, 4);
+		uel_selected->set_border_width_all(ue_bw);
+		uel_selected->set_border_color(ue_selection_border);
+		uel_selected->set_corner_radius_all(0);
+		uel_selected->set_anti_aliased(false);
+
+		Ref<StyleBoxFlat> uel_hover = make_flat_stylebox(ue_row_hover, 4, 4, 4, 4);
+		uel_hover->set_border_width_all(ue_bw);
+		uel_hover->set_border_color(ue_selection_border);
+		uel_hover->set_corner_radius_all(0);
+		uel_hover->set_anti_aliased(false);
+
+		theme->set_stylebox("bg", "Tree", uel_bg);
+		theme->set_stylebox("selected", "Tree", uel_selected);
+		theme->set_stylebox("selected_focus", "Tree", uel_selected);
+		theme->set_stylebox("hover", "Tree", uel_hover);
+		theme->set_stylebox("bg", "ItemList", uel_bg);
+		theme->set_stylebox("selected", "ItemList", uel_selected);
+		theme->set_stylebox("selected_focus", "ItemList", uel_selected);
+		theme->set_color("font_color_selected", "Tree", Color(1, 1, 1));
+		theme->set_color("font_color_selected", "ItemList", Color(1, 1, 1));
+		theme->set_stylebox("normal", "RichTextLabel", uel_bg);
+
+		// Tab content area matches the backdrop.
+		theme->set_stylebox("panel", "TabContainer", make_win_stylebox(ue_backdrop, ue_border, ue_bw, margin_size_extra, margin_size_extra, margin_size_extra, margin_size_extra));
+
+		// ProgressBar: near-black trough, blue fill.
+		theme->set_stylebox("bg", "ProgressBar", make_win_stylebox(Color(0.04, 0.04, 0.04), ue_border, ue_bw, 1, 1, 1, 1));
+		Ref<StyleBoxFlat> uepb_fg = make_flat_stylebox(Color(0.16, 0.47, 0.78), 1, 1, 1, 1);
+		uepb_fg->set_corner_radius_all(0);
+		uepb_fg->set_anti_aliased(false);
+		theme->set_stylebox("fg", "ProgressBar", uepb_fg);
+		theme->set_color("font_color", "ProgressBar", ue_text);
+
+		// Scrollbars: separate H/V tracks so the cross-axis content margin gives the
+		// bar real thickness (StyleBoxFlat reports no center size).
+		Ref<StyleBoxFlat> uesc_track_h = make_flat_stylebox(Color(0.03, 0.03, 0.03), 2, 7, 2, 7);
+		Ref<StyleBoxFlat> uesc_track_v = make_flat_stylebox(Color(0.03, 0.03, 0.03), 7, 2, 7, 2);
+		uesc_track_h->set_border_width_all(ue_bw);
+		uesc_track_h->set_border_color(ue_border);
+		uesc_track_h->set_corner_radius_all(0);
+		uesc_track_h->set_anti_aliased(false);
+		uesc_track_v->set_border_width_all(ue_bw);
+		uesc_track_v->set_border_color(ue_border);
+		uesc_track_v->set_corner_radius_all(0);
+		uesc_track_v->set_anti_aliased(false);
+
+		Ref<StyleBoxFlat> uesc_grab = make_flat_stylebox(Color(0.16, 0.16, 0.17), 2, 2, 2, 2);
+		uesc_grab->set_border_width_all(ue_bw);
+		uesc_grab->set_border_color(ue_border_disabled);
+		uesc_grab->set_corner_radius_all(0);
+		uesc_grab->set_anti_aliased(false);
+		Ref<StyleBoxFlat> uesc_grab_hl = uesc_grab->duplicate();
+		uesc_grab_hl->set_bg_color(Color(0.22, 0.26, 0.32));
+		uesc_grab_hl->set_border_color(ue_accent_border);
+
+		theme->set_stylebox("scroll", "HScrollBar", uesc_track_h);
+		theme->set_stylebox("scroll_focus", "HScrollBar", uesc_track_h);
+		theme->set_stylebox("scroll", "VScrollBar", uesc_track_v);
+		theme->set_stylebox("scroll_focus", "VScrollBar", uesc_track_v);
+		static const char *ue_sc_classes[] = { "HScrollBar", "VScrollBar" };
+		for (int i = 0; i < 2; i++) {
+			theme->set_stylebox("grabber", ue_sc_classes[i], uesc_grab);
+			theme->set_stylebox("grabber_highlight", ue_sc_classes[i], uesc_grab_hl);
+			theme->set_stylebox("grabber_pressed", ue_sc_classes[i], uesc_grab_hl);
+		}
+
+		// Popups and menus.
+		Ref<StyleBoxFlat> uepop = make_flat_stylebox(ue_popup_bg, default_margin_size * 2, default_margin_size * 2, default_margin_size * 2, default_margin_size * 2);
+		uepop->set_border_width_all(ue_bw);
+		uepop->set_border_color(ue_border);
+		uepop->set_corner_radius_all(0);
+		uepop->set_anti_aliased(false);
+		theme->set_stylebox("panel", "PopupMenu", uepop);
+		theme->set_stylebox("panel", "PopupPanel", uepop);
+		theme->set_stylebox("panel", "PopupDialog", uepop);
+
+		Ref<StyleBoxFlat> uepop_hover = make_flat_stylebox(ue_popup_hover, 2, 2, 2, 2);
+		uepop_hover->set_border_width_all(ue_bw);
+		uepop_hover->set_border_color(ue_accent_border);
+		uepop_hover->set_corner_radius_all(0);
+		uepop_hover->set_anti_aliased(false);
+		theme->set_stylebox("hover", "PopupMenu", uepop_hover);
+		theme->set_stylebox("hover", "MenuButton", uepop_hover);
+		theme->set_color("font_color", "PopupMenu", ue_text);
+		theme->set_color("font_color_hover", "PopupMenu", ue_text);
+		theme->set_color("font_color_hover", "MenuButton", ue_text);
 	}
 
 	// adaptive script theme constants

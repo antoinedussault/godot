@@ -86,6 +86,10 @@ uniform highp vec4 asym_proj;
 #endif
 #ifdef YCBCR_TO_SRGB
 #endif
+#ifdef USE_PANORAMA
+#endif
+#ifdef USE_PANORAMA_TO_DP
+#endif
 
 #ifdef USE_CUBEMAP
 uniform samplerCube source_cube; //texunit:0
@@ -133,6 +137,52 @@ vec4 texturePanorama(vec3 normal, sampler2D pano) {
 
 #endif
 
+#ifdef USE_PANORAMA_TO_DP
+
+// Bakes an equirectangular projector texture into one half of a dual-paraboloid
+// pair, so that light_process_omni() can sample it with a divide instead of two
+// inverse trig calls. `dp_z_flip` selects the +Z half.
+//
+// This is the exact analytic inverse of the forward mapping in scene.glsl
+// (uv = 0.5 + 0.5 * n.xy / (1 + abs(n.z))). Godot 4 bakes with the standard
+// Blinn paraboloid (z = 0.5 - 0.5 * dot(xy, xy)) instead, which is *not* the
+// inverse of the map its own shader samples with, so its cookies stretch
+// slightly toward the rim. Inverting exactly costs nothing here.
+uniform bool dp_z_flip;
+
+vec4 texture_panorama_dp(vec2 p_uv, sampler2D p_pano) {
+	vec2 v = p_uv * 2.0 - 1.0;
+	float d = dot(v, v);
+	float inv = 1.0 / (d + 1.0);
+
+	vec3 normal;
+	normal.xy = 2.0 * v * inv;
+	normal.z = (d - 1.0) * inv;
+
+	if (dp_z_flip) {
+		normal.z = -normal.z;
+	}
+
+	// Matches texturePanorama() above: Y is up, so the panorama's poles land on
+	// the light's local +/-Y and the cookie turns with the light.
+	vec2 st = vec2(
+			atan(normal.x, normal.z),
+			acos(normal.y));
+
+	if (st.x < 0.0)
+		st.x += M_PI * 2.0;
+
+	st /= vec2(M_PI * 2.0, M_PI);
+
+#ifdef USE_LOD
+	return textureLod(p_pano, st, mip_level);
+#else
+	return textureLod(p_pano, st, 0.0);
+#endif
+}
+
+#endif
+
 uniform vec2 pixel_size;
 
 in vec2 uv2_interp;
@@ -154,7 +204,11 @@ layout(location = 0) out vec4 frag_color;
 void main() {
 	//vec4 color = color_interp;
 
-#ifdef USE_PANORAMA
+#ifdef USE_PANORAMA_TO_DP
+
+	vec4 color = texture_panorama_dp(uv_interp, source);
+
+#elif defined(USE_PANORAMA)
 
 	vec3 cube_normal = normalize(cube_interp);
 	cube_normal.z = -cube_normal.z;

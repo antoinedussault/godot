@@ -32,6 +32,7 @@
 
 #include "core/core_string_names.h"
 #include "core/os/input.h"
+#include "core/os/file_access.h"
 #include "core/os/os.h"
 #include "core/project_settings.h"
 #include "scene/2d/collision_object_2d.h"
@@ -1381,6 +1382,14 @@ Transform2D Viewport::_get_input_pre_xform() const {
 }
 
 Vector2 Viewport::_get_window_offset() const {
+	// This offset maps screen input into a viewport that is embedded inside a parent
+	// Control in the main window. A viewport presenting into its own OS window is
+	// positioned by that window instead, so a parent Control's position is meaningless
+	// here and would shift every event by the main window's layout.
+	if (to_screen_window != OS::MAIN_WINDOW_ID) {
+		return Vector2();
+	}
+
 	if (get_parent() && get_parent()->has_method("get_global_position")) {
 		return get_parent()->call("get_global_position");
 	}
@@ -1421,7 +1430,14 @@ void Viewport::_vp_input(const Ref<InputEvent> &p_ev) {
 	//this one handles system input, p_ev are in system coordinates
 	//they are converted to viewport coordinates
 
+	// Input is broadcast to every viewport, so one presenting into a separate OS
+	// window must ignore anything that came from a different window.
+	if (p_ev->get_window() != to_screen_window) {
+		return;
+	}
+
 	Ref<InputEvent> ev = _make_input_local(p_ev);
+
 	input(ev);
 }
 
@@ -1446,6 +1462,11 @@ void Viewport::_vp_unhandled_input(const Ref<InputEvent> &p_ev) {
 
 	//this one handles system input, p_ev are in system coordinates
 	//they are converted to viewport coordinates
+
+	// Same window filter as _vp_input: unhandled input must not leak across windows.
+	if (p_ev->get_window() != to_screen_window) {
+		return;
+	}
 
 	Ref<InputEvent> ev = _make_input_local(p_ev);
 	unhandled_input(ev);
@@ -2936,8 +2957,20 @@ bool Viewport::is_using_own_world() const {
 }
 
 void Viewport::set_attach_to_screen_rect(const Rect2 &p_rect) {
-	VS::get_singleton()->viewport_attach_to_screen(viewport, p_rect);
+	VS::get_singleton()->viewport_attach_to_screen(viewport, p_rect, to_screen_window);
 	to_screen_rect = p_rect;
+}
+
+void Viewport::set_attach_to_window(int p_window) {
+	if (to_screen_window == p_window) {
+		return;
+	}
+	to_screen_window = p_window;
+	VS::get_singleton()->viewport_attach_to_screen(viewport, to_screen_rect, to_screen_window);
+}
+
+int Viewport::get_attach_to_window() const {
+	return to_screen_window;
 }
 
 Rect2 Viewport::get_attach_to_screen_rect() const {
@@ -3443,6 +3476,7 @@ void Viewport::_subwindow_visibility_changed() {
 }
 
 Viewport::Viewport() {
+	to_screen_window = OS::MAIN_WINDOW_ID;
 	world_2d = Ref<World2D>(memnew(World2D));
 
 	viewport = RID_PRIME(VisualServer::get_singleton()->viewport_create());

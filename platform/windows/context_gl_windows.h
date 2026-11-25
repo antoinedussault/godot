@@ -69,6 +69,13 @@ public:
 	HDC get_hdc();
 	HGLRC get_hglrc();
 
+	// Multi-window: a single context can be made current on any DC that shares the
+	// main window's pixel format, which avoids a second context (and the GL state
+	// cache invalidation that would come with one).
+	Error prepare_dc(HDC p_hdc);
+	void make_current_on(HDC p_hdc);
+	void swap_buffers_on(HDC p_hdc);
+
 	int get_window_width();
 	int get_window_height();
 	void swap_buffers();

@@ -608,6 +608,7 @@ typedef enum b3JointType
 	b3_sphericalJoint,
 	b3_weldJoint,
 	b3_wheelJoint,
+	b3_genericJoint, // Tuna addition
 } b3JointType;
 
 /// Base joint definition used by all joint types. The local frames are measured from the
@@ -1016,6 +1017,45 @@ typedef struct b3WheelJointDef
 /// Use this to initialize your joint definition
 /// @ingroup wheel_joint
 B3_API b3WheelJointDef b3DefaultWheelJointDef( void );
+
+/// Tuna addition, see generic_joint.c.
+/// One axis of a generic joint. Free unless something is enabled.
+/// @ingroup generic_joint
+typedef struct b3GenericAxis
+{
+	/// Limit range in meters or radians. Equal values lock the axis, lower > upper frees it.
+	float lower;
+	float upper;
+
+	/// Desired speed of body B relative to body A, and the force or torque available to reach it.
+	float motorSpeed;
+	float maxMotorForce;
+
+	/// Spring in physical units (N/m or N*m/rad).
+	float stiffness;
+	float damping;
+	float equilibrium;
+
+	bool enableLimit;
+	bool enableMotor;
+	bool enableSpring;
+} b3GenericAxis;
+
+/// Generic six degree of freedom joint definition. Linear axes are those of local frame A.
+/// Angles are the XYZ Euler angles of frame B relative to frame A.
+/// @ingroup generic_joint
+typedef struct b3GenericJointDef
+{
+	/// Base joint definition
+	b3JointDef base;
+
+	/// Linear x, y, z then angular x, y, z.
+	b3GenericAxis axes[6];
+} b3GenericJointDef;
+
+/// Use this to initialize your joint definition
+/// @ingroup generic_joint
+B3_API b3GenericJointDef b3DefaultGenericJointDef( void );
 
 /// The explosion definition is used to configure options for explosions. Explosions
 /// consider shape geometry when computing the impulse.

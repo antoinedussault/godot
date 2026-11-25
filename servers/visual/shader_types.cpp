@@ -48,6 +48,11 @@ static ShaderLanguage::BuiltInInfo constt(ShaderLanguage::DataType p_type) {
 	return ShaderLanguage::BuiltInInfo(p_type, true);
 }
 
+// A read-only built-in that shader code indexes, e.g. PATCH_VERTEX[i].
+static ShaderLanguage::BuiltInInfo patcharr(ShaderLanguage::DataType p_type) {
+	return ShaderLanguage::BuiltInInfo(p_type, true, 3);
+}
+
 ShaderTypes::ShaderTypes() {
 	singleton = this;
 
@@ -156,6 +161,36 @@ ShaderTypes::ShaderTypes() {
 	shader_modes[VS::SHADER_SPATIAL].functions["light"].built_ins["OUTPUT_IS_SRGB"] = constt(ShaderLanguage::TYPE_BOOL);
 	shader_modes[VS::SHADER_SPATIAL].functions["light"].built_ins["ALPHA"] = ShaderLanguage::TYPE_FLOAT;
 	shader_modes[VS::SHADER_SPATIAL].functions["light"].can_discard = true;
+
+	// Tessellation control: runs once per output control point. The per-patch
+	// inputs are flat arrays (three entries, triangle patches) rather than an
+	// interface block, so they index like any other array in the language.
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["PATCH_VERTEX"] = patcharr(ShaderLanguage::TYPE_VEC3);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["PATCH_NORMAL"] = patcharr(ShaderLanguage::TYPE_VEC3);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["PATCH_UV"] = patcharr(ShaderLanguage::TYPE_VEC2);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["INVOCATION_ID"] = constt(ShaderLanguage::TYPE_INT);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["CAMERA_POSITION_WORLD"] = constt(ShaderLanguage::TYPE_VEC3);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["WORLD_MATRIX"] = constt(ShaderLanguage::TYPE_MAT4);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["TIME"] = constt(ShaderLanguage::TYPE_FLOAT);
+	// Written by user code to drive the tessellator.
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["TESS_LEVEL_OUTER"] = ShaderLanguage::BuiltInInfo(ShaderLanguage::TYPE_FLOAT, false, 4);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_control"].built_ins["TESS_LEVEL_INNER"] = ShaderLanguage::BuiltInInfo(ShaderLanguage::TYPE_FLOAT, false, 2);
+
+	// Tessellation evaluation: runs once per generated vertex. TESS_COORD gives
+	// the barycentric position inside the patch; VERTEX/NORMAL/UV are writable
+	// so displacement happens here.
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["TESS_COORD"] = constt(ShaderLanguage::TYPE_VEC3);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["PATCH_VERTEX"] = patcharr(ShaderLanguage::TYPE_VEC3);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["PATCH_NORMAL"] = patcharr(ShaderLanguage::TYPE_VEC3);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["PATCH_UV"] = patcharr(ShaderLanguage::TYPE_VEC2);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["VERTEX"] = ShaderLanguage::TYPE_VEC3;
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["NORMAL"] = ShaderLanguage::TYPE_VEC3;
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["UV"] = ShaderLanguage::TYPE_VEC2;
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["CAMERA_POSITION_WORLD"] = constt(ShaderLanguage::TYPE_VEC3);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["WORLD_MATRIX"] = constt(ShaderLanguage::TYPE_MAT4);
+	shader_modes[VS::SHADER_SPATIAL].functions["tess_eval"].built_ins["TIME"] = constt(ShaderLanguage::TYPE_FLOAT);
+
+
 	shader_modes[VS::SHADER_SPATIAL].functions["light"].main_function = true;
 
 	//order used puts first enum mode (default) first

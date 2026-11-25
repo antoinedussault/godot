@@ -465,6 +465,7 @@ public:
 	virtual void light_set_shadow(RID p_light, bool p_enabled) = 0;
 	virtual void light_set_shadow_color(RID p_light, const Color &p_color) = 0;
 	virtual void light_set_projector(RID p_light, RID p_texture) = 0;
+	virtual void light_set_lens_streak(RID p_light, bool p_enabled, const Color &p_color, float p_intensity, float p_length, float p_thickness, float p_angle, float p_source_size, float p_max_distance) = 0;
 	virtual void light_set_negative(RID p_light, bool p_enable) = 0;
 	virtual void light_set_cull_mask(RID p_light, uint32_t p_mask) = 0;
 	virtual void light_set_reverse_cull_face_mode(RID p_light, bool p_enabled) = 0;
@@ -833,6 +834,20 @@ public:
 	virtual void environment_set_fog_depth(RID p_env, bool p_enable, float p_depth_begin, float p_depth_end, float p_depth_curve, bool p_transmit, float p_transmit_curve) = 0;
 	virtual void environment_set_fog_height(RID p_env, bool p_enable, float p_min_height, float p_max_height, float p_height_curve) = 0;
 	virtual void environment_set_volumetric_fog(RID p_env, bool p_enable, float p_density, float p_height_falloff, float p_height_ref, const Color &p_albedo, const Color &p_ambient, float p_sun_energy, float p_anisotropy, float p_length, float p_extinction, int p_samples, float p_temporal_blend) = 0;
+	virtual void environment_set_volumetric_fog_height_relative(RID p_env, bool p_relative) = 0;
+
+	enum EnvironmentDynamicGIDebug {
+		ENV_DYNAMIC_GI_DEBUG_DISABLED,
+		ENV_DYNAMIC_GI_DEBUG_LIGHTING,
+		ENV_DYNAMIC_GI_DEBUG_ALBEDO,
+		ENV_DYNAMIC_GI_DEBUG_IRRADIANCE,
+		ENV_DYNAMIC_GI_DEBUG_SSGI,
+	};
+
+	virtual void environment_set_dynamic_gi(RID p_env, bool p_enable, int p_cascades, float p_voxel_size, float p_energy, float p_bounce_feedback, float p_normal_bias, float p_hysteresis, int p_rays, bool p_reflection_occlusion, uint32_t p_cull_mask, EnvironmentDynamicGIDebug p_debug) = 0;
+	virtual void environment_set_ssgi(RID p_env, bool p_enable, float p_radius, float p_intensity, int p_rays, int p_steps, float p_thickness, float p_temporal_blend, bool p_half_resolution) = 0;
+
+	virtual void environment_set_exp_height_fog(RID p_env, bool p_enable, float p_density, float p_falloff, float p_ref_height, bool p_ref_height_relative, float p_start_distance, float p_max_opacity, const Color &p_inscatter, bool p_directional_enabled, const Color &p_directional_color, const Vector3 &p_light_direction, float p_directional_exponent) = 0;
 
 	/* INTERPOLATION API */
 
@@ -1263,6 +1278,7 @@ VARIANT_ENUM_CAST(VisualServer::EnvironmentDOFBlurQuality);
 VARIANT_ENUM_CAST(VisualServer::EnvironmentGlowBlendMode);
 VARIANT_ENUM_CAST(VisualServer::EnvironmentToneMapper);
 VARIANT_ENUM_CAST(VisualServer::EnvironmentSSAOQuality);
+VARIANT_ENUM_CAST(VisualServer::EnvironmentDynamicGIDebug);
 VARIANT_ENUM_CAST(VisualServer::EnvironmentSSAOBlur);
 VARIANT_ENUM_CAST(VisualServer::InstanceFlags);
 VARIANT_ENUM_CAST(VisualServer::ShadowCastingSetting);

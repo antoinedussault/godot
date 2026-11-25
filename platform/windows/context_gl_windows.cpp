@@ -34,6 +34,8 @@
 
 #include "context_gl_windows.h"
 
+#include "core/error_macros.h"
+
 #include <dwmapi.h>
 
 #define WGL_CONTEXT_MAJOR_VERSION_ARB 0x2091
@@ -100,6 +102,27 @@ bool ContextGL_Windows::should_vsync_via_compositor() {
 	}
 
 	return false;
+}
+
+Error ContextGL_Windows::prepare_dc(HDC p_hdc) {
+	ERR_FAIL_COND_V(!p_hdc, ERR_INVALID_PARAMETER);
+
+	PIXELFORMATDESCRIPTOR pfd;
+	if (!DescribePixelFormat(hDC, pixel_format, sizeof(PIXELFORMATDESCRIPTOR), &pfd)) {
+		return ERR_CANT_CREATE;
+	}
+	if (!SetPixelFormat(p_hdc, pixel_format, &pfd)) {
+		return ERR_CANT_CREATE;
+	}
+	return OK;
+}
+
+void ContextGL_Windows::make_current_on(HDC p_hdc) {
+	wglMakeCurrent(p_hdc ? p_hdc : hDC, hRC);
+}
+
+void ContextGL_Windows::swap_buffers_on(HDC p_hdc) {
+	SwapBuffers(p_hdc ? p_hdc : hDC);
 }
 
 void ContextGL_Windows::swap_buffers() {
@@ -187,8 +210,8 @@ Error ContextGL_Windows::initialize() {
 
 	if (opengl_3_context) {
 		int attribs[] = {
-			WGL_CONTEXT_MAJOR_VERSION_ARB, 3, //we want a 3.3 context
-			WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+			WGL_CONTEXT_MAJOR_VERSION_ARB, 4, //we want a 4.6 core context
+			WGL_CONTEXT_MINOR_VERSION_ARB, 6,
 			//and it shall be forward compatible so that we can only use up to date functionality
 			WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
 			WGL_CONTEXT_FLAGS_ARB, WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB /*| _WGL_CONTEXT_DEBUG_BIT_ARB*/,
@@ -198,16 +221,17 @@ Error ContextGL_Windows::initialize() {
 		PFNWGLCREATECONTEXTATTRIBSARBPROC wglCreateContextAttribsARB = NULL; //pointer to the method
 		wglCreateContextAttribsARB = (PFNWGLCREATECONTEXTATTRIBSARBPROC)wglGetProcAddress("wglCreateContextAttribsARB");
 
-		if (wglCreateContextAttribsARB == NULL) //OpenGL 3.0 is not supported
-		{
+		if (wglCreateContextAttribsARB == NULL) {
+			ERR_PRINT("Your video card driver does not support wglCreateContextAttribsARB, so no modern OpenGL context can be created at all. Update your graphics drivers.");
 			wglDeleteContext(hRC);
 			return ERR_CANT_CREATE;
 		}
 
 		HGLRC new_hRC = wglCreateContextAttribsARB(hDC, 0, attribs);
 		if (!new_hRC) {
+			ERR_PRINT("Could not create an OpenGL 4.6 core context. This engine requires OpenGL 4.6 (for tessellation and compute); your video card or driver reports a lower version. Update your graphics drivers, or use the GLES2 renderer.");
 			wglDeleteContext(hRC);
-			return ERR_CANT_CREATE; // Return false
+			return ERR_CANT_CREATE;
 		}
 		wglMakeCurrent(hDC, NULL);
 		wglDeleteContext(hRC);

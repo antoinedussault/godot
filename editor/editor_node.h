@@ -406,6 +406,7 @@ private:
 	String open_navigate;
 	bool changing_scene;
 	bool waiting_for_first_scan;
+	bool loading_startup_scene;
 
 	bool waiting_for_sources_changed;
 
@@ -754,6 +755,9 @@ public:
 	void select_editor_by_name(const String &p_name);
 
 	void open_request(const String &p_path);
+
+	// Opens a scene for EditorLoadingScreen, which preloads its dependencies.
+	void load_startup_scene(const String &p_path, bool p_restoring);
 
 	bool is_changing_scene() const;
 

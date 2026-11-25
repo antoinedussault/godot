@@ -4,27 +4,39 @@
 
 #include "editor/editor_plugin.h"
 
-class CellWorld;
+class GameWorld;
 class Control;
 class Button;
+class Label;
 
-// Activates when a CellWorld is selected. Left dock panel (consistent with the
-// other cell_system tools) with a "Sort Into Cells" button that reparents the
-// world's loose children into their owning cells.
+// "World" bottom panel, shown while a GameWorld is selected.
+//
+// There is no "Sort Into Cells" any more: GameWorld assigns objects to cells by
+// position at runtime and never touches the hierarchy, so there is nothing to
+// sort. What is left are the operations that write files:
+//
+//   Bake World       - one file per cell + a stripped world.scn (see
+//                      GameWorld::bake_world). Saves the scene first.
+//   Clear Bake       - removes them; the scene streams from memory again.
+//   Migrate Legacy   - flattens Cell / CellWorld / DynamicObjects wrappers from
+//                      scenes made before the overhaul.
 class CellWorldEditorPlugin : public EditorPlugin {
 	GDCLASS(CellWorldEditorPlugin, EditorPlugin);
 
-	CellWorld *world = nullptr;
+	GameWorld *world = nullptr;
 	Control *dock_root = nullptr;
-	Button *sort_button = nullptr;
+	Label *status = nullptr;
 
-	void _on_sort_pressed();
+	void _on_bake_pressed();
+	void _on_clear_pressed();
+	void _on_migrate_pressed();
+	void _update_status();
 
 protected:
 	static void _bind_methods();
 
 public:
-	virtual String get_name() const { return "CellWorld"; }
+	virtual String get_name() const { return "GameWorld"; }
 	virtual bool has_main_screen() const { return false; }
 	virtual bool handles(Object *p_object) const;
 	virtual void edit(Object *p_object);

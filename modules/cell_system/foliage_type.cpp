@@ -8,7 +8,7 @@ FoliageType::FoliageType() {
 void   FoliageType::set_type_name(const String &p)  { type_name = p; }
 String FoliageType::get_type_name()  const           { return type_name; }
 
-void FoliageType::set_type(int t)  { type = (Type)CLAMP(t, 0, 2); _change_notify(); }
+void FoliageType::set_type(int t)  { type = (Type)CLAMP(t, 0, (int)TYPE_ROCK); _change_notify(); }
 int  FoliageType::get_type() const { return (int)type; }
 
 void  FoliageType::set_max_distance(bool v)     { max_distance = v; }
@@ -68,6 +68,8 @@ void  FoliageType::set_max_scale(float v)        { max_scale      = MAX(0.001f, 
 float FoliageType::get_max_scale() const         { return max_scale; }
 void  FoliageType::set_random_yaw(bool v)        { random_yaw     = v; }
 bool  FoliageType::get_random_yaw() const        { return random_yaw; }
+void  FoliageType::set_nav_obstacle_radius(float v) { nav_obstacle_radius = MAX(0.0f, v); emit_changed(); }
+float FoliageType::get_nav_obstacle_radius() const  { return nav_obstacle_radius; }
 void  FoliageType::set_align_to_normal(bool v)   { align_to_normal = v; }
 bool  FoliageType::get_align_to_normal() const   { return align_to_normal; }
 void  FoliageType::set_align_amount(float v)     { align_amount    = CLAMP(v, 0.0f, 1.0f); }
@@ -129,15 +131,19 @@ void FoliageType::_validate_property(PropertyInfo &p_property) const {
 		return;
 	}
 	if (name == "tree_scene") {
-		if (type != TYPE_TREE) p_property.usage = PROPERTY_USAGE_NOEDITOR;
+		if (type != TYPE_TREE && type != TYPE_ROCK) p_property.usage = PROPERTY_USAGE_NOEDITOR;
 		return;
 	}
 	if (name == "interactor_scene") {
 		if (type != TYPE_INTERACTOR) p_property.usage = PROPERTY_USAGE_NOEDITOR;
 		return;
 	}
+	if (name == "nav_obstacle_radius") {
+		if (type != TYPE_TREE && type != TYPE_ROCK) p_property.usage = PROPERTY_USAGE_NOEDITOR;
+		return;
+	}
 	if (name == "collision_enabled") {
-		if (type != TYPE_TREE) p_property.usage = PROPERTY_USAGE_NOEDITOR;
+		if (type != TYPE_TREE && type != TYPE_ROCK) p_property.usage = PROPERTY_USAGE_NOEDITOR;
 		return;
 	}
 	if (name == "keep_loaded") {
@@ -206,6 +212,8 @@ void FoliageType::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_y_offset_max", "v"),           &FoliageType::set_y_offset_max);
 	ClassDB::bind_method(D_METHOD("get_y_offset_max"),                &FoliageType::get_y_offset_max);
 
+	ClassDB::bind_method(D_METHOD("set_nav_obstacle_radius", "v"),   &FoliageType::set_nav_obstacle_radius);
+	ClassDB::bind_method(D_METHOD("get_nav_obstacle_radius"),        &FoliageType::get_nav_obstacle_radius);
 	ClassDB::bind_method(D_METHOD("set_collision_enabled", "v"),      &FoliageType::set_collision_enabled);
 	ClassDB::bind_method(D_METHOD("get_collision_enabled"),           &FoliageType::get_collision_enabled);
 
@@ -222,10 +230,11 @@ void FoliageType::_bind_methods() {
 	BIND_ENUM_CONSTANT(TYPE_GRASS);
 	BIND_ENUM_CONSTANT(TYPE_TREE);
 	BIND_ENUM_CONSTANT(TYPE_INTERACTOR);
+	BIND_ENUM_CONSTANT(TYPE_ROCK);
 
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "type_name"),
 			"set_type_name", "get_type_name");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "type", PROPERTY_HINT_ENUM, "Grass,Tree,Interactor"),
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "type", PROPERTY_HINT_ENUM, "Grass,Tree,Interactor,Rock"),
 			"set_type", "get_type");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "max_distance"),
 			"set_max_distance", "get_max_distance");
@@ -277,6 +286,7 @@ void FoliageType::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "y_offset_max",    PROPERTY_HINT_RANGE, "-4,4,0.01"),    "set_y_offset_max",    "get_y_offset_max");
 
 	ADD_GROUP("Collision", "collision_");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL, "nav_obstacle_radius", PROPERTY_HINT_RANGE, "0,32,0.1"), "set_nav_obstacle_radius", "get_nav_obstacle_radius");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "collision_enabled"),                                          "set_collision_enabled", "get_collision_enabled");
 
 	ADD_GROUP("Rendering", "");

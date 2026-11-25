@@ -178,6 +178,26 @@ public:
 	virtual void set_window_title(const String &p_title) = 0;
 	virtual void set_window_mouse_passthrough(const PoolVector2Array &p_region){};
 
+	// Multi-window support. Godot 3.x is single-window by construction, so these
+	// default to no-ops and only the Windows backend implements them so far.
+	enum {
+		MAIN_WINDOW_ID = 0,
+		INVALID_WINDOW_ID = -1,
+	};
+
+	virtual bool has_multiple_windows() const { return false; }
+	virtual int window_create(const String &p_title, const Rect2 &p_rect) { return INVALID_WINDOW_ID; }
+	virtual void window_destroy(int p_window) {}
+	virtual Size2 window_get_size(int p_window) const { return Size2(); }
+	// Makes the rendering context current on the given window's drawable. Must be
+	// called from the thread that owns the context (the render thread when threaded).
+	virtual void window_make_current(int p_window) {}
+	virtual void window_swap_buffers(int p_window) {}
+	// Set when the user clicks the window's close button; the owner is expected to
+	// poll this and tear the window down itself.
+	virtual bool window_get_close_requested(int p_window) const { return false; }
+	virtual void window_clear_close_request(int p_window) {}
+
 	virtual void set_clipboard(const String &p_text);
 	virtual String get_clipboard() const;
 	virtual bool has_clipboard() const;

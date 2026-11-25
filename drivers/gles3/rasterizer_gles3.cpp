@@ -337,6 +337,20 @@ void RasterizerGLES3::blit_render_target_to_screen(RID p_render_target, const Re
 	RasterizerStorageGLES3::RenderTarget *rt = storage->render_target_owner.getornull(p_render_target);
 	ERR_FAIL_COND(!rt);
 
+	// p_screen is an OS window id. Presenting into a secondary window means making the
+	// (single) rendering context current on that window's drawable for the blit only.
+	const bool secondary_window = (p_screen != OS::MAIN_WINDOW_ID);
+	Size2 dest_size;
+	if (secondary_window) {
+		dest_size = OS::get_singleton()->window_get_size(p_screen);
+		if (dest_size.width <= 0 || dest_size.height <= 0) {
+			return;
+		}
+		OS::get_singleton()->window_make_current(p_screen);
+	} else {
+		dest_size = OS::get_singleton()->get_window_size();
+	}
+
 	if (rt->flags[RasterizerStorage::RENDER_TARGET_KEEP_3D_LINEAR]) {
 		// We need to add an sRGB conversion here as we kept our buffer linear (+ a little tone mapping).
 
@@ -370,16 +384,29 @@ void RasterizerGLES3::blit_render_target_to_screen(RID p_render_target, const Re
 	} else {
 		// No conversion needed, take the faster approach
 
-		Size2 win_size = OS::get_singleton()->get_window_size();
-		if (rt->external.fbo != 0) {
-			glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->external.fbo);
-		} else {
-			glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
-		}
-		glReadBuffer(GL_COLOR_ATTACHMENT0);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, RasterizerStorageGLES3::system_fbo);
-		glBlitFramebuffer(0, 0, rt->width, rt->height, p_screen_rect.position.x, win_size.height - p_screen_rect.position.y - p_screen_rect.size.height, p_screen_rect.position.x + p_screen_rect.size.width, win_size.height - p_screen_rect.position.y, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		_blit_render_target_to_current(rt, p_screen_rect, dest_size);
 	}
+
+	if (secondary_window) {
+		OS::get_singleton()->window_swap_buffers(p_screen);
+		OS::get_singleton()->window_make_current(OS::MAIN_WINDOW_ID);
+	}
+}
+
+// Blits a render target into whatever drawable is currently current. p_dest_size is
+// the destination's height reference, since GL's origin is bottom-left.
+void RasterizerGLES3::_blit_render_target_to_current(RasterizerStorageGLES3::RenderTarget *rt, const Rect2 &p_screen_rect, const Size2 &p_dest_size) {
+	if (rt->external.fbo != 0) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->external.fbo);
+	} else {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
+	}
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, RasterizerStorageGLES3::system_fbo);
+	glBlitFramebuffer(0, 0, rt->width, rt->height,
+			p_screen_rect.position.x, p_dest_size.height - p_screen_rect.position.y - p_screen_rect.size.height,
+			p_screen_rect.position.x + p_screen_rect.size.width, p_dest_size.height - p_screen_rect.position.y,
+			GL_COLOR_BUFFER_BIT, GL_NEAREST);
 }
 
 void RasterizerGLES3::output_lens_distorted_to_screen(RID p_render_target, const Rect2 &p_screen_rect, float p_k1, float p_k2, const Vector2 &p_eye_center, float p_oversample) {

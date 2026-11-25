@@ -7,6 +7,9 @@
 #include "core/os/dir_access.h"
 #include "core/os/file_access.h"
 #include "core/os/os.h"
+#ifdef TOOLS_ENABLED
+#include "editor/editor_node.h"
+#endif
 #include "core/io/resource_saver.h"
 #include "core/io/resource_loader.h"
 #include "scene/3d/camera.h"
@@ -140,6 +143,17 @@ void CellTerrainManager::_on_layer_changed() {
 	if (is_inside_tree()) call_deferred("refresh");
 }
 
+Ref<ImageTexture> CellTerrainManager::_get_neutral_white_texture() {
+	if (_neutral_white_tex.is_null()) {
+		Ref<Image> img; img.instance();
+		img->create(4, 4, false, Image::FORMAT_RGBA8);
+		img->fill(Color(1, 1, 1, 1)); // multiplies to no change
+		_neutral_white_tex.instance();
+		_neutral_white_tex->create_from_image(img, Texture::FLAG_FILTER);
+	}
+	return _neutral_white_tex;
+}
+
 Ref<ImageTexture> CellTerrainManager::_get_neutral_normal_texture() {
 	if (_neutral_normal_tex.is_null()) {
 		Ref<Image> img; img.instance();
@@ -172,6 +186,9 @@ void CellTerrainManager::_ensure_material() {
 	// unbound (see terrain_shader.h).
 	terrain_material->set_shader_param("detail_normal_map", _get_neutral_normal_texture());
 	terrain_material->set_shader_param("detail_normal_strength", detail_normal_strength);
+	// Same reasoning: colour_map is a multiply, so it must never be left unbound.
+	// Per-cell instances override this with their own painted map.
+	terrain_material->set_shader_param("color_map", _get_neutral_white_texture());
 }
 
 PoolRealArray CellTerrainManager::_load_heights(int cx, int cz) const {
@@ -194,6 +211,43 @@ PoolRealArray CellTerrainManager::_load_nav_mask(int cx, int cz) const {
 	if (f) { for (int i = 0; i < n; i++) w[i] = f->eof_reached() ? 1.0f : f->get_float(); f->close(); memdelete(f); }
 	else { for (int i = 0; i < n; i++) w[i] = 1.0f; }
 	return m;
+}
+
+// Same file-per-cell pattern as _load_nav_mask, defaulting to 1.0 (solid)
+// — see CellTerrain::_hole_at_s.
+PoolRealArray CellTerrainManager::_load_hole_mask(int cx, int cz) const {
+	const int n = verts_per_side * verts_per_side;
+	String path = world_dir.plus_file("cell_" + itos(cx) + "_" + itos(cz) + ".holes");
+	FileAccess *f = FileAccess::open(path, FileAccess::READ);
+	// No file means nothing was ever cut out. Return EMPTY rather than an
+	// all-ones array: CellTerrain treats an empty mask as "solid everywhere"
+	// and has_holes() can then answer without scanning, which matters because
+	// _apply_collision() calls it on every cell that streams in.
+	if (!f) return PoolRealArray();
+	PoolRealArray m; m.resize(n);
+	{
+		PoolRealArray::Write w = m.write();
+		for (int i = 0; i < n; i++) w[i] = f->eof_reached() ? 1.0f : f->get_float();
+	}
+	f->close(); memdelete(f);
+	return m;
+}
+
+// Null Ref when there is no file: an unpainted tint is white, and CellTerrain
+// binds a 4x4 white texture for that case instead of carrying a full image.
+Ref<Image> CellTerrainManager::_load_color_map(int cx, int cz) const {
+	String path = world_dir.plus_file("cell_" + itos(cx) + "_" + itos(cz) + ".color.png");
+	FileAccess *f = FileAccess::open(path, FileAccess::READ);
+	if (!f) return Ref<Image>();
+	PoolByteArray bytes; bytes.resize(f->get_len());
+	{ PoolByteArray::Write w = bytes.write(); f->get_buffer(w.ptr(), bytes.size()); }
+	memdelete(f);
+	Ref<Image> img; img.instance();
+	if (img->load_png_from_buffer(bytes) == OK && img->get_width() == verts_per_side && img->get_height() == verts_per_side) {
+		if (img->get_format() != Image::FORMAT_RGBA8) img->convert(Image::FORMAT_RGBA8);
+		return img;
+	}
+	return Ref<Image>();
 }
 
 Ref<Image> CellTerrainManager::_load_splatmap(int cx, int cz, int idx) const {
@@ -265,9 +319,26 @@ bool CellTerrainManager::_save_cell(int cx, int cz) {
 			mf->close(); memdelete(mf);
 		}
 	}
+	// Only written once something was actually cut - no file means "solid",
+	// matching _load_hole_mask's default.
+	PoolRealArray holes = t->get_hole_mask();
+	if (holes.size() == h.size()) {
+		String hp = world_dir.plus_file("cell_" + itos(cx) + "_" + itos(cz) + ".holes");
+		FileAccess *hf = FileAccess::open(hp, FileAccess::WRITE);
+		if (hf) {
+			PoolRealArray::Read hr = holes.read();
+			for (int i = 0; i < holes.size(); i++) hf->store_float(hr[i]);
+			hf->close(); memdelete(hf);
+		}
+	}
 	for (int s = 0; s < 4; s++) {
 		Ref<Image> splat = t->get_splatmap(s);
 		if (splat.is_valid()) { String sp = world_dir.plus_file("cell_" + itos(cx) + "_" + itos(cz) + ".splat" + itos(s) + ".png"); splat->save_png(sp); }
+	}
+	// Same rule: an unpainted tint has no image and needs no file.
+	Ref<Image> tint = t->get_color_map();
+	if (tint.is_valid()) {
+		tint->save_png(world_dir.plus_file("cell_" + itos(cx) + "_" + itos(cz) + ".color.png"));
 	}
 	return true;
 }
@@ -287,7 +358,9 @@ CellTerrain *CellTerrainManager::_spawn_cell(int cx, int cz, int lod, bool colli
 	t->set_shader_debug_view(debug_view);
 	t->set_heights(_load_heights(cx, cz));
 	t->set_nav_mask(_load_nav_mask(cx, cz));
+	t->set_hole_mask(_load_hole_mask(cx, cz));
 	for (int s = 0; s < 4; s++) t->set_splatmap(s, _load_splatmap(cx, cz, s));
+	t->set_color_map(_load_color_map(cx, cz));
 	t->set_material(terrain_material);
 	t->set_shader_resources(albedo_texture_array, normal_texture_array, num_layers, texture_scale, height_blend_sharpness, layer_params_tex, layer_color_tex, detail_normal_strength,
 				macro_variation_color1, macro_variation_color2, macro_variation_scale);
@@ -305,11 +378,18 @@ CellTerrain *CellTerrainManager::_spawn_cell(int cx, int cz, int lod, bool colli
 
 int CellTerrainManager::_lod_for_distance(int dist) const {
 	if (dist <= load_radius) return 0;
-	int d = dist - load_radius;
-	int range = lod_radius - load_radius;
-	if (range <= 0) return 0;
-	int lod = 1 + (d * 2) / range; // spread LOD 1-3 across the range
-	return CLAMP(lod, 1, 3);
+	// One LOD step PER RING. The old mapping squeezed every ring into LOD 1-3,
+	// so with load_radius=1 / lod_radius=6 the five rings came out 1,1,2,2,3 -
+	// neighbouring rings shared a level and the detail fall-off was uneven.
+	int lod = dist - load_radius;
+
+	// Hard ceiling from the grid: each level halves the step, and a step larger
+	// than the grid has nothing left to decimate. seg=64 tops out at level 6.
+	int seg = MAX(1, verts_per_side - 1);
+	int grid_max = 0;
+	while ((1 << (grid_max + 1)) <= seg) grid_max++;
+
+	return CLAMP(lod, 1, MIN(grid_max, max_lod_level));
 }
 
 void CellTerrainManager::_update_neighbor_edges(int cx, int cz) {
@@ -350,6 +430,7 @@ void CellTerrainManager::_scan_all_cell_keys(Set<int64_t> &r_out) const {
 }
 
 void CellTerrainManager::_evaluate(int cx, int cz) {
+	uint64_t _tr = cs_trace_enabled() ? OS::get_singleton()->get_ticks_usec() : 0;
 	Set<int64_t> rebuild_set;
 
 	// Editor-only: every saved cell stays resident regardless of lod_radius, so
@@ -388,6 +469,7 @@ void CellTerrainManager::_evaluate(int cx, int cz) {
 		int x, z; _unkey(E->get(), x, z);
 		if (_dirty.has(E->get())) { _save_cell(x, z); _dirty.erase(E->get()); }
 		CellTerrain *t = _active[E->get()]; _active.erase(E->get()); t->queue_delete();
+		_recompute_again.erase(E->get());
 		rebuild_set.insert(_key(x+1,z)); rebuild_set.insert(_key(x-1,z));
 		rebuild_set.insert(_key(x,z+1)); rebuild_set.insert(_key(x,z-1));
 	}
@@ -478,804 +560,70 @@ void CellTerrainManager::_evaluate(int cx, int cz) {
 	}
 
 	// --- HLOD chunks ---
+	uint64_t _tr_hlod = cs_trace_enabled() ? OS::get_singleton()->get_ticks_usec() : 0;
 	_load_hlod_chunks(cx, cz);
+	if (_tr_hlod) cs_trace_report("_load_hlod_chunks", _tr_hlod, "chunks=" + itos(_hlod_active.size()));
 
 	_last_cx = cx; _last_cz = cz; _has_last = true;
-}
-
-// --- HLOD chunk management ---
-void CellTerrainManager::_load_hlod_chunks(int center_cx, int center_cz) {
-	int cs = hlod_chunk_size;
-	if (cs <= 0) return;
-
-	// Load every baked HLOD chunk ONCE and keep them resident forever.
-	if (!_hlod_loaded) {
-		_hlod_loaded = true;
-		DirAccess *da = DirAccess::create_for_path(world_dir);
-		if (da && da->change_dir(world_dir) == OK) {
-			da->list_dir_begin();
-			String fname = da->get_next();
-			int loaded = 0;
-			while (fname != "") {
-				if (fname.begins_with("hlod_") && fname.ends_with(".mesh")) {
-					String base = fname.get_basename();
-					Vector<String> parts = base.split("_");
-					if (parts.size() >= 3 && parts[0] == "hlod") {
-						int hx = parts[1].to_int();
-						int hz = parts[2].to_int();
-						int64_t k = _key(hx, hz);
-						if (!_hlod_active.has(k)) {
-							MeshInstance *mi = _load_hlod_chunk(hx, hz);
-							if (mi) {
-								_hlod_active[k] = mi;
-								loaded++;
-								// _hlod_dirty is in-memory only and resets on every
-								// editor restart, so a chunk that was mid-flight for
-								// an auto-rebake at the moment of a restart silently
-								// loses that flag forever even though the bake on
-								// disk is now stale. Self-heal from the filesystem
-								// instead of trusting runtime state alone: if any
-								// constituent cell's height data is newer than this
-								// chunk's bake, it's stale regardless of _hlod_dirty.
-								uint64_t bake_time = FileAccess::get_modified_time(world_dir.plus_file(fname));
-								bool stale = false;
-								for (int cz = hz * cs; cz < (hz + 1) * cs && !stale; cz++) {
-									for (int cx = hx * cs; cx < (hx + 1) * cs && !stale; cx++) {
-										String hpath = world_dir.plus_file("cell_" + itos(cx) + "_" + itos(cz) + ".heights");
-										if (FileAccess::exists(hpath) && FileAccess::get_modified_time(hpath) > bake_time) stale = true;
-									}
-								}
-								if (stale) _hlod_dirty.insert(k);
-							}
-						}
-					}
-				}
-				fname = da->get_next();
-			}
-			da->list_dir_end();
-			print_line("HLOD: loaded " + itos(loaded) + " persistent chunks.");
-		}
-		if (da) memdelete(da);
-
-		if (!_hlod_dirty.empty()) {
-			print_line("HLOD: " + itos(_hlod_dirty.size()) + " chunk(s) were stale relative to saved height data — rebaking now.");
-			rebake_dirty_hlod();
-		}
-	}
-
-	// Each call: hide a chunk only once EVERY cell it covers has actually
-	// finished streaming in, show it otherwise. Cell loading is staggered —
-	// only _max_integrate_per_frame cells integrate per frame — so hiding on
-	// *any* overlap (the previous behavior) made the whole chunk (many cells)
-	// disappear the instant its first cell finished, while the rest of that
-	// same chunk could still be several frames (or, after a big camera jump,
-	// much longer) from being ready: a real gap for that whole window, not
-	// just a one-frame flicker. Requiring full coverage keeps the chunk
-	// resident under the cells that HAVE loaded — hlod_height_offset already
-	// pushes it below them, so the depth test hides the overlap there — and
-	// only drops it once nothing underneath still needs it to fill in.
-	// A chunk straddling the edge of lod_radius (partially covered forever,
-	// by design) simply never hides, staying as a hidden-by-depth floor under
-	// whatever of it did load. Nothing ever unloads — only visibility toggles.
-	for (Map<int64_t, MeshInstance *>::Element *E = _hlod_active.front(); E; E = E->next()) {
-		int hx, hz; _unkey(E->key(), hx, hz);
-		bool fully_covered = true;
-		for (int cz = hz * cs; cz < (hz + 1) * cs && fully_covered; cz++)
-			for (int cx = hx * cs; cx < (hx + 1) * cs && fully_covered; cx++)
-				if (!_active.has(_key(cx, cz))) fully_covered = false;
-		E->value()->set_visible(!fully_covered);
+	if (_tr) {
+		cs_trace_report("_evaluate", _tr, "rebuild_set=" + itos(rebuild_set.size()) +
+				" active=" + itos(_active.size()) + " loading=" + itos(_loading.size()));
 	}
 }
 
-MeshInstance *CellTerrainManager::_load_hlod_chunk(int chunk_x, int chunk_z) {
-	String mesh_path = world_dir.plus_file("hlod_" + itos(chunk_x) + "_" + itos(chunk_z) + ".mesh");
-	if (!FileAccess::exists(mesh_path)) return nullptr;
+// --- Opt-in editor/runtime tracing -------------------------------------------
+// Set TUNA_CELL_TRACE=1 to log any cell_system call that exceeds the
+// threshold (TUNA_CELL_TRACE_MS, default 30ms). Off by default and costs one
+// already-cached bool when disabled, so it can live in the shipping build —
+// the alternative, driving the editor GUI to reproduce, is off the table.
+static int _cs_trace_state = -1; // -1 = not yet resolved from the environment
 
-	Ref<Mesh> mesh = ResourceLoader::load(mesh_path, "Mesh");
-	if (mesh.is_null()) return nullptr;
-
-	MeshInstance *mi = memnew(MeshInstance);
-	mi->set_mesh(mesh);
-
-	_ensure_material();
-
-	// Build a fresh ShaderMaterial for this chunk and bind ALL params explicitly.
-	// (Material::duplicate() does not reliably carry the TextureArray params in 3.5.)
-	Ref<ShaderMaterial> mat;
-	mat.instance();
-	mat->set_shader(terrain_shader);
-	if (albedo_texture_array.is_valid()) mat->set_shader_param("albedo_arr", albedo_texture_array);
-	if (normal_texture_array.is_valid()) mat->set_shader_param("normal_arr", normal_texture_array);
-	mat->set_shader_param("num_layers", num_layers);
-	mat->set_shader_param("height_blend_sharpness", height_blend_sharpness);
-	mat->set_shader_param("layer_params", layer_params_tex);
-	mat->set_shader_param("layer_color", layer_color_tex);
-	mat->set_shader_param("macro_variation_color1", macro_variation_color1);
-	mat->set_shader_param("macro_variation_color2", macro_variation_color2);
-	mat->set_shader_param("macro_variation_scale", macro_variation_scale);
-	mat->set_shader_param("parallax_max_distance", parallax_max_distance);
-	mat->set_shader_param("debug_view", debug_view);
-	// HLOD chunks don't bake their own detail normal map (they're already the
-	// most decimated representation) — bind the flat/neutral placeholder so the
-	// shader's sampler is never left unbound.
-	mat->set_shader_param("detail_normal_map", _get_neutral_normal_texture());
-
-	// HLOD UVs span the whole chunk (0..1). Scale tiling by the number of cells
-	// so the albedo tiles at the same density as the detailed cells.
-	mat->set_shader_param("texture_scale", texture_scale * (float)hlod_chunk_size);
-
-	// Baked per-chunk splatmaps.
-	for (int s = 0; s < 4; s++) {
-		String sp = world_dir.plus_file("hlod_" + itos(chunk_x) + "_" + itos(chunk_z) + ".splat" + itos(s) + ".png");
-		Ref<ImageTexture> tex;
-		FileAccess *_hfa = FileAccess::open(sp, FileAccess::READ);
-		if (_hfa) {
-			PoolByteArray _hlod_bytes; _hlod_bytes.resize(_hfa->get_len());
-			{ PoolByteArray::Write w = _hlod_bytes.write(); _hfa->get_buffer(w.ptr(), _hlod_bytes.size()); }
-			memdelete(_hfa);
-			Ref<Image> img; img.instance();
-			if (img->load_png_from_buffer(_hlod_bytes) == OK) {
-				tex.instance();
-				tex->create_from_image(img, Texture::FLAG_FILTER);
-			}
-		}
-		if (tex.is_null()) {
-			// Default: splat0 = full layer 0, others zero.
-			Ref<Image> img; img.instance();
-			img->create(4, 4, false, Image::FORMAT_RGBA8);
-			img->fill(s == 0 ? Color(1, 0, 0, 0) : Color(0, 0, 0, 0));
-			tex.instance();
-			tex->create_from_image(img, Texture::FLAG_FILTER);
-		}
-		mat->set_shader_param("splatmap" + itos(s), tex);
+bool cs_trace_enabled() {
+	if (_cs_trace_state < 0) {
+		_cs_trace_state = OS::get_singleton()->get_environment("TUNA_CELL_TRACE") == "1" ? 1 : 0;
 	}
-	mi->set_surface_material(0, mat);
-
-	add_child(mi);
-	Transform xf;
-	xf.origin = Vector3(chunk_x * hlod_chunk_size * cell_size, hlod_height_offset, chunk_z * hlod_chunk_size * cell_size);
-	mi->set_transform(xf);
-	return mi;
+	return _cs_trace_state == 1;
 }
 
-// --- HLOD baking ---
-void CellTerrainManager::bake_hlod() {
-	print_line("HLOD bake: scanning directory '" + world_dir + "'");
-
-	DirAccess *da = DirAccess::create_for_path(world_dir);
-	if (!da) {
-		print_line("HLOD bake ERROR: could not open DirAccess for '" + world_dir + "'");
-		return;
+void cs_trace_set_enabled(bool p_enabled) {
+	_cs_trace_state = p_enabled ? 1 : 0;
+}
+uint64_t cs_trace_threshold_usec() {
+	static uint64_t cached = 0;
+	if (cached == 0) {
+		String v = OS::get_singleton()->get_environment("TUNA_CELL_TRACE_MS");
+		int ms = v.empty() ? 30 : v.to_int();
+		cached = (uint64_t)MAX(1, ms) * 1000;
 	}
-	if (da->change_dir(world_dir) != OK) {
-		print_line("HLOD bake ERROR: directory does not exist: '" + world_dir + "'");
-		memdelete(da);
-		return;
-	}
-	da->make_dir_recursive(world_dir);
-
-	// Scan for existing cells to determine world bounds.
-	Set<int64_t> cell_set;
-	da->list_dir_begin();
-	String fname = da->get_next();
-	int file_count = 0;
-	while (fname != "") {
-		file_count++;
-		if (fname.ends_with(".heights")) {
-			String base = fname.get_basename(); // cell_X_Z
-			Vector<String> parts = base.split("_");
-			if (parts.size() >= 3 && parts[0] == "cell") {
-				int cx = parts[1].to_int();
-				int cz = parts[2].to_int();
-				cell_set.insert(_key(cx, cz));
-			}
-		}
-		fname = da->get_next();
-	}
-	da->list_dir_end();
-	memdelete(da);
-
-	print_line("HLOD bake: found " + itos(file_count) + " files total, " + itos(cell_set.size()) + " heightmap cells.");
-
-	if (cell_set.size() == 0) {
-		print_line("HLOD bake: no .heights files found. Have you painted/sculpted and does world_dir match where cells are saved?");
-		return;
-	}
-
-	// Determine which chunks need baking.
-	Set<int64_t> chunks;
-	for (Set<int64_t>::Element *E = cell_set.front(); E; E = E->next()) {
-		int cx, cz; _unkey(E->get(), cx, cz);
-		int hx = (cx >= 0) ? cx / hlod_chunk_size : (cx - hlod_chunk_size + 1) / hlod_chunk_size;
-		int hz = (cz >= 0) ? cz / hlod_chunk_size : (cz - hlod_chunk_size + 1) / hlod_chunk_size;
-		chunks.insert(_key(hx, hz));
-	}
-
-	for (Set<int64_t>::Element *E = chunks.front(); E; E = E->next()) {
-		int hx, hz; _unkey(E->get(), hx, hz);
-		bake_hlod_chunk(hx, hz);
-	}
-	print_line("HLOD bake complete: " + itos(chunks.size()) + " chunks.");
-
-	// Drop and reload the resident HLOD so freshly baked chunks appear now.
-	for (Map<int64_t, MeshInstance *>::Element *E = _hlod_active.front(); E; E = E->next())
-		E->value()->queue_delete();
-	_hlod_active.clear();
-	_hlod_loaded = false;
-	_hlod_dirty.clear(); // everything is freshly baked
-	_load_hlod_chunks(_last_cx, _last_cz);
+	return cached;
+}
+void cs_trace_report(const char *p_what, uint64_t p_start_usec, const String &p_extra) {
+	uint64_t el = OS::get_singleton()->get_ticks_usec() - p_start_usec;
+	if (el < cs_trace_threshold_usec()) return;
+	print_line(String("[cell-trace] ") + p_what + " " + rtos(el / 1000.0) + "ms" +
+			(p_extra.empty() ? String() : " " + p_extra));
 }
 
-void CellTerrainManager::clear_hlod() {
-	// Remove the resident chunk instances from the scene.
-	for (Map<int64_t, MeshInstance *>::Element *E = _hlod_active.front(); E; E = E->next())
-		E->value()->queue_delete();
-	_hlod_active.clear();
-	_hlod_loaded = false;
-	_hlod_dirty.clear();
-
-	// Delete every baked HLOD file (hlod_*.mesh and hlod_*.splat*.png) from disk.
-	DirAccess *da = DirAccess::create_for_path(world_dir);
-	if (!da || da->change_dir(world_dir) != OK) {
-		if (da) memdelete(da);
-		print_line("HLOD clear: no world_dir to scan ('" + world_dir + "').");
-		return;
-	}
-
-	Vector<String> to_delete;
-	da->list_dir_begin();
-	String fname = da->get_next();
-	while (fname != "") {
-		if (!da->current_is_dir() && fname.begins_with("hlod_")
-				&& (fname.ends_with(".mesh") || fname.ends_with(".png"))) {
-			to_delete.push_back(fname);
-		}
-		fname = da->get_next();
-	}
-	da->list_dir_end();
-
-	int removed = 0;
-	for (int i = 0; i < to_delete.size(); i++) {
-		if (da->remove(world_dir.plus_file(to_delete[i])) == OK) removed++;
-	}
-	memdelete(da);
-
-	print_line("HLOD clear: deleted " + itos(removed) + " files.");
+void CellTerrainManager::set_streaming_enabled(bool e) {
+	if (streaming_enabled == e) return;
+	streaming_enabled = e;
+	set_visible(e);
+	if (!e && is_inside_tree()) editor_clear();
 }
 
-void CellTerrainManager::_release_baked_navmesh(int64_t key) {
-	Map<int64_t, RID>::Element *E = _baked_nav_regions.find(key);
-	if (!E) return;
-	NavigationServer::get_singleton()->free(E->get());
-	_baked_nav_regions.erase(key);
+bool CellTerrainManager::has_collision_at_world(const Vector3 &p_world_pos) const {
+	CellTerrain *c = get_cell_at_world(p_world_pos);
+	return c && c->has_collision_ready();
 }
 
-void CellTerrainManager::bake_navmesh() {
-	clear_baked_navmesh();
-	if (!enable_navmesh) {
-		print_line("Navmesh bake: enable_navmesh is off, nothing to bake.");
-		return;
-	}
-
-	Set<int64_t> all;
-	_scan_all_cell_keys(all);
-
-	Ref<World> w = get_world();
-	const NavigationServer *ns = NavigationServer::get_singleton();
-	Transform base_xf = get_global_transform();
-	int baked = 0, skipped_active = 0;
-
-	for (Set<int64_t>::Element *E = all.front(); E; E = E->next()) {
-		int64_t key = E->get();
-		// Already covered by its own live navmesh region — baking here too
-		// would just double-register the same walkable area.
-		if (_active.has(key)) { skipped_active++; continue; }
-
-		int cx, cz; _unkey(key, cx, cz);
-
-		CellTerrain::ComputeInput in;
-		in.heights = _load_heights(cx, cz);
-		if (in.heights.size() != verts_per_side * verts_per_side) continue;
-		in.nav_mask = _load_nav_mask(cx, cz);
-		_load_neighbor_edges_from_disk(cx, cz, in.edge_n, in.edge_s, in.edge_e, in.edge_w);
-		in.verts_per_side = verts_per_side;
-		in.cell_size = cell_size;
-		in.height_scale = height_scale;
-		in.lod_level = bake_navmesh_lod;
-		in.nav_max_slope_deg = nav_max_slope_deg;
-		in.nav_downsample = nav_downsample;
-
-		CellTerrain::ComputedData data = CellTerrain::compute(in);
-		if (data.nav_vertices.size() == 0 || data.nav_polygons.empty()) continue;
-
-		Ref<NavigationMesh> navmesh;
-		navmesh.instance();
-		navmesh->set_vertices(data.nav_vertices);
-		for (int i = 0; i < data.nav_polygons.size(); i++) navmesh->add_polygon(data.nav_polygons[i]);
-
-		RID region = ns->region_create();
-		ns->region_set_navmesh(region, navmesh);
-		Transform cell_xf;
-		cell_xf.origin = Vector3(cx * cell_size, 0.0f, cz * cell_size);
-		ns->region_set_transform(region, base_xf * cell_xf);
-		if (w.is_valid()) ns->region_set_map(region, w->get_navigation_map());
-
-		_baked_nav_regions[key] = region;
-		baked++;
-	}
-
-	print_line("Navmesh bake: " + itos(baked) + " region(s) baked, " + itos(skipped_active) + " active cell(s) skipped (already live).");
-}
-
-void CellTerrainManager::clear_baked_navmesh() {
-	const NavigationServer *ns = NavigationServer::get_singleton();
-	for (Map<int64_t, RID>::Element *E = _baked_nav_regions.front(); E; E = E->next()) {
-		ns->free(E->value());
-	}
-	_baked_nav_regions.clear();
-}
-
-void CellTerrainManager::set_bake_navmesh_lod(int l) { bake_navmesh_lod = CLAMP(l, 0, 3); }
-
-void CellTerrainManager::bake_hlod_chunk(int chunk_x, int chunk_z) {
-	int cs = hlod_chunk_size;
-	int vps = verts_per_side;
-	float full_spacing = cell_size / (float)(vps - 1);
-
-	// HLOD resolution: 2 verts per cell edge = smooth enough for distance.
-	int hlod_step = (vps - 1) / 2; // step through each cell's heightmap
-	if (hlod_step < 1) hlod_step = 1;
-	int cell_lod_vps = (vps - 1) / hlod_step + 1; // verts per cell at HLOD
-	int chunk_vps = (cell_lod_vps - 1) * cs + 1;   // total verts per chunk side
-
-	float chunk_world_size = cs * cell_size;
-
-	PoolVector3Array vertices; vertices.resize(chunk_vps * chunk_vps);
-	PoolVector3Array normals;  normals.resize(chunk_vps * chunk_vps);
-	PoolVector2Array uvs;      uvs.resize(chunk_vps * chunk_vps);
-	PoolRealArray    tangents; tangents.resize(chunk_vps * chunk_vps * 4);
-
-	{
-		PoolVector3Array::Write vw = vertices.write();
-		PoolVector3Array::Write nw = normals.write();
-		PoolVector2Array::Write uw = uvs.write();
-		PoolRealArray::Write    tw = tangents.write();
-
-		for (int gz = 0; gz < chunk_vps; gz++) {
-			for (int gx = 0; gx < chunk_vps; gx++) {
-				int i = gz * chunk_vps + gx;
-				// Which cell and local position does this vertex belong to?
-				int cell_lx = gx / (cell_lod_vps - 1);
-				int local_x = gx % (cell_lod_vps - 1);
-				int cell_lz = gz / (cell_lod_vps - 1);
-				int local_z = gz % (cell_lod_vps - 1);
-				// Clamp to last cell.
-				if (cell_lx >= cs) { cell_lx = cs - 1; local_x = cell_lod_vps - 1; }
-				if (cell_lz >= cs) { cell_lz = cs - 1; local_z = cell_lod_vps - 1; }
-
-				int cx = chunk_x * cs + cell_lx;
-				int cz = chunk_z * cs + cell_lz;
-				int hx = local_x * hlod_step;
-				int hz = local_z * hlod_step;
-
-				// Load height from cell.
-				float height = 0.0f;
-				String hpath = world_dir.plus_file("cell_" + itos(cx) + "_" + itos(cz) + ".heights");
-				if (FileAccess::exists(hpath)) {
-					FileAccess *f = FileAccess::open(hpath, FileAccess::READ);
-					if (f) {
-						int idx = CLAMP(hz, 0, vps-1) * vps + CLAMP(hx, 0, vps-1);
-						f->seek(idx * sizeof(float));
-						height = f->get_float() * height_scale;
-						f->close(); memdelete(f);
-					}
-				}
-
-				float wx = (cell_lx * cell_size) + hx * full_spacing;
-				float wz = (cell_lz * cell_size) + hz * full_spacing;
-				vw[i] = Vector3(wx, height, wz);
-				nw[i] = Vector3(0, 1, 0); // approximate; flat normal for HLOD
-				uw[i] = Vector2(wx / chunk_world_size, wz / chunk_world_size);
-				// Flat normal -> constant tangent. Without tangents the shader's
-				// NORMALMAP has no TBN basis and the chunk lights up black.
-				// Matches the detailed cell convention: T=(1,0,0), handedness=-1.
-				tw[i*4+0] = 1.0f; tw[i*4+1] = 0.0f; tw[i*4+2] = 0.0f; tw[i*4+3] = -1.0f;
-			}
-		}
-	}
-
-	// Indices.
-	int quad_count = (chunk_vps - 1) * (chunk_vps - 1);
-	PoolIntArray indices; indices.resize(quad_count * 6);
-	{
-		PoolIntArray::Write iw = indices.write();
-		int t = 0;
-		for (int gz = 0; gz < chunk_vps - 1; gz++) {
-			for (int gx = 0; gx < chunk_vps - 1; gx++) {
-				int i0 = gz * chunk_vps + gx, i1 = i0 + 1;
-				int i2 = i0 + chunk_vps, i3 = i2 + 1;
-				iw[t++] = i0; iw[t++] = i1; iw[t++] = i2;
-				iw[t++] = i1; iw[t++] = i3; iw[t++] = i2;
-			}
-		}
-	}
-
-	Array arrays; arrays.resize(Mesh::ARRAY_MAX);
-	arrays[Mesh::ARRAY_VERTEX]  = vertices;
-	arrays[Mesh::ARRAY_NORMAL]  = normals;
-	arrays[Mesh::ARRAY_TANGENT] = tangents;
-	arrays[Mesh::ARRAY_TEX_UV]  = uvs;
-	arrays[Mesh::ARRAY_INDEX]   = indices;
-
-	Ref<ArrayMesh> mesh; mesh.instance();
-	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
-
-	String mesh_path = world_dir.plus_file("hlod_" + itos(chunk_x) + "_" + itos(chunk_z) + ".mesh");
-	ResourceSaver::save(mesh_path, mesh);
-
-	// Bake combined splatmaps: composite the cell splatmaps into one per chunk.
-	int splat_res = cs * 16; // 16 px per cell in the baked splatmap
-	for (int s = 0; s < 4; s++) {
-		Ref<Image> combined; combined.instance();
-		combined->create(splat_res, splat_res, false, Image::FORMAT_RGBA8);
-		combined->fill(s == 0 ? Color(1, 0, 0, 0) : Color(0, 0, 0, 0));
-		combined->lock();
-
-		for (int cell_z = 0; cell_z < cs; cell_z++) {
-			for (int cell_x = 0; cell_x < cs; cell_x++) {
-				int cx = chunk_x * cs + cell_x;
-				int cz = chunk_z * cs + cell_z;
-				Ref<Image> src = _load_splatmap(cx, cz, s);
-				if (src.is_null()) continue;
-				src->lock();
-				int px_per_cell = splat_res / cs;
-				for (int py = 0; py < px_per_cell; py++) {
-					for (int px = 0; px < px_per_cell; px++) {
-						float u = (float)px / px_per_cell;
-						float v = (float)py / px_per_cell;
-						int sx = CLAMP((int)(u * src->get_width()), 0, src->get_width() - 1);
-						int sy = CLAMP((int)(v * src->get_height()), 0, src->get_height() - 1);
-						Color c = src->get_pixel(sx, sy);
-						combined->set_pixel(cell_x * px_per_cell + px, cell_z * px_per_cell + py, c);
-					}
-				}
-				src->unlock();
-			}
-		}
-		combined->unlock();
-		String sp = world_dir.plus_file("hlod_" + itos(chunk_x) + "_" + itos(chunk_z) + ".splat" + itos(s) + ".png");
-		combined->save_png(sp);
-	}
-}
-
-// ---- async loading helpers ----
-
-void CellTerrainManager::_load_worker(void *p_self) {
-	CellTerrainManager *self = (CellTerrainManager *)p_self;
-	while (true) {
-		self->_load_sem.wait();
-		if (self->_thread_exit) break;
-
-		self->_load_mutex.lock();
-		PendingLoad *job = nullptr;
-		if (!self->_load_queue.empty()) {
-			job = self->_load_queue.front()->get();
-			self->_load_queue.pop_front();
-		}
-		self->_load_mutex.unlock();
-
-		if (!job) continue;
-
-		CellTerrain::ComputeInput in;
-
-		if (job->is_recompute) {
-			// Already-active cell re-stitching after a neighbor/LOD change —
-			// the main thread already filled these in from the live cell's
-			// current state (see _submit_recompute), so there's no disk I/O
-			// to do here at all.
-			in.edge_n = job->edge_n; in.edge_s = job->edge_s; in.edge_e = job->edge_e; in.edge_w = job->edge_w;
-		} else {
-			// File I/O and PNG decode: no Godot scene-tree involvement, safe off-thread.
-			// _load_heights/_load_splatmap only read world_dir and verts_per_side, which
-			// never change during gameplay.
-			job->heights = self->_load_heights(job->cx, job->cz);
-			job->nav_mask = self->_load_nav_mask(job->cx, job->cz);
-			for (int s = 0; s < 4; s++) {
-				job->splatmaps[s] = self->_load_splatmap(job->cx, job->cz, s);
-			}
-			// Neighbor edges for stitching come from their saved .heights files
-			// (not live nodes, which aren't safe to touch off the main thread) —
-			// a best-effort match for the common case, corrected reactively via
-			// a _submit_recompute of this cell if a neighbor's live state has
-			// since drifted (see the neighbor loop in _integrate_ready()).
-			self->_load_neighbor_edges_from_disk(job->cx, job->cz, in.edge_n, in.edge_s, in.edge_e, in.edge_w);
-		}
-
-		// Precompute mesh/navmesh/detail-normal-map arrays here too — pure CPU
-		// math (see CellTerrain::compute()), no VisualServer/NavigationServer
-		// touch, so it's just as safe off-thread as the I/O above.
-		in.heights = job->heights;
-		in.nav_mask = job->nav_mask;
-		in.verts_per_side = self->verts_per_side;
-		in.cell_size = self->cell_size;
-		in.height_scale = self->height_scale;
-		in.lod_level = job->lod;
-		in.nav_max_slope_deg = self->nav_max_slope_deg;
-		in.nav_downsample = self->nav_downsample;
-		job->computed = CellTerrain::compute(in);
-
-		self->_load_mutex.lock();
-		self->_ready_queue.push_back(job);
-		self->_load_mutex.unlock();
-	}
-}
-
-void CellTerrainManager::_submit_load(int cx, int cz, int lod, bool collision) {
-	_loading.insert(_key(cx, cz));
-	PendingLoad *job = memnew(PendingLoad);
-	job->cx = cx; job->cz = cz; job->lod = lod; job->collision = collision;
-	_load_mutex.lock();
-	_load_queue.push_back(job);
-	_load_mutex.unlock();
-	_load_sem.post();
-}
-
-void CellTerrainManager::_submit_recompute(int cx, int cz, bool p_update_collision) {
-	int64_t k = _key(cx, cz);
-	if (!_active.has(k) || _recomputing.has(k)) return;
-	CellTerrain *cell = _active[k];
-
-	PendingLoad *job = memnew(PendingLoad);
-	job->cx = cx; job->cz = cz;
-	job->lod = cell->get_lod_level();
-	job->collision = cell->get_enable_collision();
-	job->is_recompute = true;
-	job->update_collision = p_update_collision;
-	job->target = cell;
-
-	// Cheap (COW array copies), main thread only — no disk I/O, unlike a
-	// fresh _submit_load. The worker just runs CellTerrain::compute() on this
-	// exact snapshot instead of re-deriving it from disk.
-	CellTerrain::ComputeInput in = cell->get_compute_input();
-	job->heights = in.heights;
-	job->nav_mask = in.nav_mask;
-	job->edge_n = in.edge_n; job->edge_s = in.edge_s; job->edge_e = in.edge_e; job->edge_w = in.edge_w;
-	for (int s = 0; s < 4; s++) job->splatmaps[s] = cell->get_splatmap(s);
-
-	_recomputing.insert(k);
-	_load_mutex.lock();
-	_load_queue.push_back(job);
-	_load_mutex.unlock();
-	_load_sem.post();
-}
-
-CellTerrain *CellTerrainManager::_create_cell_from_data(int cx, int cz, int lod, bool collision,
-		const PoolRealArray &heights, const PoolRealArray &nav_mask, Ref<Image> *p_splatmaps) {
-	_ensure_material();
-	CellTerrain *t = memnew(CellTerrain);
-	t->set_verts_per_side(verts_per_side);
-	t->set_cell_size(cell_size);
-	t->set_height_scale(height_scale);
-	t->set_lod_level(lod);
-	t->set_enable_collision(collision);
-	t->set_enable_navmesh(collision && enable_navmesh);
-	t->set_nav_max_slope_deg(nav_max_slope_deg);
-	t->set_nav_downsample(nav_downsample);
-	t->set_shader_parallax_max_distance(parallax_max_distance);
-	t->set_shader_debug_view(debug_view);
-	t->set_heights(heights);
-	t->set_nav_mask(nav_mask);
-	for (int s = 0; s < 4; s++) t->set_splatmap(s, p_splatmaps[s]);
-	t->set_material(terrain_material);
-	t->set_shader_resources(albedo_texture_array, normal_texture_array,
-			num_layers, texture_scale, height_blend_sharpness, layer_params_tex, layer_color_tex, detail_normal_strength,
-				macro_variation_color1, macro_variation_color2, macro_variation_scale);
-	if (_debug_normals) t->set_debug_normals(true, _debug_normal_length);
-	if (_debug_navmesh) t->set_debug_navmesh(true);
-	// The caller (_integrate_ready) already has this cell's mesh/nav/normal-map
-	// precomputed and applies it explicitly right after add_child() below —
-	// suppress the implicit rebuild() add_child() would otherwise trigger via
-	// NOTIFICATION_READY so that work doesn't happen twice.
-	t->set_skip_ready_rebuild(true);
-	add_child(t);
-	Transform xf;
-	xf.origin = Vector3(cx * cell_size, 0.0f, cz * cell_size);
-	t->set_transform(xf);
-	return t;
-}
-
-void CellTerrainManager::_integrate_ready() {
-	static const int dx[4] = { 1, -1, 0, 0 };
-	static const int dz[4] = { 0, 0, 1, -1 };
-
-	uint64_t start_usec = OS::get_singleton()->get_ticks_usec();
-	uint64_t budget_usec = (uint64_t)(integrate_budget_ms * 1000.0f);
-
-	for (int i = 0; i < _max_integrate_admission; i++) {
-		// Time-budgeted, not count-budgeted: a job's real cost varies by ~2
-		// orders of magnitude (a pure edge-restitch recompute is sub-ms; a
-		// brand-new collision-bearing cell is tens of ms), so a fixed count
-		// cap can't stop two expensive ones landing in the same frame. Always
-		// let at least one job through so the queue can't stall outright if a
-		// single job legitimately costs more than the budget.
-		if (i > 0 && (OS::get_singleton()->get_ticks_usec() - start_usec) >= budget_usec) break;
-
-		_load_mutex.lock();
-		PendingLoad *job = nullptr;
-		if (!_ready_queue.empty()) {
-			job = _ready_queue.front()->get();
-			_ready_queue.pop_front();
-		}
-		_load_mutex.unlock();
-		if (!job) break;
-
-		int64_t k = _key(job->cx, job->cz);
-
-		if (job->is_recompute) {
-			// Just re-applies already-precomputed data to a cell that was (and
-			// still is) active — no new-cell setup, no add_child, nothing else.
-			// Guard against the (removed then re-created between submission and
-			// now) case by checking it's still the SAME instance, not just the
-			// same map key.
-			_recomputing.erase(k);
-			if (_active.has(k) && _active[k] == job->target) _active[k]->apply_computed(job->computed, job->update_collision);
-			memdelete(job);
-			continue;
-		}
-
-		_loading.erase(k);
-
-		// Discard if the player has since moved out of range or the cell loaded another way.
-		bool still_needed = _has_last
-				&& !_active.has(k)
-				&& ABS(job->cx - _last_cx) <= lod_radius
-				&& ABS(job->cz - _last_cz) <= lod_radius;
-
-		if (still_needed) {
-			CellTerrain *t = _create_cell_from_data(
-					job->cx, job->cz, job->lod, job->collision,
-					job->heights, job->nav_mask, job->splatmaps);
-			_active[k] = t;
-			_release_baked_navmesh(k);
-
-			// Record this cell's own edges from its now-active neighbors (for
-			// any FUTURE rebuild, e.g. live sculpting) — the mesh/nav/normal-
-			// map already applied below were precomputed off-thread using
-			// those same neighbors' saved height files, which match in the
-			// common case (see _load_worker).
-			_update_neighbor_edges(job->cx, job->cz);
-			t->apply_computed(job->computed);
-			t->set_skip_ready_rebuild(false);
-			// This cell (and the mesh/collision/debug-view children apply_computed()
-			// just created) is being positioned/populated for the very first time —
-			// without this, physics interpolation (which the game relies on and
-			// stays ON everywhere, including here) blends from whatever stale/
-			// zeroed transform history a brand-new node starts with, causing a
-			// visible flicker on the frame it appears. This snaps that history to
-			// the current transform instead of turning interpolation off.
-			t->reset_physics_interpolation();
-			for (int d = 0; d < 4; d++) {
-				int64_t nk = _key(job->cx + dx[d], job->cz + dz[d]);
-				if (_active.has(nk)) {
-					_update_neighbor_edges(job->cx + dx[d], job->cz + dz[d]);
-					// Off the main thread (see _submit_recompute) — a direct
-					// ->rebuild() here would re-block it on every single cell
-					// integration, exactly the freeze this async loader exists
-					// to avoid. update_collision=false: only this neighbor's
-					// EDGE data changed (for mesh/navmesh stitching) — its own
-					// heights and enable_collision are untouched, so rebuilding
-					// its HeightMapShape here would be pure waste (and by far
-					// the most expensive part, measured when this was diagnosed).
-					_submit_recompute(job->cx + dx[d], job->cz + dz[d], false);
-				}
-			}
-		}
-		memdelete(job);
-	}
-}
-
-void CellTerrainManager::_preload_if_needed(int x, int z, int lod, bool collision) {
-	int64_t k = _key(x, z);
-	if (_active.has(k) || _loading.has(k) || !_thread_running) return;
-	_submit_load(x, z, lod, collision);
-}
-
-void CellTerrainManager::_preload_border(int cx, int cz, float fx, float fz, float margin) {
-	int dx = 0, dz = 0;
-	if (fx < margin) dx = -1; else if (fx > 1.0f - margin) dx = 1;
-	if (fz < margin) dz = -1; else if (fz > 1.0f - margin) dz = 1;
-	if (dx == 0 && dz == 0) return;
-
-	// The row/column of cells that would newly enter the streaming radius
-	// after crossing in this direction — same shape _evaluate()'s own sweep
-	// would produce, just one step ahead of actually needing it, so the
-	// (measured-expensive) first-time collision-shape build happens during
-	// the frames spent approaching instead of bursting the whole new
-	// row/column at once exactly when the reference cell changes.
-	if (dx != 0) {
-		int x = cx + dx * (lod_radius + 1);
-		for (int z = cz - lod_radius; z <= cz + lod_radius; z++) {
-			int dist = MAX(ABS(x - cx), ABS(z - cz));
-			_preload_if_needed(x, z, _lod_for_distance(dist), dist <= load_radius);
-		}
-	}
-	if (dz != 0) {
-		int z = cz + dz * (lod_radius + 1);
-		for (int x = cx - lod_radius; x <= cx + lod_radius; x++) {
-			int dist = MAX(ABS(x - cx), ABS(z - cz));
-			_preload_if_needed(x, z, _lod_for_distance(dist), dist <= load_radius);
-		}
-	}
-	if (dx != 0 && dz != 0) {
-		int x = cx + dx * (lod_radius + 1);
-		int z = cz + dz * (lod_radius + 1);
-		int dist = lod_radius + 1;
-		_preload_if_needed(x, z, _lod_for_distance(dist), dist <= load_radius);
-	}
-}
-
-void CellTerrainManager::_preload_collision_upgrade(int cx, int cz, float fx, float fz, float margin) {
-	int dx = 0, dz = 0;
-	if (fx < margin) dx = -1; else if (fx > 1.0f - margin) dx = 1;
-	if (fz < margin) dz = -1; else if (fz > 1.0f - margin) dz = 1;
-	if (dx == 0 && dz == 0) return;
-
-	// The lod-tier cell that would newly become a collision cell once the
-	// player actually crosses in this direction — same "dist <= load_radius"
-	// test _evaluate() makes, one step ahead. Only touches cells that are
-	// already active render-only cells; a not-yet-active cell is handled by
-	// _preload_border above (loaded with the right collision flag from the
-	// start once it's actually created).
-	int upgrade_lod = _lod_for_distance(load_radius);
-	auto try_upgrade = [&](int x, int z) {
-		int64_t k = _key(x, z);
-		if (!_active.has(k) || _recomputing.has(k)) return;
-		CellTerrain *cell = _active[k];
-		if (cell->get_enable_collision()) return;
-		cell->set_lod_level(upgrade_lod);
-		cell->set_enable_collision(true);
-		cell->set_enable_navmesh(enable_navmesh);
-		_submit_recompute(x, z, true);
-	};
-	if (dx != 0) {
-		int x = cx + dx * (load_radius + 1);
-		for (int z = cz - load_radius; z <= cz + load_radius; z++) try_upgrade(x, z);
-	}
-	if (dz != 0) {
-		int z = cz + dz * (load_radius + 1);
-		for (int x = cx - load_radius; x <= cx + load_radius; x++) try_upgrade(x, z);
-	}
-	if (dx != 0 && dz != 0) {
-		try_upgrade(cx + dx * (load_radius + 1), cz + dz * (load_radius + 1));
-	}
-}
-
-float CellTerrainManager::_estimate_speed(const Vector3 &world_pos) {
-	uint64_t now_usec = OS::get_singleton()->get_ticks_usec();
-	if (_has_last_stream_pos) {
-		float dt = (now_usec - _last_stream_time_usec) / 1000000.0f;
-		// Only NORMAL frame times produce a usable sample. A hitch frame is
-		// exactly the case that must be thrown away, not measured: during a
-		// 300-500ms stall the target legitimately covers a lot of ground, so
-		// distance/dt reads as a huge speed, which widens the preload margin,
-		// which promotes more cells to collision at once, which causes the
-		// next stall — a feedback loop that makes spikes grow instead of
-		// shrink. Out-of-range dt re-anchors the tracker and leaves the
-		// smoothed speed alone rather than poisoning it.
-		if (dt > 0.002f && dt < 0.1f) {
-			float sample = MIN(world_pos.distance_to(_last_stream_pos) / dt, 40.0f);
-			// Exponential smoothing so no single frame can swing the margin.
-			_smoothed_speed = _has_smoothed_speed ? (_smoothed_speed * 0.8f + sample * 0.2f) : sample;
-			_has_smoothed_speed = true;
-		}
-	}
-	_last_stream_pos = world_pos;
-	_last_stream_time_usec = now_usec;
-	_has_last_stream_pos = true;
-	return _has_smoothed_speed ? _smoothed_speed : 0.0f;
-}
-
-void CellTerrainManager::stream_to(const Vector3 &world_pos) {
+void CellTerrainManager::stream_to(const Vector3 &p_world_pos) {
+	if (!streaming_enabled) return;
+	// Into this manager's own space first. Every lookup (get_cell_at_world,
+	// get_height_at_world, ensure_collision_at_world) already subtracted the
+	// origin; this was the one entry point that did not, so a manager that was
+	// not sitting at (0, 0, 0) streamed cells around one place and answered
+	// queries about another.
+	const Vector3 world_pos = p_world_pos - get_global_transform().origin;
 	int cx = (int)Math::floor(world_pos.x / cell_size);
 	int cz = (int)Math::floor(world_pos.z / cell_size);
 
@@ -1292,6 +640,16 @@ void CellTerrainManager::stream_to(const Vector3 &world_pos) {
 			float fz = world_pos.z / cell_size - cz;
 			_preload_border(cx, cz, fx, fz, margin);
 			if (preload_collision_upgrade) _preload_collision_upgrade(cx, cz, fx, fz, margin);
+		}
+	}
+
+	// First stream at runtime: build the collision ring synchronously so the
+	// very first physics step has ground under it. A one-off hitch at level
+	// start is the right trade against every body falling through the world.
+	if (!_has_last && preload_collision_on_start && !Engine::get_singleton()->is_editor_hint()) {
+		int built = ensure_collision_at_world(p_world_pos);
+		if (built > 0) {
+			print_line("CellTerrain: pre-built " + itos(built) + " collision cells at spawn.");
 		}
 	}
 
@@ -1385,16 +743,24 @@ void CellTerrainManager::ensure_cell_sync(int cx, int cz) {
 	// Load synchronously on the calling (main) thread.
 	PoolRealArray heights = _load_heights(cx, cz);
 	PoolRealArray nav_mask = _load_nav_mask(cx, cz);
+	PoolRealArray hole_mask = _load_hole_mask(cx, cz);
 	Ref<Image> splatmaps[4];
 	int nsplat = (num_layers + 3) / 4;
 	for (int i = 0; i < nsplat && i < 4; i++) {
 		splatmaps[i] = _load_splatmap(cx, cz, i);
 	}
 
-	CellTerrain *cell = _create_cell_from_data(cx, cz, 0, true, heights, nav_mask, splatmaps);
+	CellTerrain *cell = _create_cell_from_data(cx, cz, 0, true, heights, nav_mask, hole_mask,
+			splatmaps, _load_color_map(cx, cz));
 	if (cell) {
-		rebuild_at(cx, cz);
+		// MUST be registered before anything else: get_cell() and rebuild_at()
+		// both look the cell up in _active, so without this the cell existed as
+		// a child but had no mesh, no collision, and was invisible to queries.
+		_active[k] = cell;
+		_release_baked_navmesh(k);
+		cell->set_skip_ready_rebuild(false);
 		_update_neighbor_edges(cx, cz);
+		rebuild_at(cx, cz);
 	}
 }
 
@@ -1420,6 +786,14 @@ void CellTerrainManager::editor_clear() {
 CellTerrain *CellTerrainManager::get_cell(int cx, int cz) const {
 	const Map<int64_t,CellTerrain*>::Element *E=_active.find(_key(cx,cz)); return E?E->value():nullptr;
 }
+
+CellTerrain *CellTerrainManager::get_cell_at_world(const Vector3 &p_world_pos) const {
+	if (cell_size <= 0.0f) return nullptr;
+	const Vector3 origin = get_global_transform().origin;
+	const int cx = (int)Math::floor((p_world_pos.x - origin.x) / cell_size);
+	const int cz = (int)Math::floor((p_world_pos.z - origin.z) / cell_size);
+	return get_cell(cx, cz);
+}
 float CellTerrainManager::get_height_at_world(float wx, float wz) const {
 	Vector3 origin = get_global_transform().origin;
 	float lx = wx - origin.x;
@@ -1442,6 +816,107 @@ float CellTerrainManager::get_height_at_world(float wx, float wz) const {
 	float h01 = cell->get_height_at(vx,     vz + 1) * height_scale;
 	float h11 = cell->get_height_at(vx + 1, vz + 1) * height_scale;
 	return Math::lerp(Math::lerp(h00, h10, tx), Math::lerp(h01, h11, tx), tz);
+}
+
+bool CellTerrainManager::raycast_terrain(const Vector3 &p_from, const Vector3 &p_dir, Vector3 &r_hit) const {
+	// Analytic march against the heightmap instead of a physics raycast.
+	//
+	// The editor tools used to do intersect_ray() out to 100,000 units. A ray
+	// that HITS terrain returns quickly, but one that misses (pointing at sky,
+	// past the terrain edge, or sweeping toward the toolbar) traverses the full
+	// length through every btHeightfieldTerrainShape the broadphase hands back,
+	// walking heightfield grid cells the whole way — which froze the editor on
+	// mouse-move. This has a hard bounded cost instead: a coarse march with a
+	// growing step, then a bisection refine, all Map lookups.
+	//
+	// It also works on cells that carry NO collision (the LOD ring), which a
+	// physics ray could never hit.
+	Vector3 dir = p_dir;
+	if (dir.length_squared() < CMP_EPSILON) return false;
+	dir.normalize();
+
+	const float max_dist = raycast_max_distance;
+	float t = 0.0f;
+	float prev_t = 0.0f;
+	// Signed distance from the ray to the ground: >0 above, <0 below.
+	float prev_d = p_from.y - get_height_at_world(p_from.x, p_from.z);
+
+	// Already underground at the origin: treat the start as the hit rather than
+	// marching away from it.
+	if (prev_d <= 0.0f) {
+		r_hit = p_from;
+		return true;
+	}
+
+	// Step grows with distance so near the cursor is precise and far away stays
+	// cheap. ~120 steps to cover the default range.
+	while (t < max_dist) {
+		float step = MAX(1.0f, t * 0.05f);
+		t = MIN(t + step, max_dist);
+		Vector3 p = p_from + dir * t;
+		float h = get_height_at_world(p.x, p.z);
+		float d = p.y - h;
+		if (d <= 0.0f) {
+			// Crossed the surface between prev_t and t — bisect to refine.
+			float lo = prev_t, hi = t;
+			for (int i = 0; i < 16; i++) {
+				float mid = (lo + hi) * 0.5f;
+				Vector3 mp = p_from + dir * mid;
+				float md = mp.y - get_height_at_world(mp.x, mp.z);
+				if (md > 0.0f) {
+					lo = mid;
+				} else {
+					hi = mid;
+				}
+			}
+			r_hit = p_from + dir * ((lo + hi) * 0.5f);
+			return true;
+		}
+		prev_t = t;
+		prev_d = d;
+	}
+	return false;
+}
+
+Variant CellTerrainManager::raycast_terrain_v(const Vector3 &p_from, const Vector3 &p_dir) const {
+	Vector3 hit;
+	if (!raycast_terrain(p_from, p_dir, hit)) return Variant();
+	return hit;
+}
+
+int CellTerrainManager::get_pending_count() {
+	_load_mutex.lock();
+	int queued = _load_queue.size() + _ready_queue.size();
+	_load_mutex.unlock();
+	return queued + _loading.size() + _recomputing.size();
+}
+
+void CellTerrainManager::set_cell_nav_obstacles(int cx, int cz, const PoolRealArray &p_obstacles) {
+	CellTerrain *c = get_cell(cx, cz);
+	if (!c) return; // not streamed in; FoliageManager re-stamps on its next refresh
+	if (c->get_nav_obstacles().size() == 0 && p_obstacles.size() == 0) return;
+	c->set_nav_obstacles(p_obstacles);
+	if (_thread_running) {
+		_submit_recompute(cx, cz, false); // nav/mesh only, collision untouched
+	} else {
+		c->rebuild();
+	}
+}
+
+int CellTerrainManager::ensure_collision_at_world(const Vector3 &p_world_pos) {
+	Vector3 origin = get_global_transform().origin;
+	int ccx = (int)Math::floor((p_world_pos.x - origin.x) / cell_size);
+	int ccz = (int)Math::floor((p_world_pos.z - origin.z) / cell_size);
+	int built = 0;
+	// The collision tier is exactly the load_radius ring (see _evaluate).
+	for (int cz = ccz - load_radius; cz <= ccz + load_radius; cz++) {
+		for (int cx = ccx - load_radius; cx <= ccx + load_radius; cx++) {
+			if (get_cell(cx, cz)) continue;
+			ensure_cell_sync(cx, cz);
+			built++;
+		}
+	}
+	return built;
 }
 
 void CellTerrainManager::set_debug_normals(bool enabled, float length) {
@@ -1479,7 +954,7 @@ void CellTerrainManager::_notification(int p_what) {
 			set_process(true);
 			_thread_exit = false;
 			_thread_running = true;
-			_load_thread.start(&CellTerrainManager::_load_worker, this);
+			_start_workers(_resolve_thread_count());
 
 			// In the editor, terrain otherwise only streams in once something
 			// (the sculpt tool, a mouse event) calls stream_to() — which meant
@@ -1499,9 +974,7 @@ void CellTerrainManager::_notification(int p_what) {
 			// remaining lifetime.
 			clear_baked_navmesh();
 			if (_thread_running) {
-				_thread_exit = true;
-				_load_sem.post(); // wake worker so it sees the exit flag
-				_load_thread.wait_to_finish();
+				_stop_workers();
 				_thread_running = false;
 			}
 			// Thread is stopped; safe to drain queues without locking.
@@ -1516,6 +989,9 @@ void CellTerrainManager::_notification(int p_what) {
 			// without blocking. The work limit keeps frame time predictable.
 			if (_thread_running) _integrate_ready();
 			if (Engine::get_singleton()->is_editor_hint()) break;
+			// Under a GameWorld the focus is read once, there, and pushed in
+			// through stream_to() for terrain, foliage and objects alike.
+			if (external_focus || !streaming_enabled) break;
 			// Follow the active camera, not a specific "player" node — terrain
 			// should track what's actually being rendered. target_path is only
 			// used as a fallback when no camera is current (e.g. headless).
@@ -1602,15 +1078,20 @@ Ref<CellTerrainLayer> CellTerrainManager::get_layer_at_world(float wx, float wz)
 	return layers[idx];
 }
 
-void CellTerrainManager::set_height_blend_sharpness(float s){height_blend_sharpness=s; if(terrain_material.is_valid()) terrain_material->set_shader_param("height_blend_sharpness",s);} float CellTerrainManager::get_height_blend_sharpness()const{return height_blend_sharpness;}
+void CellTerrainManager::set_height_blend_sharpness(float s) { height_blend_sharpness = s; _push_height_blend_live(); }
+float CellTerrainManager::get_height_blend_sharpness() const { return height_blend_sharpness; }
 
 void CellTerrainManager::set_detail_normal_strength(float s) {
 	detail_normal_strength = MAX(0.0f, s);
-	for (Map<int64_t, CellTerrain *>::Element *E = _active.front(); E; E = E->next()) {
-		E->value()->set_shader_resources(albedo_texture_array, normal_texture_array,
-				num_layers, texture_scale, height_blend_sharpness, layer_params_tex, layer_color_tex, detail_normal_strength,
-				macro_variation_color1, macro_variation_color2, macro_variation_scale);
-		E->value()->rebuild();
+	// Was calling rebuild() per cell - a full mesh + collision + navmesh rebuild
+	// for what is only a shader uniform. Pushing it straight to the material
+	// gets the same result without touching geometry or the NavigationServer.
+	if (terrain_material.is_valid()) terrain_material->set_shader_param("detail_normal_strength", detail_normal_strength);
+	for (Map<int64_t, CellTerrain *>::Element *E = _active.front(); E; E = E->next())
+		E->value()->set_shader_detail_normal_strength(detail_normal_strength);
+	for (Map<int64_t, MeshInstance *>::Element *E = _hlod_active.front(); E; E = E->next()) {
+		Ref<ShaderMaterial> m = E->value()->get_material_override();
+		if (m.is_valid()) m->set_shader_param("detail_normal_strength", detail_normal_strength);
 	}
 }
 float CellTerrainManager::get_detail_normal_strength()const{return detail_normal_strength;}
@@ -1630,6 +1111,26 @@ void CellTerrainManager::_push_macro_variation_live() {
 		E->value()->rebuild();
 	}
 }
+void CellTerrainManager::_push_height_blend_live() {
+	if (terrain_material.is_valid()) terrain_material->set_shader_param("height_blend_sharpness", height_blend_sharpness);
+	for (Map<int64_t, CellTerrain *>::Element *E = _active.front(); E; E = E->next())
+		E->value()->set_shader_height_blend(height_blend_sharpness);
+	for (Map<int64_t, MeshInstance *>::Element *E = _hlod_active.front(); E; E = E->next()) {
+		Ref<ShaderMaterial> m = E->value()->get_material_override();
+		if (m.is_valid()) m->set_shader_param("height_blend_sharpness", height_blend_sharpness);
+	}
+}
+
+void CellTerrainManager::_push_texture_scale_live() {
+	if (terrain_material.is_valid()) terrain_material->set_shader_param("texture_scale", texture_scale);
+	for (Map<int64_t, CellTerrain *>::Element *E = _active.front(); E; E = E->next())
+		E->value()->set_shader_texture_scale(texture_scale);
+	for (Map<int64_t, MeshInstance *>::Element *E = _hlod_active.front(); E; E = E->next()) {
+		Ref<ShaderMaterial> m = E->value()->get_material_override();
+		if (m.is_valid()) m->set_shader_param("texture_scale", texture_scale);
+	}
+}
+
 void CellTerrainManager::_push_parallax_live() {
 	// Unlike _push_macro_variation_live(), this does NOT rebuild cells: a view
 	// distance changes no geometry, splat, collision or nav data — only a
@@ -1701,6 +1202,12 @@ void CellTerrainManager::set_cell_size(float s){cell_size=s;} float CellTerrainM
 void CellTerrainManager::set_height_scale(float s){height_scale=s;} float CellTerrainManager::get_height_scale()const{return height_scale;}
 void CellTerrainManager::set_load_radius(int r){load_radius=MAX(0,r);} int CellTerrainManager::get_load_radius()const{return load_radius;}
 void CellTerrainManager::set_lod_radius(int r){lod_radius=MAX(0,r);} int CellTerrainManager::get_lod_radius()const{return lod_radius;}
+void CellTerrainManager::set_max_lod_level(int l) {
+	max_lod_level = CLAMP(l, 1, 8);
+	// Re-evaluate so live cells pick up the new mapping instead of waiting for
+	// the next cell-boundary crossing.
+	if (_has_last) _evaluate(_last_cx, _last_cz);
+}
 void CellTerrainManager::set_hlod_chunk_size(int s){hlod_chunk_size=MAX(1,s);} int CellTerrainManager::get_hlod_chunk_size()const{return hlod_chunk_size;}
 void CellTerrainManager::set_hlod_radius(int r){hlod_radius=MAX(0,r);} int CellTerrainManager::get_hlod_radius()const{return hlod_radius;}
 void CellTerrainManager::set_hlod_height_offset(float o){ hlod_height_offset=o; for (Map<int64_t,MeshInstance*>::Element *E=_hlod_active.front();E;E=E->next()) { Transform xf=E->value()->get_transform(); xf.origin.y=o; E->value()->set_transform(xf); } } float CellTerrainManager::get_hlod_height_offset()const{return hlod_height_offset;}
@@ -1709,7 +1216,19 @@ void CellTerrainManager::set_frustum_cull_dot(float d) { frustum_cull_dot = CLAM
 void CellTerrainManager::set_preload_margin(float m) { preload_margin = CLAMP(m, 0.0f, 0.49f); }
 void CellTerrainManager::set_streaming_lookahead_seconds(float s) { streaming_lookahead_seconds = MAX(0.0f, s); }
 void CellTerrainManager::set_integrate_budget_ms(float ms) { integrate_budget_ms = MAX(0.0f, ms); }
-void CellTerrainManager::set_texture_scale(float s){texture_scale=s;} float CellTerrainManager::get_texture_scale()const{return texture_scale;}
+void CellTerrainManager::set_streaming_threads(int n) {
+	streaming_threads = MAX(0, n);
+	// Applied live: swap the pool out right now rather than waiting for a
+	// scene reload. Safe because a worker mid-job completes and pushes its
+	// result before honouring the exit flag, and anything still queued is
+	// picked up by the replacement pool.
+	if (_thread_running) {
+		_stop_workers();
+		_start_workers(_resolve_thread_count());
+	}
+}
+void CellTerrainManager::set_texture_scale(float s) { texture_scale = s; _push_texture_scale_live(); }
+float CellTerrainManager::get_texture_scale() const { return texture_scale; }
 void CellTerrainManager::set_brush_texture(const Ref<Texture>&t){brush_texture=t;} Ref<Texture> CellTerrainManager::get_brush_texture()const{return brush_texture;}
 void CellTerrainManager::set_preview_in_editor(bool p_enabled){preview_in_editor=p_enabled;} bool CellTerrainManager::get_preview_in_editor()const{return preview_in_editor;}
 void CellTerrainManager::set_show_all_in_editor(bool p_enabled) {
@@ -1721,7 +1240,12 @@ bool CellTerrainManager::get_show_all_in_editor() const { return show_all_in_edi
 
 void CellTerrainManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("stream_to","p"),&CellTerrainManager::stream_to);
+	ClassDB::bind_method(D_METHOD("has_collision_at_world","world_pos"),&CellTerrainManager::has_collision_at_world);
+	ClassDB::bind_method(D_METHOD("get_loaded_cell_count"),&CellTerrainManager::get_loaded_cell_count);
 	ClassDB::bind_method(D_METHOD("ensure_cell_sync","cx","cz"),&CellTerrainManager::ensure_cell_sync);
+	ClassDB::bind_method(D_METHOD("ensure_collision_at_world","world_pos"),&CellTerrainManager::ensure_collision_at_world);
+	ClassDB::bind_method(D_METHOD("set_preload_collision_on_start","e"),&CellTerrainManager::set_preload_collision_on_start);
+	ClassDB::bind_method(D_METHOD("get_preload_collision_on_start"),&CellTerrainManager::get_preload_collision_on_start);
 	ClassDB::bind_method(D_METHOD("rebuild_at","cx","cz"),&CellTerrainManager::rebuild_at);
 	ClassDB::bind_method(D_METHOD("mark_dirty","cx","cz"),&CellTerrainManager::mark_dirty);
 	ClassDB::bind_method(D_METHOD("save_dirty"),&CellTerrainManager::save_dirty);
@@ -1732,6 +1256,14 @@ void CellTerrainManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("bake_hlod_chunk","cx","cz"),&CellTerrainManager::bake_hlod_chunk);
 	ClassDB::bind_method(D_METHOD("clear_hlod"),&CellTerrainManager::clear_hlod);
 	ClassDB::bind_method(D_METHOD("rebake_dirty_hlod"),&CellTerrainManager::rebake_dirty_hlod);
+	ClassDB::bind_method(D_METHOD("bake_ground_texture"),&CellTerrainManager::bake_ground_texture);
+	ClassDB::bind_method(D_METHOD("clear_ground_texture"),&CellTerrainManager::clear_ground_texture);
+	ClassDB::bind_method(D_METHOD("has_ground_texture"),&CellTerrainManager::has_ground_texture);
+	ClassDB::bind_method(D_METHOD("get_ground_albedo_texture"),&CellTerrainManager::get_ground_albedo_texture);
+	ClassDB::bind_method(D_METHOD("get_ground_height_texture"),&CellTerrainManager::get_ground_height_texture);
+	ClassDB::bind_method(D_METHOD("get_ground_bounds"),&CellTerrainManager::get_ground_bounds);
+	ClassDB::bind_method(D_METHOD("set_ground_texels_per_unit","v"),&CellTerrainManager::set_ground_texels_per_unit);
+	ClassDB::bind_method(D_METHOD("get_ground_texels_per_unit"),&CellTerrainManager::get_ground_texels_per_unit);
 	ClassDB::bind_method(D_METHOD("bake_navmesh"),&CellTerrainManager::bake_navmesh);
 	ClassDB::bind_method(D_METHOD("clear_baked_navmesh"),&CellTerrainManager::clear_baked_navmesh);
 	ClassDB::bind_method(D_METHOD("has_baked_navmesh"),&CellTerrainManager::has_baked_navmesh);
@@ -1752,6 +1284,8 @@ void CellTerrainManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_load_radius"),&CellTerrainManager::get_load_radius);
 	ClassDB::bind_method(D_METHOD("set_lod_radius","r"),&CellTerrainManager::set_lod_radius);
 	ClassDB::bind_method(D_METHOD("get_lod_radius"),&CellTerrainManager::get_lod_radius);
+	ClassDB::bind_method(D_METHOD("set_max_lod_level","l"),&CellTerrainManager::set_max_lod_level);
+	ClassDB::bind_method(D_METHOD("get_max_lod_level"),&CellTerrainManager::get_max_lod_level);
 	ClassDB::bind_method(D_METHOD("set_hlod_chunk_size","s"),&CellTerrainManager::set_hlod_chunk_size);
 	ClassDB::bind_method(D_METHOD("get_hlod_chunk_size"),&CellTerrainManager::get_hlod_chunk_size);
 	ClassDB::bind_method(D_METHOD("set_hlod_radius","r"),&CellTerrainManager::set_hlod_radius);
@@ -1770,13 +1304,21 @@ void CellTerrainManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_preload_collision_upgrade"),&CellTerrainManager::get_preload_collision_upgrade);
 	ClassDB::bind_method(D_METHOD("set_integrate_budget_ms","ms"),&CellTerrainManager::set_integrate_budget_ms);
 	ClassDB::bind_method(D_METHOD("get_integrate_budget_ms"),&CellTerrainManager::get_integrate_budget_ms);
+	ClassDB::bind_method(D_METHOD("set_streaming_threads","n"),&CellTerrainManager::set_streaming_threads);
+	ClassDB::bind_method(D_METHOD("get_streaming_threads"),&CellTerrainManager::get_streaming_threads);
+	ClassDB::bind_method(D_METHOD("get_active_thread_count"),&CellTerrainManager::get_active_thread_count);
 	ClassDB::bind_method(D_METHOD("set_texture_scale","s"),&CellTerrainManager::set_texture_scale);
 	ClassDB::bind_method(D_METHOD("get_texture_scale"),&CellTerrainManager::get_texture_scale);
 	ClassDB::bind_method(D_METHOD("get_num_layers"),&CellTerrainManager::get_num_layers);
 	ClassDB::bind_method(D_METHOD("set_layers","layers"),&CellTerrainManager::set_layers);
 	ClassDB::bind_method(D_METHOD("get_layers"),&CellTerrainManager::get_layers);
 	ClassDB::bind_method(D_METHOD("_on_layer_changed"),&CellTerrainManager::_on_layer_changed);
+	ClassDB::bind_method(D_METHOD("get_cell","cx","cz"),&CellTerrainManager::get_cell);
+	ClassDB::bind_method(D_METHOD("get_cell_at_world", "world_pos"), &CellTerrainManager::get_cell_at_world);
 	ClassDB::bind_method(D_METHOD("get_height_at_world","wx","wz"),&CellTerrainManager::get_height_at_world);
+	ClassDB::bind_method(D_METHOD("raycast_terrain","from","dir"),&CellTerrainManager::raycast_terrain_v);
+	ClassDB::bind_method(D_METHOD("set_cell_nav_obstacles","cx","cz","obstacles"),&CellTerrainManager::set_cell_nav_obstacles);
+	ClassDB::bind_method(D_METHOD("get_pending_count"),&CellTerrainManager::get_pending_count);
 	ClassDB::bind_method(D_METHOD("get_dominant_layer_index_at_world","wx","wz"),&CellTerrainManager::get_dominant_layer_index_at_world);
 	ClassDB::bind_method(D_METHOD("get_layer_id_at_world","wx","wz"),&CellTerrainManager::get_layer_id_at_world);
 	ClassDB::bind_method(D_METHOD("get_layer_at_world","wx","wz"),&CellTerrainManager::get_layer_at_world);
@@ -1805,6 +1347,7 @@ void CellTerrainManager::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::REAL,"height_scale"),"set_height_scale","get_height_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT,"load_radius"),"set_load_radius","get_load_radius");
 	ADD_PROPERTY(PropertyInfo(Variant::INT,"lod_radius"),"set_lod_radius","get_lod_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::INT,"max_lod_level",PROPERTY_HINT_RANGE,"1,8,1"),"set_max_lod_level","get_max_lod_level");
 	ADD_PROPERTY(PropertyInfo(Variant::INT,"hlod_chunk_size"),"set_hlod_chunk_size","get_hlod_chunk_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT,"hlod_radius"),"set_hlod_radius","get_hlod_radius");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL,"hlod_height_offset"),"set_hlod_height_offset","get_hlod_height_offset");
@@ -1814,6 +1357,8 @@ void CellTerrainManager::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::REAL,"streaming_lookahead_seconds",PROPERTY_HINT_RANGE,"0.0,3.0,0.05"),"set_streaming_lookahead_seconds","get_streaming_lookahead_seconds");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL,"preload_collision_upgrade"),"set_preload_collision_upgrade","get_preload_collision_upgrade");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL,"integrate_budget_ms",PROPERTY_HINT_RANGE,"0.1,16.0,0.1"),"set_integrate_budget_ms","get_integrate_budget_ms");
+	ADD_PROPERTY(PropertyInfo(Variant::INT,"streaming_threads",PROPERTY_HINT_RANGE,"0,16,1"),"set_streaming_threads","get_streaming_threads");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL,"preload_collision_on_start"),"set_preload_collision_on_start","get_preload_collision_on_start");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL,"texture_scale"),"set_texture_scale","get_texture_scale");
 
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL,"preview_in_editor"),"set_preview_in_editor","get_preview_in_editor");
@@ -1828,6 +1373,7 @@ void CellTerrainManager::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL,"enable_navmesh"),"set_enable_navmesh","get_enable_navmesh");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL,"nav_max_slope_deg",PROPERTY_HINT_RANGE,"0.0,89.0,0.5"),"set_nav_max_slope_deg","get_nav_max_slope_deg");
 	ADD_PROPERTY(PropertyInfo(Variant::INT,"nav_downsample",PROPERTY_HINT_RANGE,"1,16,1"),"set_nav_downsample","get_nav_downsample");
+	ADD_PROPERTY(PropertyInfo(Variant::REAL,"ground_texels_per_unit",PROPERTY_HINT_RANGE,"0.05,4.0,0.05"),"set_ground_texels_per_unit","get_ground_texels_per_unit");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL,"parallax_max_distance",PROPERTY_HINT_RANGE,"0.0,400.0,1.0"),"set_parallax_max_distance","get_parallax_max_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT,"debug_view",PROPERTY_HINT_ENUM,"Off,Splatmap Layers,Detail Normal,Nav Mask"),"set_debug_view","get_debug_view");
 	ADD_PROPERTY(PropertyInfo(Variant::INT,"bake_navmesh_lod",PROPERTY_HINT_RANGE,"0,3,1"),"set_bake_navmesh_lod","get_bake_navmesh_lod");

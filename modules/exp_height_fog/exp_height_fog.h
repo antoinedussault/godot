@@ -15,6 +15,7 @@ private:
 	float density = 0.04f;
 	float falloff = 0.15f;
 	float ref_height = 0.0f;
+	bool ref_height_relative = false;
 	float start_distance = 0.0f;
 	float max_opacity = 1.0f;
 	Color inscatter = Color(0.55, 0.62, 0.72);
@@ -49,6 +50,8 @@ public:
 	float get_falloff() const;
 	void set_ref_height(float p_v);
 	float get_ref_height() const;
+	void set_ref_height_relative(bool p_enabled);
+	bool is_ref_height_relative() const;
 	void set_start_distance(float p_v);
 	float get_start_distance() const;
 	void set_max_opacity(float p_v);

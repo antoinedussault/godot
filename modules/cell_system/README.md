@@ -1,3 +1,152 @@
+# Game World (read this first)
+
+`GameWorld` is the root of a playable scene and the **one authority** over
+everything laid out on the cell grid. It replaces the old trio of independent
+streamers (`CellWorld` + `CellTerrainManager` + `FoliageManager`, each with its
+own cell size and its own camera polling).
+
+```
+MyLevel (GameWorld)            <- scene root
+├── Terrain (CellTerrainManager)   created automatically when has_terrain is on
+├── Foliage (FoliageManager)       created automatically when has_terrain is on
+├── Village (Spatial)              a folder: looked inside, never touched
+│   ├── House1                     <- streamed as one object
+│   └── House2
+└── Crate (RigidBody)              <- dynamic object
+```
+
+## What it owns
+
+| | |
+|---|---|
+| **Grid** | One origin (the node), one `cell_size`. Terrain runs on it; foliage on `cell_size × foliage_cell_multiple`. No other node stores a cell size, so indices can no longer be read against the wrong grid. |
+| **Focus** | The camera currently rendering the viewport. Terrain, foliage and objects are all streamed from that one position, once per frame. Override with `focus_path` or `set_focus_position()`. |
+| **Terrain + foliage** | `has_terrain` on: both managers are created as children and kept in step with the grid. Off (an interior): no terrain, and therefore no foliage. Turning it off hides and stops existing managers but keeps their settings. |
+| **Objects** | Assigned to a cell by position, **without reparenting**. Out of range, an object is removed from the scene tree — it leaves physics, rendering and processing — and comes back when the camera approaches. |
+| **Dynamic objects** | Rigid/kinematic bodies follow the cell they are actually in and are parked while the terrain under them has no collision. |
+| **State** | What was removed, moved or changed survives unloading and scene travel. |
+| **Layers** | Editor layers, plus a per-layer *Game* flag and `set_layer_enabled()` at runtime. |
+
+## Properties
+
+- `cell_size` (64) — base grid. `world_dir` — where terrain data lives.
+- `has_terrain` (on) — exterior vs interior. `foliage_cell_multiple` (4).
+  `foliage_dir` — foliage data folder; empty means the same as `world_dir`.
+- `stream_objects` (on), `load_radius` (2 cells), `unload_margin` (1 cell of
+  hysteresis), `integrate_budget_ms` (2 ms of main thread per frame).
+- `focus_path` — optional node to follow instead of the camera.
+
+Set the grid here. The managers' own `cell_size` / `world_dir` are overwritten
+from it.
+
+## What counts as an object
+
+Only things that are actually *placed* in the world stream. Walking down from
+the `GameWorld`, each child is, in this order:
+
+| The node is… | It is treated as |
+|---|---|
+| in the `always_loaded` group (or meta), or a system class (the managers, `Camera`, `DirectionalLight`, `SceneSpawnPoint`, `WorldLocationArea`, `TerrainPath`, `CellPlayerBody`) | left alone, subtree included |
+| a `RigidBody` / `KinematicBody`, or in the `movable` group | a **dynamic** object |
+| an instanced scene | an object if anything in it renders or collides; otherwise a marker, left alone |
+| a visual node (mesh, light, particles, CSG) or a static body | an object |
+| a node with a script | **logic**: left alone, subtree included |
+| an `Area` | left alone |
+| any other script-less helper (`Spatial`, `Position3D`, `Node`, an old `Cell`) | a **folder**: looked inside |
+
+An object streams whole, subtree included. It is in range when **any cell its
+bounding box touches** is in range, so a 300 m cliff does not vanish because
+its pivot is three cells away.
+
+The "script = logic" rule is what keeps a weather controller, a sky rig or a
+camera-following particle system loaded no matter where its origin is. If you
+do want a scripted, non-visual node to stream, make it an instanced scene with
+something visible in it. A static object that is moved by a script should be in
+the `movable` group, otherwise it stays filed under the cell it started in.
+
+## Baking (streaming from disk)
+
+Unbaked, the whole scene is loaded and out-of-range objects are merely kept out
+of the tree. That fixes physics, draw and process cost but not memory or load
+time. **World dock → Bake World** writes, next to the scene:
+
+```
+my_level.world/world.scn             the scene without its static objects
+my_level.world/cells/cell_X_Z.scn    one file per cell
+my_level.world/bake.cfg              timestamp of the scene it was baked from
+```
+
+`SceneManager.travel_to()` then loads `world.scn` instead, and each cell file is
+loaded when the camera gets near and freed when it leaves. The authoring scene
+is never modified. If the scene is newer than its bake, the game warns and uses
+the scene itself — re-bake after editing. Dynamic objects, and objects that
+span several cells, stay in `world.scn`.
+Running the scene directly from the editor always uses the unbaked path.
+
+## Persistent state
+
+```gdscript
+var save = SceneManager.get_world_states()   # every visited scene, plain data
+SceneManager.set_world_states(save)          # on load
+```
+
+Tracked automatically: objects that were freed (stay gone), dynamic objects
+that moved, objects added through `GameWorld.add_object(node)` (they must be
+instanced scenes to survive a save), and runtime layer toggles. A node adds its
+own data by implementing:
+
+```gdscript
+func _save_cell_state(): return {"open": is_open}
+func _load_cell_state(state): is_open = state.open
+```
+
+## Signals and queries
+
+`focus_cell_changed(cx, cz)`, `cell_loaded(cx, cz)`, `cell_unloaded(cx, cz)`;
+`world_to_cell(pos)`, `get_cell_origin(cx, cz)`, `get_cell_state(cx, cz)`,
+`is_ground_ready(pos)`, `prime(pos)` (load everything around a point now —
+`SceneManager` calls it on arrival, behind the loading screen).
+
+## Coming from the old system
+
+- `CellWorld` and `Cell` still load but do nothing; `GameWorld` treats them as
+  folders, so an old scene streams correctly as it is. **World dock → Migrate
+  Legacy Scene** removes the wrappers for good.
+- "Sort Into Cells" is gone — there is nothing to sort.
+- `CellPlayerBody` no longer has `cell_size` / `cell_world_path`; it finds the
+  `GameWorld` by itself.
+- On first load of an old scene, `GameWorld` adopts the grid and the data
+  folders from its existing managers, the load radius from its old `CellWorld`
+  child, and treats a scene that had no terrain manager as an interior.
+
+## Testing it
+
+`tests/gameworld/` is a tiny project that drives every feature above from a
+script and prints `ok` / `FAIL` per check:
+
+```bash
+bin\godot.windows.opt.tools.64.exe --no-window --path modules\cell_system\tests\gameworld
+```
+
+It must end with `RESULT: 0 failure(s)`. The same folder holds three scenes for
+an editor smoke test (`-e --no-window --path … res://ext.tscn`, also
+`legacy_interior.tscn` and `legacy_exterior.tscn`). Set `TUNA_CELL_TRACE=1` to
+get one line per `GameWorld` saying what it decided to stream.
+
+## Honest notes
+
+- **Loading a cell file is main-thread.** It is polled within the frame budget,
+  but the final `instance()` of one cell is a single call, so a very dense cell
+  can still cost a visible frame. Smaller `cell_size` spreads it.
+- **Bake copies objects with `Node.duplicate()`.** Changes made to the children
+  of an instanced scene through *Editable Children* are not carried into the
+  cell file.
+- **A streamed-out object has no node path.** Scripts that hold a path to an
+  object that can unload need it in `always_loaded`.
+- **Rotation of the `GameWorld` node is not supported**; translation is.
+
+---
+
 # Foliage System for `cell_system` (Godot 3.5.3)
 
 An Unreal-style foliage system that plugs into your existing
@@ -48,20 +197,13 @@ scons platform=windows target=release_debug -j8
 
 ## Scene setup
 
-```
-WorldRoot
-├── CellTerrainManager        (your existing node)
-├── FoliageManager            (NEW — add as a sibling)
-│     terrain_manager_path -> ../CellTerrainManager
-│     world_dir            -> same as the terrain manager
-│     cell_size            -> same as the terrain manager
-│     type0..type15        -> FoliageType resources
-└── CellPlayerBody / Camera   (drives streaming as before)
-```
+A `GameWorld` with `has_terrain` on creates the `FoliageManager` for you, next
+to the terrain manager, and sets its `terrain_manager_path`, `world_dir` and
+`cell_size` from the world grid - there is nothing to keep in sync by hand.
+Assign `FoliageType` resources to its `types`.
 
-`FoliageManager` reads the **active camera** each frame for LOD/collision, and
-mirrors terrain cells for streaming. Keep `cell_size` and `world_dir` identical
-to the terrain manager or cells won't line up.
+The focus position (the active camera) is pushed in by the `GameWorld` each
+frame; the manager uses it for streaming, LOD and collision.
 
 ## Creating a FoliageType
 
@@ -161,7 +303,9 @@ scene_manager.h / .cpp            SceneManager — Engine singleton, runs the tr
 scene_transition.h / .cpp         SceneTransition — the loading-screen overlay
 scene_spawn_point.h / .cpp        SceneSpawnPoint — a named arrival marker
 scene_door.h / .cpp               SceneDoor — a linked load door (Area)
+world_location_area.h / .cpp      WorldLocationArea — a named, discoverable region (Area)
 scene_manager_editor_plugin.*     "Scenes" bottom-panel dock (TOOLS_ENABLED)
+game_world.h / .cpp               EXTENDS your existing GameWorld with a location registry
 register_types.cpp                REPLACES your current one (adds the classes + the SceneManager singleton)
 config.py                         REPLACES your current one (adds get_doc_classes)
 doc_classes/Scene*.xml            class reference
@@ -181,9 +325,10 @@ no completion hook) — it manages the swap itself, adding the new scene as a
 direct child of the root viewport and calling `set_current_scene`, then
 `queue_free`-ing the old one.
 
-An exterior scene that needs streamed terrain simply contains its own
-`CellTerrainManager` (+ `CellWorld` / `FoliageManager`) inside its `.tscn` —
-nothing special, it just loads with the rest of the scene.
+Make each scene's root a `GameWorld`. An exterior leaves `has_terrain` on and
+gets its terrain and foliage managers automatically; an interior turns it off.
+On arrival the manager calls `GameWorld.prime()` at the spawn point, so the
+loading screen lifts on a world that is already there.
 
 > Loading is **poll-based on the main thread** (this 3.5 fork has no threaded
 > `ResourceLoader`). The loading screen hides the cost. `max_polls_per_frame`
@@ -212,10 +357,9 @@ Or, instead of the signal, name a target method:
 manager then calls `place_player(xform, spawn_id)` directly. Default target is
 `/root/GameMaster.place_player`.
 
-> **Exterior gotcha:** `CellTerrainManager` streams to whatever camera is
-> `current` in the root viewport, not to a "player". After travelling into an
-> exterior scene make sure the player's camera is made `current`, or terrain
-> won't stream.
+> **Exterior gotcha:** `GameWorld` streams to whatever camera is `current` in
+> the root viewport, not to a "player". After travelling into a scene make sure
+> the player's camera is made `current`, or nothing streams.
 
 ## Authoring the catalog
 
@@ -247,6 +391,34 @@ From script you can also travel directly:
 `SceneManager.travel_to("interior_house", "entry")`, and
 `SceneManager.travel_back()` / `SceneManager.reload_current()`.
 
+## World Locations
+
+`WorldLocationArea` (an `Area`) marks a region of a scene as a named location —
+a settlement, dungeon, landmark — and fires `location_entered` /
+`location_exited` as a `body_filter` body crosses its bounds, plus
+`location_discovered` the first time it's entered. It's independent of
+`SceneManager`/`SceneDoor`: it lives inside a scene and never loads anything,
+it only announces itself.
+
+When a scene's root is a `GameWorld`, every `WorldLocationArea` under it is
+reachable without holding a node reference:
+
+```gdscript
+var world = SceneManager.get_world_game()          # current scene's GameWorld root, or null
+var loc = SceneManager.get_location_by_id("sanctuary")
+var all = SceneManager.get_locations()             # every WorldLocationArea under it
+```
+
+(equivalently `world.get_location_by_id(...)` / `world.get_locations()` if you
+already hold the `GameWorld`). The registry is a live group lookup
+(`"world_locations"`), not a stored list on `GameWorld` — nothing needs to
+(un)register on add/remove/reparent, and nesting one `WorldLocationArea` inside
+another (a house inside a settlement) just works, each firing independently.
+
+A scene that isn't `GameWorld`-rooted can still use `WorldLocationArea` — its
+signals fire regardless — it just isn't reachable through the registry
+shortcuts above.
+
 ## The loading-screen scene
 
 Any `.tscn`. If its root script has `func set_progress(ratio: float):` the
@@ -258,9 +430,9 @@ works. `SceneTransition.min_display_time` keeps very fast loads from flashing.
 
 - **Not compiled against your tree yet.** Built against the 3.5 API and the
   `cell_system` headers; verify on your checkout (`vsproj=yes` flags any drift).
-- **No persistent object state across unload.** A scene is rebuilt from its
-  `.tscn` every time you enter — no Creation-Engine "persistent references",
-  no save-game hook yet. `SceneCatalogEntry.keep_loaded` is a placeholder.
+- **Persistent state lives on `GameWorld`**, not here: see *Persistent state*
+  at the top. `SceneManager.get_world_states()` / `set_world_states()` are the
+  save-game hook. `SceneCatalogEntry.keep_loaded` is still a placeholder.
 - **Main-thread loading.** See the note above.
 - **`SceneManager` auto-creates its `SceneTransition`** under the root viewport
   on the first `travel_to` (or `bootstrap()`), via a SceneTree idle callback.
@@ -315,8 +487,9 @@ Three views via the top switch:
 `RigidBody` + `item` (an `ItemResource`). On entering the tree it instances the
 item's `scene_path` as `ItemVisual` and — while `auto_build` is on — adds one box
 `CollisionShape` sized to that scene's combined visual AABB, with `mass` taken
-from the item's `weight`. `CellWorld` already sorts any `RigidBody` into
-`DynamicObjects`, so it streams for free.
+from the item's `weight`. `GameWorld` treats any `RigidBody` as a dynamic
+object, so it streams for free; hand a dropped item to
+`GameWorld.add_object()`.
 
 Pushing: `CellPlayerBody` now tracks its own velocity (transform delta per
 physics frame, `get_linear_velocity()`); `CellItemBody::_direct_state_changed`

@@ -8,6 +8,7 @@
 #include "scene/3d/spatial.h"
 #include "scene/resources/mesh.h"
 #include "scene/resources/material.h"
+#include "scene/resources/concave_polygon_shape.h"
 #include "scene/resources/height_map_shape.h"
 #include "scene/resources/navigation_mesh.h"
 #include "scene/resources/texture.h"
@@ -32,6 +33,13 @@ public:
 		// TerrainBrush::MODE_NAV_MASK). Same layout as heights; empty/wrong-size
 		// is treated as "navigable everywhere" (see _mask_at_s).
 		PoolRealArray nav_mask;
+		// Per-vertex paintable hole mask (0 = hole, 1 = solid — see
+		// TerrainBrush::MODE_HOLE). Same layout as heights; empty/wrong-size is
+		// treated as "solid everywhere" (see _hole_at_s). Any quad with a holed
+		// corner is dropped from the render mesh, the navmesh AND the collision
+		// shape, which is how a cave mouth or a shaft gets cut through what is
+		// otherwise a continuous heightfield.
+		PoolRealArray hole_mask;
 		int verts_per_side = 65;
 		float cell_size = 64.0f;
 		float height_scale = 1.0f;
@@ -46,6 +54,11 @@ public:
 		// live. 4 cuts that 16x, 8 cuts it 64x, for navmesh detail that is
 		// still far finer than any agent needs.
 		int nav_downsample = 4;
+		// Flattened (x, z, radius) triples in CELL-LOCAL units marking areas the
+		// navmesh must leave out - rocks and other foliage obstacles. Plain
+		// floats rather than node references because compute() runs on the
+		// streaming worker thread and must not touch the scene tree.
+		PoolRealArray nav_obstacles;
 	};
 
 	// Everything compute() produces — pure CPU data, nothing GPU/server-side
@@ -82,6 +95,10 @@ private:
 	bool enable_navmesh = true;
 	float nav_max_slope_deg = 55.0f;
 	int nav_downsample = 4; // see ComputeInput::nav_downsample
+	// Set by FoliageManager when rock/tree placement changes; consumed by the
+	// next navmesh build. Non-destructive - deleting the foliage restores
+	// navigation without touching the painted nav mask.
+	PoolRealArray nav_obstacles;
 	RID nav_region;
 	bool _nav_dirty = true;
 	// Godot's "Visible Navigation" viewport debug overlay is drawn per-node by
@@ -104,9 +121,21 @@ private:
 	// to 1.0 (fully navigable) on first touch by _ensure_nav_mask().
 	PoolRealArray nav_mask;
 	void _ensure_nav_mask();
+	// Paintable hole mask, see ComputeInput::hole_mask. Lazily sized/filled to
+	// 1.0 (solid) on first touch by _ensure_hole_mask().
+	PoolRealArray hole_mask;
+	void _ensure_hole_mask();
 
 	Ref<Image> splatmaps[4];
 	Ref<ImageTexture> splatmap_texes[4];
+
+	// Painted albedo tint (TerrainBrush::MODE_COLOR), multiplied over the
+	// blended layer albedo in the shader. White is the identity, so this is
+	// only allocated once something actually paints into it and an unpainted
+	// cell costs nothing but a bound 1x1-equivalent white image.
+	Ref<Image> color_map;
+	Ref<ImageTexture> color_map_tex;
+	void _ensure_color_map();
 
 	// Heightmap-derived detail normal map, baked at full resolution (see
 	// compute()) so lighting stays detailed even when the LOD mesh itself is
@@ -158,6 +187,19 @@ private:
 	// halving the broadphase remove/re-add + heightfield-accelerator-rebuild
 	// cost every time a collision-bearing cell streams in or gets resculpted.
 	Ref<HeightMapShape> height_shape;
+	// Used INSTEAD of height_shape once a cell has painted holes. A heightfield
+	// is a dense 2D array of samples with no way to express a missing quad, so
+	// a holed cell falls back to a triangle soup built from exactly the surface
+	// triangles the render mesh keeps. Only built for cells that have holes -
+	// everything else stays on the much cheaper heightfield path.
+	Ref<ConcavePolygonShape> hole_shape;
+	// Which of the two shapes collision_shape currently holds, so a cell that
+	// gains or loses its last hole swaps shape instead of silently keeping the
+	// wrong one.
+	bool _collision_is_concave = false;
+	// Surface triangles in cell-local space, at LOD 0 and with holes removed.
+	// Shared by the concave collision shape.
+	PoolVector3Array _build_collision_faces() const;
 	ImmediateGeometry *normal_viz = nullptr;
 	bool normal_viz_enabled = false;
 	float normal_viz_length = 1.0f;
@@ -185,6 +227,13 @@ private:
 	// 1.0 (navigable) wherever nav_mask is empty/undersized, matching the
 	// "unpainted == fully navigable" default.
 	static float _mask_at_s(const ComputeInput &in, int x, int z);
+	// 1.0 (solid) wherever hole_mask is empty/undersized, matching the
+	// "unpainted == solid" default.
+	static float _hole_at_s(const ComputeInput &in, int x, int z);
+	// True when the quad whose low corner is the LOD vertex (lod_x, lod_z)
+	// must be dropped. Checks the four heightmap samples the quad is actually
+	// built from, so it stays consistent with _height_sampled_s at every LOD.
+	static bool _quad_is_hole_s(const ComputeInput &in, int lod_x, int lod_z, int step);
 	static Vector3 _sample_normal_s(const ComputeInput &in, int lod_x, int lod_z, int step);
 	static Array _build_mesh_arrays_s(const ComputeInput &in);
 	static void _build_navmesh_data_s(const ComputeInput &in, PoolVector3Array &r_verts, Vector<Vector<int> > &r_polys);
@@ -203,12 +252,23 @@ public:
 	void set_lod_level(int l);        int get_lod_level() const;
 	void set_skirt_depth(float d);    float get_skirt_depth() const;
 	void set_enable_collision(bool e); bool get_enable_collision() const;
+	// enable_collision flips as soon as the cell is promoted, but the shape is
+	// built by an async job; this is true only once it actually exists.
+	bool has_collision_ready() const { return enable_collision && static_body != nullptr; }
 	void set_enable_navmesh(bool e);  bool get_enable_navmesh() const;
 	void set_nav_max_slope_deg(float d); float get_nav_max_slope_deg() const;
 	void set_nav_downsample(int d); int get_nav_downsample() const;
+	void set_nav_obstacles(const PoolRealArray &p_obstacles);
+	PoolRealArray get_nav_obstacles() const { return nav_obstacles; }
 	// Applied to the cached per-cell ShaderMaterial without forcing a full
 	// rebuild() — a distance knob changes no geometry, splat or nav data.
 	void set_shader_parallax_max_distance(float d);
+	// Same pattern as above: update the cached value AND the already-built
+	// material instance. Setting only the manager's shared material does
+	// nothing, because every cell renders through its own _material_inst.
+	void set_shader_height_blend(float v);
+	void set_shader_texture_scale(float v);
+	void set_shader_detail_normal_strength(float v);
 	void set_shader_debug_view(int mode);
 
 	void set_neighbor_edges(const PoolRealArray &n, const PoolRealArray &s,
@@ -221,6 +281,15 @@ public:
 	PoolRealArray get_nav_mask() const;
 	float get_nav_mask_at(int lx, int lz) const;
 	void set_nav_mask_at(int lx, int lz, float v);
+
+	// Paintable hole mask — see ComputeInput::hole_mask.
+	void set_hole_mask(const PoolRealArray &p_mask);
+	PoolRealArray get_hole_mask() const;
+	float get_hole_at(int lx, int lz) const;
+	void set_hole_at(int lx, int lz, float v);
+	// True if anything is actually cut out. Drives the heightfield/trimesh
+	// choice in _apply_collision(), so it must stay cheap.
+	bool has_holes() const;
 
 	void set_material(const Ref<Material> &m); Ref<Material> get_material() const;
 
@@ -239,6 +308,12 @@ public:
 	void set_splatmap(int idx, const Ref<Image> &img);
 	void update_splatmap_textures();
 	void paint_layer(int lx, int lz, int layer, float strength);
+
+	// Painted albedo tint — see the color_map member.
+	Ref<Image> get_color_map() const;
+	void set_color_map(const Ref<Image> &p_img);
+	void update_color_texture();
+	void paint_color_at(int lx, int lz, const Color &p_color, float p_strength);
 
 	void rebuild();
 	void set_skip_ready_rebuild(bool e) { _skip_ready_rebuild = e; }

@@ -34,9 +34,12 @@
 /* Must come before shaders or the Windows build fails... */
 #include "rasterizer_storage_gles3.h"
 
+#include "dynamic_gi_gles3.h"
+
 #include "drivers/gles3/shaders/cube_to_dp.glsl.gen.h"
 #include "drivers/gles3/shaders/effect_blur.glsl.gen.h"
 #include "drivers/gles3/shaders/exposure.glsl.gen.h"
+#include "drivers/gles3/shaders/lens_streak.glsl.gen.h"
 #include "drivers/gles3/shaders/light_shaft.glsl.gen.h"
 #include "drivers/gles3/shaders/resolve.glsl.gen.h"
 #include "drivers/gles3/shaders/scene.glsl.gen.h"
@@ -48,6 +51,7 @@
 #include "drivers/gles3/shaders/subsurf_scattering.glsl.gen.h"
 #include "drivers/gles3/shaders/tonemap.glsl.gen.h"
 #include "drivers/gles3/shaders/volumetric_fog.glsl.gen.h"
+#include "drivers/gles3/shaders/exp_height_fog.glsl.gen.h"
 
 class RasterizerSceneGLES3 : public RasterizerScene {
 public:
@@ -110,7 +114,9 @@ public:
 		ScreenSpaceReflectionShaderGLES3 ssr_shader;
 		EffectBlurShaderGLES3 effect_blur_shader;
 		LightShaftShaderGLES3 light_shaft_shader;
+		LensStreakShaderGLES3 lens_streak_shader;
 		VolumetricFogShaderGLES3 volumetric_fog_shader;
+		ExpHeightFogShaderGLES3 exp_height_fog_shader;
 		SubsurfScatteringShaderGLES3 sss_shader;
 		SsaoMinifyShaderGLES3 ssao_minify_shader;
 		SsaoShaderGLES3 ssao_shader;
@@ -216,8 +222,26 @@ public:
 		bool used_depth_prepass;
 
 		bool used_depth_texture;
+		// Set per material: when true the surface is drawn as GL_PATCHES so the
+		// tessellation stages run. Only meaningful for triangle primitives.
+		bool use_tessellation;
+		bool patch_vertices_set;
+		float tess_max_level;
+		Vector3 tess_ref_camera_pos;
+		float tess_ref_proj_y;
+		float tess_ref_viewport_height;
+		float tess_target_edge_px;
+		float tess_cull_slack;
 		bool prepared_depth_texture;
 		bool bound_depth_texture;
+
+		// Set while drawing into the dynamic GI voxel cascades.
+		bool gi_voxel_pass = false;
+		bool gi_voxel_incomplete = false;
+		float gi_voxel_size = 0;
+		int gi_voxel_cascade = 0;
+		int gi_voxel_box_min[3];
+		int gi_voxel_box_max[3];
 
 		VS::ViewportDebugDraw debug_draw;
 	} state;
@@ -293,6 +317,7 @@ public:
 
 	virtual int get_directional_light_shadow_size(RID p_light_intance);
 	virtual void set_directional_shadow_count(int p_count);
+	virtual void set_tessellation_reference(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection);
 
 	/* REFLECTION PROBE ATLAS API */
 
@@ -467,6 +492,7 @@ public:
 		float volumetric_fog_density;
 		float volumetric_fog_height_falloff;
 		float volumetric_fog_height_ref;
+		bool volumetric_fog_height_relative;
 		Color volumetric_fog_albedo;
 		Color volumetric_fog_ambient;
 		float volumetric_fog_sun_energy;
@@ -475,6 +501,44 @@ public:
 		float volumetric_fog_extinction;
 		int volumetric_fog_samples;
 		float volumetric_fog_temporal_blend;
+
+		// ExpHeightFog (see modules/exp_height_fog), ported onto Environment: a
+		// cheap single-pass analytic exponential height fog, no shadow sampling.
+		// The ExpHeightFog node still works standalone; this is its Environment
+		// home for the transition (see _exp_height_fog).
+		bool dynamic_gi_enabled = false;
+		int dynamic_gi_cascades = 4;
+		float dynamic_gi_voxel_size = 0.25;
+		float dynamic_gi_energy = 1.0;
+		float dynamic_gi_bounce_feedback = 0.8;
+		float dynamic_gi_normal_bias = 1.1;
+		float dynamic_gi_hysteresis = 0.95;
+		int dynamic_gi_rays = 64;
+		bool dynamic_gi_reflection_occlusion = true;
+		uint32_t dynamic_gi_cull_mask = 0xFFFFFFFF;
+		VS::EnvironmentDynamicGIDebug dynamic_gi_debug = VS::ENV_DYNAMIC_GI_DEBUG_DISABLED;
+
+		bool ssgi_enabled = false;
+		float ssgi_radius = 4.0;
+		float ssgi_intensity = 1.0;
+		int ssgi_rays = 4;
+		int ssgi_steps = 12;
+		float ssgi_thickness = 0.5;
+		float ssgi_temporal_blend = 0.95;
+		bool ssgi_half_resolution = true;
+
+		bool exp_height_fog_enabled;
+		float exp_height_fog_density;
+		float exp_height_fog_falloff;
+		float exp_height_fog_ref_height;
+		bool exp_height_fog_ref_height_relative;
+		float exp_height_fog_start_distance;
+		float exp_height_fog_max_opacity;
+		Color exp_height_fog_inscatter;
+		bool exp_height_fog_directional_enabled;
+		Color exp_height_fog_directional_color;
+		Vector3 exp_height_fog_light_direction;
+		float exp_height_fog_directional_exponent;
 
 		Environment() :
 				bg_mode(VS::ENV_BG_CLEAR_COLOR),
@@ -553,6 +617,7 @@ public:
 				volumetric_fog_density(0.03),
 				volumetric_fog_height_falloff(0.1),
 				volumetric_fog_height_ref(0.0),
+				volumetric_fog_height_relative(false),
 				volumetric_fog_albedo(Color(1, 1, 1)),
 				volumetric_fog_ambient(Color(0.05, 0.06, 0.08)),
 				volumetric_fog_sun_energy(1.0),
@@ -560,7 +625,19 @@ public:
 				volumetric_fog_length(160.0),
 				volumetric_fog_extinction(1.0),
 				volumetric_fog_samples(48),
-				volumetric_fog_temporal_blend(0.9) {
+				volumetric_fog_temporal_blend(0.9),
+				exp_height_fog_enabled(false),
+				exp_height_fog_density(0.04),
+				exp_height_fog_falloff(0.15),
+				exp_height_fog_ref_height(0.0),
+				exp_height_fog_ref_height_relative(false),
+				exp_height_fog_start_distance(0.0),
+				exp_height_fog_max_opacity(1.0),
+				exp_height_fog_inscatter(Color(0.55, 0.62, 0.72)),
+				exp_height_fog_directional_enabled(false),
+				exp_height_fog_directional_color(Color(1.0, 0.9, 0.7)),
+				exp_height_fog_light_direction(Vector3(0, -1, 0)),
+				exp_height_fog_directional_exponent(4.0) {
 		}
 	};
 
@@ -595,6 +672,10 @@ public:
 	virtual void environment_set_fog_depth(RID p_env, bool p_enable, float p_depth_begin, float p_depth_end, float p_depth_curve, bool p_transmit, float p_transmit_curve);
 	virtual void environment_set_fog_height(RID p_env, bool p_enable, float p_min_height, float p_max_height, float p_height_curve);
 	virtual void environment_set_volumetric_fog(RID p_env, bool p_enable, float p_density, float p_height_falloff, float p_height_ref, const Color &p_albedo, const Color &p_ambient, float p_sun_energy, float p_anisotropy, float p_length, float p_extinction, int p_samples, float p_temporal_blend);
+	virtual void environment_set_volumetric_fog_height_relative(RID p_env, bool p_relative);
+	virtual void environment_set_dynamic_gi(RID p_env, bool p_enable, int p_cascades, float p_voxel_size, float p_energy, float p_bounce_feedback, float p_normal_bias, float p_hysteresis, int p_rays, bool p_reflection_occlusion, uint32_t p_cull_mask, VS::EnvironmentDynamicGIDebug p_debug);
+	virtual void environment_set_ssgi(RID p_env, bool p_enable, float p_radius, float p_intensity, int p_rays, int p_steps, float p_thickness, float p_temporal_blend, bool p_half_resolution);
+	virtual void environment_set_exp_height_fog(RID p_env, bool p_enable, float p_density, float p_falloff, float p_ref_height, bool p_ref_height_relative, float p_start_distance, float p_max_opacity, const Color &p_inscatter, bool p_directional_enabled, const Color &p_directional_color, const Vector3 &p_light_direction, float p_directional_exponent);
 
 	virtual bool is_environment(RID p_env);
 
@@ -610,6 +691,10 @@ public:
 		float light_params[4]; //spot attenuation, spot angle, specular, shadow enabled
 		float light_clamp[4];
 		float light_shadow_color_contact[4];
+		// xy/zw = position/size of this light's cookie in the projector atlas, or all
+		// zeroes when the light has no projector. Must stay in sync with LightData
+		// (and the padding slot in DirectionalLightData) in scene.glsl.
+		float projector_rect[4];
 		union {
 			struct {
 				float matrix1[16]; //up to here for spot and omni, rest is for directional
@@ -620,6 +705,8 @@ public:
 			float matrix[4 * 16];
 		} shadow;
 		float shadow_split_offsets[4];
+		//per-cascade world-space normal offset, already scaled by the cascade's shadow texel size
+		float shadow_normal_bias[4];
 	};
 
 	struct LightInstance : public RID_Data {
@@ -852,6 +939,7 @@ public:
 
 	LightInstance *directional_light;
 	LightInstance *directional_lights[RenderList::MAX_DIRECTIONAL_LIGHTS];
+	LocalVector<LightInstance *> lens_streak_lights; // Rebuilt by every render_scene().
 	RID first_directional_light;
 
 	RenderList render_list;
@@ -889,9 +977,12 @@ public:
 	void _fill_render_list(InstanceBase **p_cull_result, int p_cull_count, bool p_depth_pass, bool p_shadow_pass);
 
 	void _blur_effect_buffer();
-	void _render_mrts(Environment *env, const CameraMatrix &p_cam_projection);
+	void _render_mrts(Environment *env, const CameraMatrix &p_cam_projection, const Transform &p_cam_transform);
+	bool _has_light_post_effects() const;
+	void _lens_streaks(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_target_fbo);
 	GLuint _light_shafts(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_source_color);
 	GLuint _volumetric_fog(Environment *env, const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_source_color);
+	GLuint _exp_height_fog(Environment *env, const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, GLuint p_source_color);
 	void _post_process(Environment *env, const CameraMatrix &p_cam_projection, const Transform &p_cam_transform);
 
 	void _prepare_depth_texture();
@@ -901,6 +992,39 @@ public:
 	virtual void render_scene(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, const int p_eye, bool p_cam_ortogonal, InstanceBase **p_cull_result, int p_cull_count, RID *p_light_cull_result, int p_light_cull_count, RID *p_reflection_probe_cull_result, int p_reflection_probe_cull_count, RID p_environment, RID p_shadow_atlas, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass);
 	virtual void render_shadow(RID p_light, RID p_shadow_atlas, int p_pass, InstanceBase **p_cull_result, int p_cull_count);
 	virtual bool free(RID p_rid);
+
+	/* DYNAMIC GI (dynamic_gi_gles3.cpp) */
+
+	struct DynamicGIData {
+		Map<RID, DynamicGIGLES3::State *> states; // by scenario
+		DynamicGIGLES3::State *current = nullptr;
+		GLuint programs[16] = {};
+		bool program_tried[16] = {};
+		GLuint zero_ubo = 0;
+		GLuint zero_ssbo = 0;
+		GLuint empty_vao = 0;
+		GLuint voxel_fbo = 0;
+	} gi;
+
+	void _gi_initialize();
+	GLuint _gi_get_program(int p_which);
+	void _gi_bind(DynamicGIGLES3::State *p_state);
+	DynamicGIGLES3::State *_gi_create_state(const Environment *p_env);
+	void _gi_free_state(DynamicGIGLES3::State *p_state);
+	void _gi_clear_tiles(DynamicGIGLES3::State *p_state, const DynamicGIGLES3::Region &p_region, bool p_radiance);
+	bool _gi_take_region(DynamicGIGLES3::State *p_state, int p_cascade, DynamicGIGLES3::Region &r_region);
+	void _gi_draw_debug(Environment *env, const CameraMatrix &p_cam_projection, const Transform &p_cam_transform);
+	bool _ssgi_prepare_buffers(RasterizerStorageGLES3::RenderTarget *rt);
+	void _render_ssgi(Environment *env, const CameraMatrix &p_cam_projection, const Transform &p_cam_transform);
+	void _ssgi_draw_composite(Environment *env, const CameraMatrix &p_cam_projection, bool p_show_only);
+
+	virtual bool dynamic_gi_begin(RID p_scenario, RID p_environment, const Transform &p_cam_transform, bool p_reflection_probe);
+	virtual bool dynamic_gi_next_region(AABB &r_aabb);
+	virtual void dynamic_gi_render_region(RID p_environment, InstanceBase **p_cull_result, int p_cull_count);
+	virtual AABB dynamic_gi_get_bounds();
+	virtual void dynamic_gi_finish(RID p_environment, const RID *p_lights, int p_light_count);
+	virtual void dynamic_gi_mark_dirty(RID p_scenario, const AABB &p_aabb);
+	virtual void dynamic_gi_free(RID p_scenario);
 
 	virtual void set_scene_pass(uint64_t p_pass);
 	virtual void set_debug_draw_mode(VS::ViewportDebugDraw p_debug_draw);

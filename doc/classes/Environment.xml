@@ -140,6 +140,76 @@
 		<member name="dof_blur_near_transition" type="float" setter="set_dof_blur_near_transition" getter="get_dof_blur_near_transition" default="1.0">
 			The length of the transition between the near blur and no-blur area.
 		</member>
+		<member name="dynamic_gi_bounce_feedback" type="float" setter="set_dynamic_gi_bounce_feedback" getter="get_dynamic_gi_bounce_feedback" default="0.8">
+			How much of the gathered indirect light is bounced again. [code]0[/code] gives a single bounce; values near [code]1[/code] fill enclosed spaces with more light.
+		</member>
+		<member name="dynamic_gi_cascades" type="int" setter="set_dynamic_gi_cascades" getter="get_dynamic_gi_cascades" default="4">
+			Number of nested voxel volumes around the camera. Each one covers twice the size of the previous at half the detail. With the default [member dynamic_gi_voxel_size], 4 cascades cover 128 meters.
+		</member>
+		<member name="dynamic_gi_cull_mask" type="int" setter="set_dynamic_gi_cull_mask" getter="get_dynamic_gi_cull_mask" default="1048575">
+			Only geometry on these render layers blocks and bounces light. Particles, transparent and unshaded surfaces never do.
+		</member>
+		<member name="dynamic_gi_debug" type="int" setter="set_dynamic_gi_debug" getter="get_dynamic_gi_debug" enum="Environment.DynamicGIDebug" default="0">
+			Replaces the opaque image with one of the GI buffers, see [enum DynamicGIDebug].
+		</member>
+		<member name="dynamic_gi_enabled" type="bool" setter="set_dynamic_gi_enabled" getter="is_dynamic_gi_enabled" default="false">
+			If [code]true[/code], enables dynamic global illumination: light bounces, sky occlusion and emissive lighting with no baking. The scene is voxelized around the camera and sampled through irradiance probes. Replaces ambient light inside the covered area; lightmaps and [GIProbe]s take priority on the objects that use them. A [Light] whose [member Light.light_bake_mode] is [constant Light.BAKE_DISABLED] does not contribute, and [member Light.light_indirect_energy] scales its bounce.
+			[b]Note:[/b] Only available with the GLES3 renderer. Only one view per [World] moves the volumes; the others sample the same data.
+		</member>
+		<member name="dynamic_gi_energy" type="float" setter="set_dynamic_gi_energy" getter="get_dynamic_gi_energy" default="1.0">
+			Multiplier for the indirect light applied to surfaces.
+		</member>
+		<member name="dynamic_gi_hysteresis" type="float" setter="set_dynamic_gi_hysteresis" getter="get_dynamic_gi_hysteresis" default="0.95">
+			How much each probe keeps of its previous value. Higher is smoother but reacts more slowly to lighting changes.
+		</member>
+		<member name="dynamic_gi_normal_bias" type="float" setter="set_dynamic_gi_normal_bias" getter="get_dynamic_gi_normal_bias" default="1.1">
+			Offset along the surface normal used when sampling probes, in voxels. Raise it to reduce self-shadowing, lower it to reduce light leaking.
+		</member>
+		<member name="dynamic_gi_rays" type="int" setter="set_dynamic_gi_rays" getter="get_dynamic_gi_rays" default="64">
+			Rays traced per probe update: 64, 128 or 192. More rays give less noise and cost proportionally more.
+		</member>
+		<member name="dynamic_gi_reflection_occlusion" type="bool" setter="set_dynamic_gi_reflection_occlusion" getter="is_dynamic_gi_reflection_occlusion" default="true">
+			If [code]true[/code], sky reflections are darkened where little sky light arrives, and rough reflections come from the probes. Keeps interiors from reflecting the sky through walls.
+		</member>
+		<member name="dynamic_gi_voxel_size" type="float" setter="set_dynamic_gi_voxel_size" getter="get_dynamic_gi_voxel_size" default="0.25">
+			Voxel size of the finest cascade, in meters. Walls thinner than one voxel may leak light. Changing it rebuilds the volumes.
+		</member>
+		<member name="exp_height_fog_density" type="float" setter="set_exp_height_fog_density" getter="get_exp_height_fog_density" default="0.04">
+			Fog density at [member exp_height_fog_ref_height]. Higher is thicker. The [ExpHeightFog] node's [member ExpHeightFog.density], moved onto Environment.
+		</member>
+		<member name="exp_height_fog_directional_color" type="Color" setter="set_exp_height_fog_directional_color" getter="get_exp_height_fog_directional_color" default="Color( 1, 0.9, 0.7, 1 )">
+			Colour of the directional inscattering glow. See [member ExpHeightFog.directional_color].
+		</member>
+		<member name="exp_height_fog_directional_enabled" type="bool" setter="set_exp_height_fog_directional_enabled" getter="is_exp_height_fog_directional_enabled" default="false">
+			Enables a sun-tinted glow when looking toward [member exp_height_fog_light_direction]. Not shadowed -- this fog does not sample the shadow map, unlike [member Environment.volumetric_fog_enabled].
+		</member>
+		<member name="exp_height_fog_directional_exponent" type="float" setter="set_exp_height_fog_directional_exponent" getter="get_exp_height_fog_directional_exponent" default="4.0">
+			Tightness of the directional glow. Higher concentrates it nearer [member exp_height_fog_light_direction].
+		</member>
+		<member name="exp_height_fog_enabled" type="bool" setter="set_exp_height_fog_enabled" getter="is_exp_height_fog_enabled" default="false">
+			If [code]true[/code], enables a single-pass analytic exponential height fog: the [ExpHeightFog] node's model, driven from Environment instead of a scene node. Cheaper than [member volumetric_fog_enabled] (no shadow sampling, no raymarch), at the cost of not being shadow-aware. The [ExpHeightFog] node still works standalone and stacks with this if both are enabled.
+		</member>
+		<member name="exp_height_fog_falloff" type="float" setter="set_exp_height_fog_falloff" getter="get_exp_height_fog_falloff" default="0.15">
+			Height falloff. Larger values confine the fog closer to [member exp_height_fog_ref_height]; smaller values let it rise higher.
+		</member>
+		<member name="exp_height_fog_inscatter" type="Color" setter="set_exp_height_fog_inscatter" getter="get_exp_height_fog_inscatter" default="Color( 0.55, 0.62, 0.72, 1 )">
+			Base fog colour.
+		</member>
+		<member name="exp_height_fog_light_direction" type="Vector3" setter="set_exp_height_fog_light_direction" getter="get_exp_height_fog_light_direction" default="Vector3( 0, -1, 0 )">
+			Direction the light travels, used only for the directional glow. Set this to your sun's forward (-Z) vector; unlike [member volumetric_fog_enabled] this is not read from a scene [DirectionalLight] automatically.
+		</member>
+		<member name="exp_height_fog_max_opacity" type="float" setter="set_exp_height_fog_max_opacity" getter="get_exp_height_fog_max_opacity" default="1.0">
+			Upper clamp on fog opacity.
+		</member>
+		<member name="exp_height_fog_ref_height" type="float" setter="set_exp_height_fog_ref_height" getter="get_exp_height_fog_ref_height" default="0.0">
+			World-space Y where density equals [member exp_height_fog_density] (the fog "sea level"). If [member exp_height_fog_ref_height_relative] is [code]true[/code] this is instead an offset added to the camera's world Y each frame.
+		</member>
+		<member name="exp_height_fog_ref_height_relative" type="bool" setter="set_exp_height_fog_ref_height_relative" getter="is_exp_height_fog_ref_height_relative" default="false">
+			If [code]true[/code], [member exp_height_fog_ref_height] is treated as an offset from the camera's height rather than an absolute world Y, so the fog "sea level" follows the camera. See [member ExpHeightFog.ref_height_relative].
+		</member>
+		<member name="exp_height_fog_start_distance" type="float" setter="set_exp_height_fog_start_distance" getter="get_exp_height_fog_start_distance" default="0.0">
+			Distance from the camera before the fog begins.
+		</member>
 		<member name="fog_color" type="Color" setter="set_fog_color" getter="get_fog_color" default="Color( 0.5, 0.6, 0.7, 1 )">
 			The fog's [Color].
 		</member>
@@ -290,6 +360,31 @@
 		<member name="ssao_radius2" type="float" setter="set_ssao_radius2" getter="get_ssao_radius2" default="0.0">
 			The secondary screen-space ambient occlusion radius. If set to a value higher than [code]0[/code], enables the secondary screen-space ambient occlusion effect which can be used to improve the effect's appearance (at the cost of performance).
 		</member>
+		<member name="ssgi_enabled" type="bool" setter="set_ssgi_enabled" getter="is_ssgi_enabled" default="false">
+			If [code]true[/code], enables screen space global illumination, which adds fine bounce light from what is on screen. Works alone or on top of dynamic GI, where hits replace the ambient light they occlude.
+			[b]Note:[/b] Only available with the GLES3 renderer, in HDR viewports. Light from off-screen surfaces is not seen, so it disappears at the screen edges.
+		</member>
+		<member name="ssgi_half_resolution" type="bool" setter="set_ssgi_half_resolution" getter="is_ssgi_half_resolution" default="true">
+			If [code]true[/code], traces and denoises at half resolution.
+		</member>
+		<member name="ssgi_intensity" type="float" setter="set_ssgi_intensity" getter="get_ssgi_intensity" default="1.0">
+			Multiplier for the bounced light.
+		</member>
+		<member name="ssgi_radius" type="float" setter="set_ssgi_radius" getter="get_ssgi_radius" default="4.0">
+			Maximum ray length, in meters.
+		</member>
+		<member name="ssgi_rays" type="int" setter="set_ssgi_rays" getter="get_ssgi_rays" default="4">
+			Rays per traced pixel.
+		</member>
+		<member name="ssgi_steps" type="int" setter="set_ssgi_steps" getter="get_ssgi_steps" default="12">
+			Samples taken along each ray.
+		</member>
+		<member name="ssgi_temporal_blend" type="float" setter="set_ssgi_temporal_blend" getter="get_ssgi_temporal_blend" default="0.95">
+			How much of the previous frame is kept. Higher is smoother, with more ghosting behind moving objects.
+		</member>
+		<member name="ssgi_thickness" type="float" setter="set_ssgi_thickness" getter="get_ssgi_thickness" default="0.5">
+			Assumed depth of on-screen surfaces, in meters. Rays passing further behind one ignore it.
+		</member>
 		<member name="tonemap_exposure" type="float" setter="set_tonemap_exposure" getter="get_tonemap_exposure" default="1.0">
 			The default exposure used for tonemapping.
 		</member>
@@ -321,13 +416,16 @@
 			Exponential vertical falloff of the volumetric fog density. Larger values keep fog closer to [member volumetric_fog_height_ref]; smaller values let it rise higher.
 		</member>
 		<member name="volumetric_fog_height_ref" type="float" setter="set_volumetric_fog_height_ref" getter="get_volumetric_fog_height_ref" default="0.0">
-			World-space Y where the volumetric fog density equals [member volumetric_fog_density] (its "sea level").
+			World-space Y where the volumetric fog density equals [member volumetric_fog_density] (its "sea level"). If [member volumetric_fog_height_relative] is [code]true[/code] this is instead an offset added to the camera's world Y each frame.
+		</member>
+		<member name="volumetric_fog_height_relative" type="bool" setter="set_volumetric_fog_height_relative" getter="is_volumetric_fog_height_relative" default="false">
+			If [code]true[/code], [member volumetric_fog_height_ref] is treated as an offset from the camera's height rather than an absolute world Y, so the fog "sea level" follows the camera. Useful in large or vertical scenes where the fog would otherwise thin out or disappear as the camera climbs.
 		</member>
 		<member name="volumetric_fog_length" type="float" setter="set_volumetric_fog_length" getter="get_volumetric_fog_length" default="160.0">
 			Maximum distance from the camera the volumetric fog is marched to. Beyond this, pixels (including the sky) receive no volumetric contribution. Keep it as short as the scene allows for quality and performance.
 		</member>
 		<member name="volumetric_fog_samples" type="int" setter="set_volumetric_fog_samples" getter="get_volumetric_fog_samples" default="48">
-			Number of raymarch steps per pixel. Higher is less noisy at a linear cost. The temporal filter ([member volumetric_fog_temporal_blend]) hides most of the noise from low counts.
+			Number of raymarch steps per pixel (8–512). Higher is less noisy at a linear cost. The spatial filter ([member ProjectSettings.rendering/quality/volumetric_fog/use_filter]) and temporal reprojection ([member volumetric_fog_temporal_blend]) hide most of the noise from low counts.
 		</member>
 		<member name="volumetric_fog_sun_energy" type="float" setter="set_volumetric_fog_sun_energy" getter="get_volumetric_fog_sun_energy" default="1.0">
 			Extra multiplier on the [DirectionalLight]'s contribution to the volumetric fog, on top of the light's own energy.
@@ -419,6 +517,21 @@
 		</constant>
 		<constant name="SSAO_QUALITY_HIGH" value="2" enum="SSAOQuality">
 			High quality for the screen-space ambient occlusion effect (slowest).
+		</constant>
+		<constant name="DYNAMIC_GI_DEBUG_DISABLED" value="0" enum="DynamicGIDebug">
+			Normal rendering.
+		</constant>
+		<constant name="DYNAMIC_GI_DEBUG_LIGHTING" value="1" enum="DynamicGIDebug">
+			Shows the lit voxels.
+		</constant>
+		<constant name="DYNAMIC_GI_DEBUG_ALBEDO" value="2" enum="DynamicGIDebug">
+			Shows the voxel albedo.
+		</constant>
+		<constant name="DYNAMIC_GI_DEBUG_IRRADIANCE" value="3" enum="DynamicGIDebug">
+			Shows the probe lighting on surfaces. Areas no probe covers are purple.
+		</constant>
+		<constant name="DYNAMIC_GI_DEBUG_SSGI" value="4" enum="DynamicGIDebug">
+			Shows the denoised screen space GI.
 		</constant>
 	</constants>
 </class>

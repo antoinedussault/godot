@@ -1747,6 +1747,9 @@
 		<member name="rendering/quality/shading/force_vertex_shading.mobile" type="bool" setter="" getter="" default="true">
 			Lower-end override for [member rendering/quality/shading/force_vertex_shading] on mobile devices, due to performance concerns or driver support. If lighting looks broken after exporting the project to a mobile platform, try disabling this setting.
 		</member>
+		<member name="rendering/quality/lights/projector_size" type="int" setter="" getter="" default="512">
+			Resolution each light projector texture is packed at inside the shared projector atlas (see [member Light.light_projector]). [OmniLight] cookies occupy twice this height, since they store two dual-paraboloid halves stacked vertically. Higher values sharpen cookies at the cost of atlas memory.
+		</member>
 		<member name="rendering/quality/shading/use_physical_light_attenuation" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], enables new physical light attenuation for [OmniLight]s and [SpotLight]s. This results in more realistic lighting appearance with a very small performance cost. When physical light attenuation is enabled, lights will appear to be darker as a result of the new attenuation formula. This can be compensated by adjusting the lights' energy or attenuation values.
 			Changes to this setting will only be applied upon restarting the application.
@@ -1813,6 +1816,12 @@
 		</member>
 		<member name="rendering/quality/subsurface_scattering/weight_samples" type="bool" setter="" getter="" default="true">
 			Weight subsurface scattering samples. Helps to avoid reading samples from unrelated parts of the screen.
+		</member>
+		<member name="rendering/quality/volumetric_fog/resolution" type="int" setter="" getter="" default="1">
+			Resolution of the [member Environment.volumetric_fog_enabled] raymarch buffer: [code]0[/code] full, [code]1[/code] half, [code]2[/code] quarter of the viewport. Lower is much faster; the spatial filter and temporal reprojection hide most of the resolution loss. Takes effect when the viewport is next (re)sized.
+		</member>
+		<member name="rendering/quality/volumetric_fog/use_filter" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], runs a separable blur on the volumetric fog buffer before compositing, so a lower [member Environment.volumetric_fog_samples] still looks smooth. The analog of Godot 4's volumetric fog "Use Filter".
 		</member>
 		<member name="rendering/quality/voxel_cone_tracing/high_quality" type="bool" setter="" getter="" default="false">
 			Use high-quality voxel cone tracing. This results in better-looking reflections, but is much more expensive on the GPU.

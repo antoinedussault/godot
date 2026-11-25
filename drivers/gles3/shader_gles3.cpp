@@ -61,6 +61,29 @@ ShaderCacheGLES3 *ShaderGLES3::shader_cache;
 ThreadedCallableQueue<GLuint> *ShaderGLES3::cache_write_queue;
 
 ThreadedCallableQueue<GLuint> *ShaderGLES3::compile_queue;
+// Desktop GL 4.0+ has these in core. Mobile GLES3 headers predate tessellation;
+// the stages are simply never instantiated there, but the table still needs to compile.
+#ifndef GL_TESS_CONTROL_SHADER
+#define GL_TESS_CONTROL_SHADER 0x8E88
+#endif
+#ifndef GL_TESS_EVALUATION_SHADER
+#define GL_TESS_EVALUATION_SHADER 0x8E87
+#endif
+
+const GLenum ShaderGLES3::stage_gl_type[ShaderGLES3::STAGE_MAX] = {
+	GL_VERTEX_SHADER,
+	GL_TESS_CONTROL_SHADER,
+	GL_TESS_EVALUATION_SHADER,
+	GL_FRAGMENT_SHADER,
+};
+
+const char *ShaderGLES3::stage_name[ShaderGLES3::STAGE_MAX] = {
+	"Vertex",
+	"Tessellation Control",
+	"Tessellation Evaluation",
+	"Fragment",
+};
+
 bool ShaderGLES3::parallel_compile_supported;
 
 bool ShaderGLES3::async_hidden_forbidden;
@@ -111,6 +134,16 @@ bool ShaderGLES3::_bind(bool p_binding_fallback) {
 
 	bool must_be_ready_now = !is_async_compilation_supported() || p_binding_fallback;
 
+	if (!must_be_ready_now && has_tess) {
+		// The ubershader never carries tessellation stages, so falling back to it
+		// would draw undisplaced geometry - a visible shape change, not the usual
+		// shading approximation. Compile these synchronously instead.
+		const CustomCode *tess_cc = custom_code_map.getptr(new_conditional_version.code_version);
+		if (tess_cc && tess_cc->uses_tessellation) {
+			must_be_ready_now = true;
+		}
+	}
+
 	conditional_version = new_conditional_version;
 	version = get_current_version(must_be_ready_now);
 	ERR_FAIL_COND_V(!version, false);
@@ -139,7 +172,7 @@ bool ShaderGLES3::_bind(bool p_binding_fallback) {
 		DEBUG_TEST_ERROR("Use Program");
 		active = this;
 		return true;
-	} else if (!must_be_ready_now && version->async_mode == ASYNC_MODE_VISIBLE && !p_binding_fallback && get_ubershader_flags_uniform() != -1) {
+	} else if (!must_be_ready_now && ubershader_fallback_enabled && version->async_mode == ASYNC_MODE_VISIBLE && !p_binding_fallback && get_ubershader_flags_uniform() != -1) {
 		// We can and have to fall back to the ubershader
 		return _bind_ubershader();
 	} else {
@@ -249,85 +282,84 @@ bool ShaderGLES3::_process_program_state(Version *p_version, bool p_async_forbid
 			case Version::COMPILE_STATUS_RESTART_NEEDED: {
 				// These lead to nowhere unless other piece of code starts the compile process
 			} break;
-			case Version::COMPILE_STATUS_SOURCE_PROVIDED: {
-				uint32_t start_compiles_count = p_async_forbidden ? 2 : 0;
-				if (!start_compiles_count) {
-					uint32_t used_async_slots = MAX(active_compiles_count, *compiles_started_this_frame);
-					uint32_t free_async_slots = used_async_slots < max_simultaneous_compiles ? max_simultaneous_compiles - used_async_slots : 0;
-					start_compiles_count = MIN(2, free_async_slots);
-				}
-				if (start_compiles_count >= 1) {
-					glCompileShader(p_version->ids.vert);
-					if (start_compiles_count == 1) {
-						p_version->compile_status = Version::COMPILE_STATUS_COMPILING_VERTEX;
-					} else {
-						glCompileShader(p_version->ids.frag);
-						p_version->compile_status = Version::COMPILE_STATUS_COMPILING_VERTEX_AND_FRAGMENT;
+			case Version::COMPILE_STATUS_SOURCE_PROVIDED:
+			case Version::COMPILE_STATUS_COMPILING_STAGES: {
+				// Stages this program actually uses; absent ones carry a zero id.
+				int stage_order[STAGE_MAX];
+				int stage_count = 0;
+				for (int i = 0; i < STAGE_MAX; i++) {
+					if (p_version->ids.stage[i]) {
+						stage_order[stage_count++] = i;
 					}
+				}
+
+				if (p_version->compile_status == Version::COMPILE_STATUS_SOURCE_PROVIDED) {
+					p_version->stages_started = 0;
+					p_version->stages_done = 0;
+					p_version->slots_held = 0;
+					p_version->compile_status = Version::COMPILE_STATUS_COMPILING_STAGES;
 					if (!p_async_forbidden) {
 						versions_compiling.add_last(&p_version->compiling_list);
-						// Vertex and fragment shaders take independent compile slots
-						active_compiles_count += start_compiles_count;
-						*max_frame_compiles_in_progress = MAX(*max_frame_compiles_in_progress, active_compiles_count);
-						_log_active_compiles();
-					}
-					(*compiles_started_this_frame) += start_compiles_count;
-					run_next_step = p_async_forbidden;
-				}
-			} break;
-			case Version::COMPILE_STATUS_COMPILING_VERTEX: {
-				bool must_compile_frag_now = p_async_forbidden;
-				if (!must_compile_frag_now) {
-					if (active_compiles_count < max_simultaneous_compiles && *compiles_started_this_frame < max_simultaneous_compiles) {
-						must_compile_frag_now = true;
 					}
 				}
-				if (must_compile_frag_now) {
-					glCompileShader(p_version->ids.frag);
-					if (p_version->compiling_list.in_list()) {
-						active_compiles_count++;
-						*max_frame_compiles_in_progress = MAX(*max_frame_compiles_in_progress, active_compiles_count);
-						_log_active_compiles();
-					}
-					p_version->compile_status = Version::COMPILE_STATUS_COMPILING_VERTEX_AND_FRAGMENT;
-				} else if (parallel_compile_supported) {
-					GLint completed = 0;
-					glGetShaderiv(p_version->ids.vert, _EXT_COMPLETION_STATUS, &completed);
-					if (completed) {
-						// Not touching compiles count since the same slot used for vertex is now used for fragment
-						glCompileShader(p_version->ids.frag);
-						p_version->compile_status = Version::COMPILE_STATUS_COMPILING_FRAGMENT;
-					}
-				}
-				run_next_step = p_async_forbidden;
-			} break;
-			case Version::COMPILE_STATUS_COMPILING_FRAGMENT:
-			case Version::COMPILE_STATUS_COMPILING_VERTEX_AND_FRAGMENT: {
-				bool must_complete_now = p_async_forbidden;
-				if (!must_complete_now && parallel_compile_supported) {
-					GLint vertex_completed = 0;
-					if (p_version->compile_status == Version::COMPILE_STATUS_COMPILING_FRAGMENT) {
-						vertex_completed = true;
-					} else {
-						glGetShaderiv(p_version->ids.vert, _EXT_COMPLETION_STATUS, &vertex_completed);
-						if (p_version->compiling_list.in_list()) {
+
+				// --- Retire finished stages, freeing their compile slots. ---
+				// One slot is deliberately held until a terminal transition, which is what
+				// the terminal sites below release; releasing it here would underflow them.
+				if (parallel_compile_supported && !p_async_forbidden) {
+					while (p_version->stages_done < p_version->stages_started) {
+						GLint completed = 0;
+						glGetShaderiv(p_version->ids.stage[stage_order[p_version->stages_done]], _EXT_COMPLETION_STATUS, &completed);
+						if (!completed) {
+							break;
+						}
+						p_version->stages_done++;
+						if (p_version->slots_held > 1) {
+							p_version->slots_held--;
 							active_compiles_count--;
 #ifdef DEV_ENABLED
 							CRASH_COND(active_compiles_count == UINT32_MAX);
 #endif
-							*max_frame_compiles_in_progress = MAX(*max_frame_compiles_in_progress, active_compiles_count);
 							_log_active_compiles();
-						}
-						p_version->compile_status = Version::COMPILE_STATUS_COMPILING_FRAGMENT;
-					}
-					if (vertex_completed) {
-						GLint frag_completed = 0;
-						glGetShaderiv(p_version->ids.frag, _EXT_COMPLETION_STATUS, &frag_completed);
-						if (frag_completed) {
-							must_complete_now = true;
 						}
 					}
 				}
+
+				// --- Start further stages into whatever budget is free. ---
+				uint32_t remaining = (uint32_t)stage_count - p_version->stages_started;
+				if (remaining > 0) {
+					uint32_t to_start;
+					if (p_async_forbidden) {
+						to_start = remaining;
+					} else {
+						uint32_t used_async_slots = MAX(active_compiles_count, *compiles_started_this_frame);
+						uint32_t free_async_slots = used_async_slots < max_simultaneous_compiles ? max_simultaneous_compiles - used_async_slots : 0;
+						to_start = MIN(remaining, free_async_slots);
+					}
+
+					if (to_start > 0) {
+						for (uint32_t i = 0; i < to_start; i++) {
+							glCompileShader(p_version->ids.stage[stage_order[p_version->stages_started + i]]);
+						}
+						p_version->stages_started += to_start;
+
+						if (!p_async_forbidden) {
+							active_compiles_count += to_start;
+							p_version->slots_held += to_start;
+							*max_frame_compiles_in_progress = MAX(*max_frame_compiles_in_progress, active_compiles_count);
+							_log_active_compiles();
+						}
+						(*compiles_started_this_frame) += to_start;
+					}
+				}
+
+				// --- Finish once every stage has compiled. ---
+				bool all_started = p_version->stages_started == (uint32_t)stage_count;
+				bool must_complete_now = p_async_forbidden && all_started;
+				if (!must_complete_now && all_started && parallel_compile_supported) {
+					must_complete_now = p_version->stages_done == (uint32_t)stage_count;
+				}
+
 				if (must_complete_now) {
 					bool must_save_to_cache = p_version->version_key.is_subject_to_caching() && p_version->program_binary.source != Version::ProgramBinary::SOURCE_CACHE && shader_cache;
 					bool ok = p_version->shader->_complete_compile(p_version->ids, must_save_to_cache);
@@ -338,13 +370,16 @@ bool ShaderGLES3::_process_program_state(Version *p_version, bool p_async_forbid
 						p_version->compile_status = Version::COMPILE_STATUS_ERROR;
 						if (p_version->compiling_list.in_list()) {
 							p_version->compiling_list.remove_from_list();
-							active_compiles_count--;
+							active_compiles_count -= p_version->slots_held;
+							p_version->slots_held = 0;
 #ifdef DEV_ENABLED
 							CRASH_COND(active_compiles_count == UINT32_MAX);
 #endif
 							_log_active_compiles();
 						}
 					}
+				} else {
+					run_next_step = p_async_forbidden;
 				}
 			} break;
 			case Version::COMPILE_STATUS_PROCESSING_AT_QUEUE: {
@@ -353,7 +388,8 @@ bool ShaderGLES3::_process_program_state(Version *p_version, bool p_async_forbid
 					case -1: { // Error
 						p_version->compile_status = Version::COMPILE_STATUS_ERROR;
 						p_version->compiling_list.remove_from_list();
-						active_compiles_count--;
+						active_compiles_count -= p_version->slots_held;
+						p_version->slots_held = 0;
 #ifdef DEV_ENABLED
 						CRASH_COND(active_compiles_count == UINT32_MAX);
 #endif
@@ -384,6 +420,7 @@ bool ShaderGLES3::_process_program_state(Version *p_version, bool p_async_forbid
 					if (!p_async_forbidden) {
 						versions_compiling.add_last(&p_version->compiling_list);
 						active_compiles_count++;
+						p_version->slots_held = 1;
 						*max_frame_compiles_in_progress = MAX(*max_frame_compiles_in_progress, active_compiles_count);
 						_log_active_compiles();
 						(*compiles_started_this_frame)++;
@@ -448,7 +485,11 @@ bool ShaderGLES3::_process_program_state(Version *p_version, bool p_async_forbid
 					p_version->program_binary.cache_hash.clear();
 					if (p_version->compiling_list.in_list()) {
 						p_version->compiling_list.remove_from_list();
-						active_compiles_count--;
+						// May be more than one: a version holds a slot per stage that
+						// was started, and a pass with async forbidden completes without
+						// going through the polling path that trims them back.
+						active_compiles_count -= p_version->slots_held;
+						p_version->slots_held = 0;
 #ifdef DEV_ENABLED
 						CRASH_COND(active_compiles_count == UINT32_MAX);
 #endif
@@ -536,7 +577,17 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 		effective_version.version = VersionKey::UBERSHADER_FLAG;
 	}
 
+	// Tessellation is per-variant, never part of the ubershader: the ubershader
+	// resolves conditionals at runtime, but adding or removing shader stages
+	// cannot be a runtime branch, so it always builds without them.
+	const bool build_tess = has_tess && tess_conditional_index >= 0 &&
+			!(effective_version.version & VersionKey::UBERSHADER_FLAG) &&
+			(effective_version.version & (1 << tess_conditional_index)) != 0;
+
 	Version *_v = version_map.getptr(effective_version);
+	if (_v) {
+		_v->tessellated = build_tess;
+	}
 	CustomCode *cc = nullptr;
 	if (_v) {
 		if (_v->compile_status == Version::COMPILE_STATUS_RESTART_NEEDED) {
@@ -567,7 +618,7 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 
 	LocalVector<const char *> strings_common;
 #ifdef GLES_OVER_GL
-	strings_common.push_back("#version 330\n");
+	strings_common.push_back("#version 460 core\n");
 	strings_common.push_back("#define GLES_OVER_GL\n");
 #else
 	strings_common.push_back("#version 300 es\n");
@@ -621,6 +672,16 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 		CharString code_globals;
 		CharString material_string;
 	} frag;
+	struct {
+		CharString code_string;
+		CharString code_globals;
+		CharString material_string;
+	} tesc;
+	struct {
+		CharString code_string;
+		CharString code_globals;
+		CharString material_string;
+	} tese;
 
 	if (effective_version.code_version != 0) {
 		ERR_FAIL_COND_V(!custom_code_map.has(effective_version.code_version), nullptr);
@@ -636,6 +697,7 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 
 	/* CREATE PROGRAM */
 
+	v.tessellated = build_tess;
 	v.ids.main = glCreateProgram();
 
 	ERR_FAIL_COND_V(v.ids.main == 0, nullptr);
@@ -799,10 +861,112 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 	}
 #endif
 
+	/* TESSELLATION SHADERS (only for shaders that declare them) */
+
+	LocalVector<const char *> strings_tess_control(strings_common);
+	LocalVector<const char *> strings_tess_eval(strings_common);
+
+	if (build_tess) {
+		strings_tess_control.push_back("precision highp float;\n");
+		strings_tess_control.push_back("precision highp int;\n");
+		strings_tess_eval.push_back("precision highp float;\n");
+		strings_tess_eval.push_back("precision highp int;\n");
+
+		if (build_ubershader) {
+			CharString s0 = _prepare_ubershader_chunk(tess_control_code0);
+			filtered_strings.push_back(s0);
+			strings_tess_control.push_back(s0.get_data());
+		} else {
+			strings_tess_control.push_back(tess_control_code0.get_data());
+		}
+		if (cc) {
+			tesc.material_string = cc->uniforms.ascii();
+			strings_tess_control.push_back(tesc.material_string.get_data());
+		}
+		if (build_ubershader) {
+			CharString s1 = _prepare_ubershader_chunk(tess_control_code1);
+			filtered_strings.push_back(s1);
+			strings_tess_control.push_back(s1.get_data());
+		} else {
+			strings_tess_control.push_back(tess_control_code1.get_data());
+		}
+		if (cc) {
+			tesc.code_globals = cc->tess_control_globals.ascii();
+			strings_tess_control.push_back(tesc.code_globals.get_data());
+		}
+		if (build_ubershader) {
+			CharString s2 = _prepare_ubershader_chunk(tess_control_code2);
+			filtered_strings.push_back(s2);
+			strings_tess_control.push_back(s2.get_data());
+		} else {
+			strings_tess_control.push_back(tess_control_code2.get_data());
+		}
+		if (cc) {
+			tesc.code_string = cc->tess_control.ascii();
+			strings_tess_control.push_back(tesc.code_string.get_data());
+		}
+		if (build_ubershader) {
+			CharString s3 = _prepare_ubershader_chunk(tess_control_code3);
+			filtered_strings.push_back(s3);
+			strings_tess_control.push_back(s3.get_data());
+		} else {
+			strings_tess_control.push_back(tess_control_code3.get_data());
+		}
+
+		if (build_ubershader) {
+			CharString e0 = _prepare_ubershader_chunk(tess_eval_code0);
+			filtered_strings.push_back(e0);
+			strings_tess_eval.push_back(e0.get_data());
+		} else {
+			strings_tess_eval.push_back(tess_eval_code0.get_data());
+		}
+		if (cc) {
+			tese.material_string = cc->uniforms.ascii();
+			strings_tess_eval.push_back(tese.material_string.get_data());
+		}
+		if (build_ubershader) {
+			CharString e1 = _prepare_ubershader_chunk(tess_eval_code1);
+			filtered_strings.push_back(e1);
+			strings_tess_eval.push_back(e1.get_data());
+		} else {
+			strings_tess_eval.push_back(tess_eval_code1.get_data());
+		}
+		if (cc) {
+			tese.code_globals = cc->tess_eval_globals.ascii();
+			strings_tess_eval.push_back(tese.code_globals.get_data());
+		}
+		if (build_ubershader) {
+			CharString e2 = _prepare_ubershader_chunk(tess_eval_code2);
+			filtered_strings.push_back(e2);
+			strings_tess_eval.push_back(e2.get_data());
+		} else {
+			strings_tess_eval.push_back(tess_eval_code2.get_data());
+		}
+		if (cc) {
+			tese.code_string = cc->tess_eval.ascii();
+			strings_tess_eval.push_back(tese.code_string.get_data());
+		}
+		if (build_ubershader) {
+			CharString e3 = _prepare_ubershader_chunk(tess_eval_code3);
+			filtered_strings.push_back(e3);
+			strings_tess_eval.push_back(e3.get_data());
+		} else {
+			strings_tess_eval.push_back(tess_eval_code3.get_data());
+		}
+	}
+
 	if (!r_async_forbidden) {
 		r_async_forbidden =
 				(v.async_mode == ASYNC_MODE_HIDDEN && async_hidden_forbidden) ||
 				(v.async_mode == ASYNC_MODE_VISIBLE && get_ubershader_flags_uniform() == -1);
+	}
+
+	LocalVector<const char *> stage_strings[STAGE_MAX];
+	stage_strings[STAGE_VERTEX] = strings_vertex;
+	stage_strings[STAGE_FRAGMENT] = strings_fragment;
+	if (build_tess) {
+		stage_strings[STAGE_TESS_CONTROL] = strings_tess_control;
+		stage_strings[STAGE_TESS_EVAL] = strings_tess_eval;
 	}
 
 	bool in_cache = false;
@@ -813,7 +977,7 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 			reinterpret_cast<const char *>(glGetString(GL_VERSION)),
 			nullptr,
 		};
-		v.program_binary.cache_hash = ShaderCacheGLES3::hash_program(strings_platform, strings_vertex, strings_fragment);
+		v.program_binary.cache_hash = ShaderCacheGLES3::hash_program(strings_platform, stage_strings, STAGE_MAX);
 		if (shader_cache->retrieve(v.program_binary.cache_hash, &v.program_binary.format, &v.program_binary.data)) {
 			in_cache = true;
 			v.program_binary.source = Version::ProgramBinary::SOURCE_CACHE;
@@ -841,36 +1005,52 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 				*(r_out->ptr() + r_out->size() - 1) = '\0';
 			};
 
-			LocalVector<char> vertex_code;
-			concat_shader_strings(strings_vertex, &vertex_code);
-			LocalVector<char> fragment_code;
-			concat_shader_strings(strings_fragment, &fragment_code);
+			// One flattened buffer per stage; absent stages stay empty.
+			LocalVector<LocalVector<char>> stage_code;
+			stage_code.resize(STAGE_MAX);
+			for (int stage = 0; stage < STAGE_MAX; stage++) {
+				if (stage_strings[stage].size()) {
+					concat_shader_strings(stage_strings[stage], &stage_code[stage]);
+				}
+			}
 
 			v.program_binary.source = Version::ProgramBinary::SOURCE_QUEUE;
 			v.compile_status = Version::COMPILE_STATUS_PROCESSING_AT_QUEUE;
 			versions_compiling.add_last(&v.compiling_list);
 			active_compiles_count++;
+			v.slots_held = 1;
 			*max_frame_compiles_in_progress = MAX(*max_frame_compiles_in_progress, active_compiles_count);
 			_log_active_compiles();
 			(*compiles_started_this_frame)++;
 
-			compile_queue->enqueue(v.ids.main, [this, &v, vertex_code, fragment_code]() {
-				Version::Ids async_ids;
+			compile_queue->enqueue(v.ids.main, [this, &v, stage_code]() {
+				// Zero-initialized: a nonzero entry is what marks a stage as present,
+				// and the compile/link helpers iterate on exactly that.
+				Version::Ids async_ids = {};
 				async_ids.main = glCreateProgram();
-				async_ids.vert = glCreateShader(GL_VERTEX_SHADER);
-				async_ids.frag = glCreateShader(GL_FRAGMENT_SHADER);
 
-				LocalVector<const char *> async_strings_vertex;
-				async_strings_vertex.push_back(vertex_code.ptr());
-				LocalVector<const char *> async_strings_fragment;
-				async_strings_fragment.push_back(fragment_code.ptr());
+				LocalVector<const char *> async_stage_strings[STAGE_MAX];
+				for (int stage = 0; stage < STAGE_MAX; stage++) {
+					if (!stage_code[stage].size()) {
+						continue;
+					}
+					async_ids.stage[stage] = glCreateShader(stage_gl_type[stage]);
+					async_stage_strings[stage].push_back(stage_code[stage].ptr());
+				}
 
-				_set_source(async_ids, async_strings_vertex, async_strings_fragment);
-				glCompileShader(async_ids.vert);
-				glCompileShader(async_ids.frag);
+				_set_source(async_ids, async_stage_strings);
+				for (int stage = 0; stage < STAGE_MAX; stage++) {
+					if (async_ids.stage[stage]) {
+						glCompileShader(async_ids.stage[stage]);
+					}
+				}
+
 				if (_complete_compile(async_ids, true) && _complete_link(async_ids, &v.program_binary.format, &v.program_binary.data)) {
-					glDeleteShader(async_ids.frag);
-					glDeleteShader(async_ids.vert);
+					for (int stage = 0; stage < STAGE_MAX; stage++) {
+						if (async_ids.stage[stage]) {
+							glDeleteShader(async_ids.stage[stage]);
+						}
+					}
 					glDeleteProgram(async_ids.main);
 					v.program_binary.result_from_queue.set(1);
 				} else {
@@ -879,9 +1059,13 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 			});
 		} else {
 			// Synchronous compilation, or async. via native support
-			v.ids.vert = glCreateShader(GL_VERTEX_SHADER);
-			v.ids.frag = glCreateShader(GL_FRAGMENT_SHADER);
-			_set_source(v.ids, strings_vertex, strings_fragment);
+			v.ids.stage[STAGE_VERTEX] = glCreateShader(GL_VERTEX_SHADER);
+			v.ids.stage[STAGE_FRAGMENT] = glCreateShader(GL_FRAGMENT_SHADER);
+			if (build_tess) {
+				v.ids.stage[STAGE_TESS_CONTROL] = glCreateShader(GL_TESS_CONTROL_SHADER);
+				v.ids.stage[STAGE_TESS_EVAL] = glCreateShader(GL_TESS_EVALUATION_SHADER);
+			}
+			_set_source(v.ids, stage_strings);
 			v.program_binary.source = Version::ProgramBinary::SOURCE_LOCAL;
 			v.compile_status = Version::COMPILE_STATUS_SOURCE_PROVIDED;
 		}
@@ -894,26 +1078,44 @@ ShaderGLES3::Version *ShaderGLES3::get_current_version(bool &r_async_forbidden) 
 	return &v;
 }
 
-void ShaderGLES3::_set_source(Version::Ids p_ids, const LocalVector<const char *> &p_vertex_strings, const LocalVector<const char *> &p_fragment_strings) const {
-	glShaderSource(p_ids.vert, p_vertex_strings.size(), p_vertex_strings.ptr(), nullptr);
-	glShaderSource(p_ids.frag, p_fragment_strings.size(), p_fragment_strings.ptr(), nullptr);
+void ShaderGLES3::_set_source(Version::Ids p_ids, const LocalVector<const char *> *p_stage_strings) const {
+	for (int stage = 0; stage < STAGE_MAX; stage++) {
+		if (!p_ids.stage[stage]) {
+			continue;
+		}
+		glShaderSource(p_ids.stage[stage], p_stage_strings[stage].size(), p_stage_strings[stage].ptr(), nullptr);
+	}
+}
+
+void ShaderGLES3::_dispose_stages(Version::Ids p_ids) const {
+	for (int stage = 0; stage < STAGE_MAX; stage++) {
+		if (p_ids.stage[stage]) {
+			glDeleteShader(p_ids.stage[stage]);
+		}
+	}
+	glDeleteProgram(p_ids.main);
 }
 
 bool ShaderGLES3::_complete_compile(Version::Ids p_ids, bool p_retrievable) const {
-	GLint status;
+	// Every stage present in this program must have compiled. Absent stages
+	// (the tessellation pair, for shaders that don't use it) carry a zero id.
+	for (int stage = 0; stage < STAGE_MAX; stage++) {
+		if (!p_ids.stage[stage]) {
+			continue;
+		}
 
-	glGetShaderiv(p_ids.vert, GL_COMPILE_STATUS, &status);
-	if (status == GL_FALSE) {
-		// error compiling
+		GLint status;
+		glGetShaderiv(p_ids.stage[stage], GL_COMPILE_STATUS, &status);
+		if (status != GL_FALSE) {
+			continue;
+		}
+
 		GLsizei iloglen;
-		glGetShaderiv(p_ids.vert, GL_INFO_LOG_LENGTH, &iloglen);
+		glGetShaderiv(p_ids.stage[stage], GL_INFO_LOG_LENGTH, &iloglen);
 
 		if (iloglen < 0) {
-			glDeleteShader(p_ids.frag);
-			glDeleteShader(p_ids.vert);
-			glDeleteProgram(p_ids.main);
-
-			ERR_PRINT("Vertex shader compilation failed with empty log");
+			_dispose_stages(p_ids);
+			ERR_PRINT(String(stage_name[stage]) + " shader compilation failed with empty log");
 		} else {
 			if (iloglen == 0) {
 				iloglen = 4096; //buggy driver (Adreno 220+....)
@@ -921,58 +1123,25 @@ bool ShaderGLES3::_complete_compile(Version::Ids p_ids, bool p_retrievable) cons
 
 			char *ilogmem = (char *)memalloc(iloglen + 1);
 			ilogmem[iloglen] = 0;
-			glGetShaderInfoLog(p_ids.vert, iloglen, &iloglen, ilogmem);
+			glGetShaderInfoLog(p_ids.stage[stage], iloglen, &iloglen, ilogmem);
 
-			String err_string = get_shader_name() + ": Vertex Program Compilation Failed:\n";
+			String err_string = get_shader_name() + ": " + stage_name[stage] + " Program Compilation Failed:\n";
 
 			err_string += ilogmem;
-			_display_error_with_code(err_string, p_ids.vert);
+			_display_error_with_code(err_string, p_ids.stage[stage]);
 			ERR_PRINT(err_string.ascii().get_data());
 			memfree(ilogmem);
-			glDeleteShader(p_ids.frag);
-			glDeleteShader(p_ids.vert);
-			glDeleteProgram(p_ids.main);
+			_dispose_stages(p_ids);
 		}
 
 		return false;
 	}
 
-	glGetShaderiv(p_ids.frag, GL_COMPILE_STATUS, &status);
-	if (status == GL_FALSE) {
-		// error compiling
-		GLsizei iloglen;
-		glGetShaderiv(p_ids.frag, GL_INFO_LOG_LENGTH, &iloglen);
-
-		if (iloglen < 0) {
-			glDeleteShader(p_ids.frag);
-			glDeleteShader(p_ids.vert);
-			glDeleteProgram(p_ids.main);
-			ERR_PRINT("Fragment shader compilation failed with empty log");
-		} else {
-			if (iloglen == 0) {
-				iloglen = 4096; //buggy driver (Adreno 220+....)
-			}
-
-			char *ilogmem = (char *)memalloc(iloglen + 1);
-			ilogmem[iloglen] = 0;
-			glGetShaderInfoLog(p_ids.frag, iloglen, &iloglen, ilogmem);
-
-			String err_string = get_shader_name() + ": Fragment Program Compilation Failed:\n";
-
-			err_string += ilogmem;
-			_display_error_with_code(err_string, p_ids.frag);
-			ERR_PRINT(err_string.ascii().get_data());
-			memfree(ilogmem);
-			glDeleteShader(p_ids.frag);
-			glDeleteShader(p_ids.vert);
-			glDeleteProgram(p_ids.main);
+	for (int stage = 0; stage < STAGE_MAX; stage++) {
+		if (p_ids.stage[stage]) {
+			glAttachShader(p_ids.main, p_ids.stage[stage]);
 		}
-
-		return false;
 	}
-
-	glAttachShader(p_ids.main, p_ids.frag);
-	glAttachShader(p_ids.main, p_ids.vert);
 
 	// bind attributes before linking
 	for (int i = 0; i < attribute_pair_count; i++) {
@@ -1013,8 +1182,8 @@ bool ShaderGLES3::_complete_link(Version::Ids p_ids, GLenum *r_program_format, P
 		glGetProgramiv(p_ids.main, GL_INFO_LOG_LENGTH, &iloglen);
 
 		if (iloglen < 0) {
-			glDeleteShader(p_ids.frag);
-			glDeleteShader(p_ids.vert);
+			glDeleteShader(p_ids.stage[STAGE_FRAGMENT]);
+			glDeleteShader(p_ids.stage[STAGE_VERTEX]);
 			glDeleteProgram(p_ids.main);
 			ERR_FAIL_COND_V(iloglen < 0, false);
 		}
@@ -1032,8 +1201,8 @@ bool ShaderGLES3::_complete_link(Version::Ids p_ids, GLenum *r_program_format, P
 		err_string += ilogmem;
 		ERR_PRINT(err_string.ascii().get_data());
 		Memory::free_static(ilogmem);
-		glDeleteShader(p_ids.frag);
-		glDeleteShader(p_ids.vert);
+		glDeleteShader(p_ids.stage[STAGE_FRAGMENT]);
+		glDeleteShader(p_ids.stage[STAGE_VERTEX]);
 		glDeleteProgram(p_ids.main);
 
 		return false;
@@ -1091,22 +1260,21 @@ void ShaderGLES3::_dispose_program(Version *p_version) {
 			compile_queue->cancel(p_version->ids.main);
 		}
 	}
-	glDeleteShader(p_version->ids.vert);
-	glDeleteShader(p_version->ids.frag);
+	for (int stage = 0; stage < STAGE_MAX; stage++) {
+		if (p_version->ids.stage[stage]) {
+			glDeleteShader(p_version->ids.stage[stage]);
+		}
+	}
 	glDeleteProgram(p_version->ids.main);
 
 	if (p_version->compiling_list.in_list()) {
 		p_version->compiling_list.remove_from_list();
-		active_compiles_count--;
+		// A version mid-compile may hold more than one slot (one per stage in flight).
+		active_compiles_count -= p_version->slots_held;
+		p_version->slots_held = 0;
 #ifdef DEV_ENABLED
 		CRASH_COND(active_compiles_count == UINT32_MAX);
 #endif
-		if (p_version->compile_status == Version::COMPILE_STATUS_COMPILING_VERTEX_AND_FRAGMENT) {
-			active_compiles_count--;
-#ifdef DEV_ENABLED
-			CRASH_COND(active_compiles_count == UINT32_MAX);
-#endif
-		}
 		_log_active_compiles();
 	}
 	p_version->compile_status = Version::COMPILE_STATUS_ERROR;
@@ -1117,7 +1285,37 @@ GLint ShaderGLES3::get_uniform_location(const String &p_name) const {
 	return glGetUniformLocation(version->ids.main, p_name.ascii().get_data());
 }
 
-void ShaderGLES3::setup(const char **p_conditional_defines, int p_conditional_count, const char **p_uniform_names, int p_uniform_count, const AttributePair *p_attribute_pairs, int p_attribute_count, const TexUnitPair *p_texunit_pairs, int p_texunit_pair_count, const UBOPair *p_ubo_pairs, int p_ubo_pair_count, const Feedback *p_feedback, int p_feedback_count, const char *p_vertex_code, const char *p_fragment_code, int p_vertex_code_start, int p_fragment_code_start) {
+// Splits a stage's source at the injection points where compiled user code is
+// spliced in: material uniforms, stage globals, then the stage's own body.
+static void _split_stage_chunks(const String &p_code, const String &p_globals_tag, const String &p_code_tag, CharString &r_c0, CharString &r_c1, CharString &r_c2, CharString &r_c3) {
+	const String material_tag = "\nMATERIAL_UNIFORMS";
+	String code = p_code;
+	int cpos = code.find(material_tag);
+	if (cpos == -1) {
+		r_c0 = code.ascii();
+		return;
+	}
+	r_c0 = code.substr(0, cpos).ascii();
+	code = code.substr(cpos + material_tag.length(), code.length());
+
+	cpos = code.find(p_globals_tag);
+	if (cpos == -1) {
+		r_c1 = code.ascii();
+		return;
+	}
+	r_c1 = code.substr(0, cpos).ascii();
+	String code2 = code.substr(cpos + p_globals_tag.length(), code.length());
+
+	cpos = code2.find(p_code_tag);
+	if (cpos == -1) {
+		r_c2 = code2.ascii();
+		return;
+	}
+	r_c2 = code2.substr(0, cpos).ascii();
+	r_c3 = code2.substr(cpos + p_code_tag.length(), code2.length()).ascii();
+}
+
+void ShaderGLES3::setup(const char **p_conditional_defines, int p_conditional_count, const char **p_uniform_names, int p_uniform_count, const AttributePair *p_attribute_pairs, int p_attribute_count, const TexUnitPair *p_texunit_pairs, int p_texunit_pair_count, const UBOPair *p_ubo_pairs, int p_ubo_pair_count, const Feedback *p_feedback, int p_feedback_count, const char *p_vertex_code, const char *p_fragment_code, int p_vertex_code_start, int p_fragment_code_start, const char *p_tess_control_code, const char *p_tess_eval_code, int p_tess_control_code_start, int p_tess_eval_code_start) {
 	ERR_FAIL_COND(version);
 	conditional_version.key = 0;
 	new_conditional_version.key = 0;
@@ -1125,6 +1323,19 @@ void ShaderGLES3::setup(const char **p_conditional_defines, int p_conditional_co
 	conditional_count = p_conditional_count;
 	conditional_defines = p_conditional_defines;
 	uniform_names = p_uniform_names;
+	has_tess = p_tess_control_code != nullptr && p_tess_eval_code != nullptr;
+	tess_conditional_index = -1;
+	for (int i = 0; i < p_conditional_count; i++) {
+		if (p_conditional_defines[i] && strstr(p_conditional_defines[i], "USE_TESSELLATION")) {
+			tess_conditional_index = i;
+			break;
+		}
+	}
+	if (has_tess) {
+		_split_stage_chunks(String(p_tess_control_code), "\nTESS_CONTROL_SHADER_GLOBALS", "\nTESS_CONTROL_SHADER_CODE", tess_control_code0, tess_control_code1, tess_control_code2, tess_control_code3);
+		_split_stage_chunks(String(p_tess_eval_code), "\nTESS_EVAL_SHADER_GLOBALS", "\nTESS_EVAL_SHADER_CODE", tess_eval_code0, tess_eval_code1, tess_eval_code2, tess_eval_code3);
+	}
+
 	vertex_code = p_vertex_code;
 	fragment_code = p_fragment_code;
 	texunit_pairs = p_texunit_pairs;
@@ -1265,7 +1476,7 @@ uint32_t ShaderGLES3::create_custom_shader() {
 	return last_custom_code++;
 }
 
-void ShaderGLES3::set_custom_shader_code(uint32_t p_code_id, const String &p_vertex, const String &p_vertex_globals, const String &p_fragment, const String &p_light, const String &p_fragment_globals, const String &p_uniforms, const Vector<StringName> &p_texture_uniforms, const Vector<CharString> &p_custom_defines, AsyncMode p_async_mode) {
+void ShaderGLES3::set_custom_shader_code(uint32_t p_code_id, const String &p_vertex, const String &p_vertex_globals, const String &p_fragment, const String &p_light, const String &p_fragment_globals, const String &p_uniforms, const Vector<StringName> &p_texture_uniforms, const Vector<CharString> &p_custom_defines, AsyncMode p_async_mode, const String &p_tess_control, const String &p_tess_control_globals, const String &p_tess_eval, const String &p_tess_eval_globals) {
 	ERR_FAIL_COND(!custom_code_map.has(p_code_id));
 	CustomCode *cc = &custom_code_map[p_code_id];
 
@@ -1274,6 +1485,11 @@ void ShaderGLES3::set_custom_shader_code(uint32_t p_code_id, const String &p_ver
 	cc->fragment = p_fragment;
 	cc->fragment_globals = p_fragment_globals;
 	cc->light = p_light;
+	cc->tess_control = p_tess_control;
+	cc->tess_control_globals = p_tess_control_globals;
+	cc->tess_eval = p_tess_eval;
+	cc->tess_eval_globals = p_tess_eval_globals;
+	cc->uses_tessellation = !p_tess_control.empty() && !p_tess_eval.empty();
 	cc->texture_uniforms = p_texture_uniforms;
 	cc->uniforms = p_uniforms;
 	cc->custom_defines = p_custom_defines;

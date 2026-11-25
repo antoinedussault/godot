@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="MeshPacker" inherits="Spatial" version="3.5">
+	<brief_description>
+		Collapses every [MeshInstance] below it into as few draw calls as possible.
+	</brief_description>
+	<description>
+		Walks its own subtree, groups the [MeshInstance] nodes it finds, and bakes them into a single [code]PackedOutput[/code] child made of merged [ArrayMesh] instances and [MultiMeshInstance] nodes.
+		Two strategies are used, and [constant PACK_MODE_AUTO] picks one per group:
+		- merging bakes geometry into one [ArrayMesh] with one surface per material. Best for many small, [i]unique[/i] meshes such as kitbashed props or modular walls.
+		- instancing turns sources that share a mesh and its materials into one [MultiMeshInstance]. Best for many [i]repeated[/i] meshes, and unlike merging it does not duplicate vertex data.
+		Sources are hidden rather than deleted, so [method unpack] restores the scene exactly. Packing in the editor writes the result into the scene file; [member pack_on_ready] does it at runtime instead.
+		Sources are skipped when they are already hidden, have no mesh, are skinned (a [Skeleton] is reachable through their skeleton path), or carry blend shapes, since their vertices are not static.
+		[b]Note:[/b] this only touches visuals. Collision shapes, lights and other children of the source nodes are left untouched and keep working.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_pack_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns what the last [method pack] did: [code]sources[/code], [code]merged_sources[/code], [code]instanced_sources[/code], [code]merged_meshes[/code], [code]multimeshes[/code], [code]surfaces_before[/code], [code]surfaces_after[/code], [code]skipped_surfaces[/code] and [code]vertices[/code]. Empty when not packed.
+			</description>
+		</method>
+		<method name="get_source_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns how many [MeshInstance] nodes below this one would be packed right now.
+			</description>
+		</method>
+		<method name="pack">
+			<return type="void" />
+			<description>
+				Bakes the subtree into the [code]PackedOutput[/code] child. Calling it while already packed repacks from scratch, so it is safe to call after editing the sources.
+			</description>
+		</method>
+		<method name="unpack">
+			<return type="void" />
+			<description>
+				Deletes the packed output and shows the sources this node hid. Sources removed by [constant SOURCE_HANDLING_REMOVE] cannot be brought back.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="cell_size" type="float" setter="set_cell_size" getter="get_cell_size" default="0.0">
+			When above zero, sources are also grouped by which cell of a grid this size their origin falls in, so the result still culls per region instead of drawing the whole subtree at once. Leave at [code]0[/code] to put everything in one batch per material.
+		</member>
+		<member name="compress_result" type="bool" setter="set_compress_result" getter="get_compress_result" default="true">
+			Stores the merged geometry with Godot's default vertex compression. Turn off if the packed mesh shows precision artifacts.
+		</member>
+		<member name="multimesh_threshold" type="int" setter="set_multimesh_threshold" getter="get_multimesh_threshold" default="8">
+			In [constant PACK_MODE_AUTO], how many copies of the same mesh it takes before that group becomes a [MultiMeshInstance] instead of merged geometry.
+		</member>
+		<member name="pack_mode" type="int" setter="set_pack_mode" getter="get_pack_mode" enum="MeshPacker.PackMode" default="2">
+			Which strategy to use. See [enum PackMode].
+		</member>
+		<member name="pack_on_ready" type="bool" setter="set_pack_on_ready" getter="get_pack_on_ready" default="false">
+			Packs automatically in [method Node._ready] when running the game, for subtrees that are built at runtime. Does nothing in the editor, and nothing if the scene was already packed there.
+		</member>
+		<member name="source_handling" type="int" setter="set_source_handling" getter="get_source_handling" enum="MeshPacker.SourceHandling" default="0">
+			What happens to the sources once their geometry has been baked. See [enum SourceHandling].
+		</member>
+		<member name="vertex_budget" type="int" setter="set_vertex_budget" getter="get_vertex_budget" default="65536">
+			Maximum vertices in one merged surface; a batch that grows past it continues in a new surface. The default keeps surfaces inside the 16-bit index range. Set to [code]0[/code] for no limit.
+		</member>
+	</members>
+	<signals>
+		<signal name="pack_completed">
+			<description>
+				Emitted at the end of a successful [method pack].
+			</description>
+		</signal>
+		<signal name="unpack_completed">
+			<description>
+				Emitted at the end of [method unpack].
+			</description>
+		</signal>
+	</signals>
+	<constants>
+		<constant name="PACK_MODE_MERGE" value="0" enum="PackMode">
+			Merge everything into [ArrayMesh] surfaces, one per material and settings group.
+		</constant>
+		<constant name="PACK_MODE_MULTIMESH" value="1" enum="PackMode">
+			Turn every group of sources sharing a mesh into a [MultiMeshInstance], even groups of one.
+		</constant>
+		<constant name="PACK_MODE_AUTO" value="2" enum="PackMode">
+			Use a [MultiMeshInstance] for meshes repeated at least [member multimesh_threshold] times and merge the rest.
+		</constant>
+		<constant name="SOURCE_HANDLING_HIDE" value="0" enum="SourceHandling">
+			Hide the sources. [method unpack] shows them again.
+		</constant>
+		<constant name="SOURCE_HANDLING_REMOVE" value="1" enum="SourceHandling">
+			Free the sources at runtime to reclaim their memory. Sources that have children are hidden instead so attached collision shapes and lights survive, and in the editor nothing is ever freed, so a pack stays reversible.
+		</constant>
+		<constant name="SOURCE_HANDLING_KEEP" value="2" enum="SourceHandling">
+			Leave the sources visible. The packed output is drawn on top of them, so this is for comparing the two.
+		</constant>
+	</constants>
+</class>

@@ -118,9 +118,18 @@ void SceneLayerEditorPlugin::_build_dock() {
 	// New Sub-Layer parent, or renaming, fight with toggling its visibility.
 	// Column 0 = visibility checkbox only; column 1 = name (+ the action
 	// buttons) — normal CELL_MODE_STRING, so selection/rename behave normally.
-	tree->set_columns(2);
+	// Column 1 is the RUNTIME flag: whether the layer is loaded when the game
+	// starts. Deliberately separate from column 0 - hiding a layer to declutter
+	// the viewport must never be able to remove it from the game.
+	tree->set_columns(3);
+	tree->set_column_titles_visible(true);
+	tree->set_column_title(0, "Edit");
+	tree->set_column_title(1, "Game");
+	tree->set_column_title(2, "Layer");
 	tree->set_column_expand(0, false);
-	tree->set_column_min_width(0, 28);
+	tree->set_column_min_width(0, 40);
+	tree->set_column_expand(1, false);
+	tree->set_column_min_width(1, 44);
 	// Without this, Tree's default (allow_reselect=false) treats *any* click
 	// on an unselected editable cell as bring_up_editor=true — i.e. the very
 	// click that selects a row also immediately arms rename-edit mode on it,
@@ -185,17 +194,24 @@ void SceneLayerEditorPlugin::_add_layer_items(TreeItem *p_parent_item, const Arr
 		item->set_checked(0, vis);
 		item->set_metadata(0, id);
 
-		// Column 1: name (double-click to rename) + action buttons. Kept off
-		// column 0 so clicking to select/rename a row doesn't also toggle it.
+		// Column 1: loaded-in-game checkbox.
+		item->set_cell_mode(1, TreeItem::CELL_MODE_CHECK);
 		item->set_editable(1, true);
-		item->set_text(1, name);
-		item->set_metadata(1, id);
-		item->add_button(1, tree->get_icon("Add", "EditorIcons"), BTN_ASSIGN, false, "Assign selected nodes to this layer");
-		item->add_button(1, tree->get_icon("Remove", "EditorIcons"), BTN_UNASSIGN, false, "Unassign selected nodes from this layer");
-		item->add_button(1, tree->get_icon("Close", "EditorIcons"), BTN_DELETE, false, "Delete this layer");
+		item->set_checked(1, d.has("runtime") ? (bool)d["runtime"] : true);
+		item->set_tooltip(1, "Loaded when the game starts. Toggle at runtime with GameWorld.set_layer_enabled().");
+
+		// Column 2: name (double-click to rename) + action buttons. Kept off
+		// the checkbox columns so clicking to select/rename a row doesn't also
+		// toggle it.
+		item->set_editable(2, true);
+		item->set_text(2, name);
+		item->set_metadata(2, id);
+		item->add_button(2, tree->get_icon("Add", "EditorIcons"), BTN_ASSIGN, false, "Assign selected nodes to this layer");
+		item->add_button(2, tree->get_icon("Remove", "EditorIcons"), BTN_UNASSIGN, false, "Unassign selected nodes from this layer");
+		item->add_button(2, tree->get_icon("Close", "EditorIcons"), BTN_DELETE, false, "Delete this layer");
 
 		if (id == _pending_select_id) {
-			item->select(1);
+			item->select(2);
 			_pending_select_id = -1;
 		}
 
@@ -227,6 +243,7 @@ void SceneLayerEditorPlugin::_on_new_layer_pressed() {
 	new_layer["id"] = next_id;
 	new_layer["name"] = "New Layer";
 	new_layer["visible"] = true;
+	new_layer["runtime"] = true;
 	new_layer["children"] = Array();
 	new_data["next_id"] = next_id + 1;
 
@@ -250,6 +267,7 @@ void SceneLayerEditorPlugin::_on_new_sublayer_pressed() {
 	new_layer["id"] = next_id;
 	new_layer["name"] = "New Sub-Layer";
 	new_layer["visible"] = true;
+	new_layer["runtime"] = true;
 	new_layer["children"] = Array();
 	new_data["next_id"] = next_id + 1;
 
@@ -271,8 +289,10 @@ void SceneLayerEditorPlugin::_on_item_edited() {
 	Array layers = new_data.has("layers") ? (Array)new_data["layers"] : Array();
 	if (col == 0) {
 		_find_and_set_field(layers, id, "visible", item->is_checked(0));
+	} else if (col == 1) {
+		_find_and_set_field(layers, id, "runtime", item->is_checked(1));
 	} else {
-		_find_and_set_field(layers, id, "name", item->get_text(1));
+		_find_and_set_field(layers, id, "name", item->get_text(2));
 	}
 	new_data["layers"] = layers;
 	_commit_layer_data("Edit Scene Layer", new_data);

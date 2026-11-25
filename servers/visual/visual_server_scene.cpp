@@ -54,6 +54,10 @@ RID VisualServerScene::camera_create() {
 	return camera_owner.make_rid(camera);
 }
 
+inline bool is_geometry_instance(VisualServer::InstanceType p_type) {
+	return p_type == VS::INSTANCE_MESH || p_type == VS::INSTANCE_MULTIMESH || p_type == VS::INSTANCE_PARTICLES || p_type == VS::INSTANCE_IMMEDIATE;
+}
+
 void VisualServerScene::camera_set_perspective(RID p_camera, float p_fovy_degrees, float p_z_near, float p_z_far) {
 	Camera *camera = camera_owner.get(p_camera);
 	ERR_FAIL_COND(!camera);
@@ -714,6 +718,10 @@ void VisualServerScene::instance_set_scenario(RID p_instance, RID p_scenario) {
 	if (instance->scenario) {
 		instance->scenario->instances.remove(&instance->scenario_item);
 
+		if (instance->spatial_partition_id && instance->visible && is_geometry_instance(instance->base_type)) {
+			VSG::scene_render->dynamic_gi_mark_dirty(instance->scenario->self, instance->transformed_aabb);
+		}
+
 		if (instance->spatial_partition_id) {
 			instance->scenario->sps->erase(instance->spatial_partition_id);
 			instance->spatial_partition_id = 0;
@@ -1194,6 +1202,10 @@ void VisualServerScene::instance_set_visible(RID p_instance, bool p_visible) {
 		}
 	}
 
+	if (instance->scenario && instance->spatial_partition_id && is_geometry_instance(instance->base_type)) {
+		VSG::scene_render->dynamic_gi_mark_dirty(instance->scenario->self, instance->transformed_aabb);
+	}
+
 	// when showing or hiding geometry, lights must be kept up to date to show / hide shadows
 	if ((1 << instance->base_type) & VS::INSTANCE_GEOMETRY_MASK) {
 		InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
@@ -1239,9 +1251,6 @@ void VisualServerScene::instance_set_visible(RID p_instance, bool p_visible) {
 			}
 		}
 	}
-}
-inline bool is_geometry_instance(VisualServer::InstanceType p_type) {
-	return p_type == VS::INSTANCE_MESH || p_type == VS::INSTANCE_MULTIMESH || p_type == VS::INSTANCE_PARTICLES || p_type == VS::INSTANCE_IMMEDIATE;
 }
 
 void VisualServerScene::instance_set_use_lightmap(RID p_instance, RID p_lightmap_instance, RID p_lightmap, int p_lightmap_slice, const Rect2 &p_lightmap_uv_rect) {
@@ -2078,6 +2087,13 @@ void VisualServerScene::_update_instance(Instance *p_instance) {
 	AABB new_aabb;
 
 	new_aabb = instance_xform->xform(p_instance->aabb);
+
+	if (p_instance->scenario && p_instance->visible && is_geometry_instance(p_instance->base_type) && p_instance->base_type != VS::INSTANCE_PARTICLES) {
+		if (p_instance->spatial_partition_id) {
+			VSG::scene_render->dynamic_gi_mark_dirty(p_instance->scenario->self, p_instance->transformed_aabb);
+		}
+		VSG::scene_render->dynamic_gi_mark_dirty(p_instance->scenario->self, new_aabb);
+	}
 
 	p_instance->transformed_aabb = new_aabb;
 
@@ -2964,6 +2980,9 @@ void VisualServerScene::render_camera(Ref<ARVRInterface> &p_interface, ARVRInter
 };
 
 void VisualServerScene::_prepare_scene(const Transform p_cam_transform, const CameraMatrix &p_cam_projection, bool p_cam_orthogonal, RID p_force_environment, uint32_t p_visible_layers, RID p_scenario, RID p_shadow_atlas, RID p_reflection_probe, int32_t &r_previous_room_id_hint) {
+	// Must happen before any shadow map is rendered, so shadow and colour passes
+	// tessellate from the same reference view.
+	VSG::scene_render->set_tessellation_reference(p_cam_transform, p_cam_projection);
 	// Note, in stereo rendering:
 	// - p_cam_transform will be a transform in the middle of our two eyes
 	// - p_cam_projection is a wider frustrum that encompasses both eyes
@@ -3013,8 +3032,9 @@ void VisualServerScene::_prepare_scene(const Transform p_cam_transform, const Ca
 			if (light_cull_count < MAX_LIGHTS_CULLED) {
 				InstanceLightData *light = static_cast<InstanceLightData *>(ins->base_data);
 
-				if (!light->geometries.empty()) {
+				if (!light->geometries.empty() || VSG::storage->light_has_lens_streak(ins->base)) {
 					//do not add this light if no geometry is affected by it..
+					//(unless it draws a lens streak, which is visible on its own)
 					light_cull_result[light_cull_count] = ins;
 					light_instance_cull_result[light_cull_count] = light->instance;
 					if (p_shadow_atlas.is_valid() && VSG::storage->light_has_shadow(ins->base)) {
@@ -3301,6 +3321,39 @@ void VisualServerScene::_render_scene(const Transform p_cam_transform, const Cam
 		environment = scenario->environment;
 	} else {
 		environment = scenario->fallback_environment;
+	}
+
+	/* DYNAMIC GI */
+
+	if (VSG::scene_render->dynamic_gi_begin(p_scenario, environment, p_cam_transform, p_reflection_probe.is_valid())) {
+		AABB region;
+		while (VSG::scene_render->dynamic_gi_next_region(region)) {
+			int culled = scenario->sps->cull_aabb(region, instance_shadow_cull_result, MAX_INSTANCE_CULL, nullptr, VS::INSTANCE_GEOMETRY_MASK);
+			int kept = 0;
+			for (int i = 0; i < culled; i++) {
+				Instance *ins = instance_shadow_cull_result[i];
+				if (((1 << ins->base_type) & VS::INSTANCE_GEOMETRY_MASK) && ins->visible && ins->cast_shadows != VS::SHADOW_CASTING_SETTING_SHADOWS_ONLY) {
+					instance_shadow_cull_result[kept++] = ins;
+				}
+			}
+			VSG::scene_render->dynamic_gi_render_region(environment, (RasterizerScene::InstanceBase **)instance_shadow_cull_result, kept);
+		}
+
+		// Every light that can reach the cascades, not just those on screen.
+		Vector<RID> gi_lights;
+		for (List<Instance *>::Element *E = scenario->directional_lights.front(); E; E = E->next()) {
+			if (E->get()->visible) {
+				gi_lights.push_back(static_cast<InstanceLightData *>(E->get()->base_data)->instance);
+			}
+		}
+		int culled = scenario->sps->cull_aabb(VSG::scene_render->dynamic_gi_get_bounds(), instance_shadow_cull_result, MAX_INSTANCE_CULL, nullptr, 1 << VS::INSTANCE_LIGHT);
+		for (int i = 0; i < culled; i++) {
+			Instance *ins = instance_shadow_cull_result[i];
+			if (ins->base_type == VS::INSTANCE_LIGHT && ins->visible && VSG::storage->light_get_type(ins->base) != VS::LIGHT_DIRECTIONAL) {
+				gi_lights.push_back(static_cast<InstanceLightData *>(ins->base_data)->instance);
+			}
+		}
+		VSG::scene_render->dynamic_gi_finish(environment, gi_lights.ptr(), gi_lights.size());
 	}
 
 	/* PROCESS GEOMETRY AND DRAW SCENE */
@@ -4541,6 +4594,7 @@ bool VisualServerScene::free(RID p_rid) {
 		}
 		VSG::scene_render->free(scenario->reflection_probe_shadow_atlas);
 		VSG::scene_render->free(scenario->reflection_atlas);
+		VSG::scene_render->dynamic_gi_free(p_rid);
 		scenario_owner.free(p_rid);
 		memdelete(scenario);
 

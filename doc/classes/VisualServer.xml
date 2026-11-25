@@ -867,6 +867,51 @@
 				Sets the variables to be used with the volumetric fog pass (GLES3 only). See [Environment] for details on each parameter.
 			</description>
 		</method>
+		<method name="environment_set_volumetric_fog_height_relative">
+			<return type="void" />
+			<argument index="0" name="env" type="RID" />
+			<argument index="1" name="relative" type="bool" />
+			<description>
+				If [code]true[/code], the volumetric fog's [code]height_ref[/code] is interpreted as an offset from the camera's world Y instead of an absolute height, so the fog "sea level" tracks the camera. See [member Environment.volumetric_fog_height_relative].
+			</description>
+		</method>
+		<method name="environment_set_dynamic_gi">
+			<return type="void" />
+			<argument index="0" name="env" type="RID" />
+			<argument index="1" name="enable" type="bool" />
+			<argument index="2" name="cascades" type="int" />
+			<argument index="3" name="voxel_size" type="float" />
+			<argument index="4" name="energy" type="float" />
+			<argument index="5" name="bounce_feedback" type="float" />
+			<argument index="6" name="normal_bias" type="float" />
+			<argument index="7" name="hysteresis" type="float" />
+			<argument index="8" name="rays" type="int" />
+			<argument index="9" name="reflection_occlusion" type="bool" />
+			<argument index="10" name="cull_mask" type="int" />
+			<argument index="11" name="debug" type="int" enum="VisualServer.EnvironmentDynamicGIDebug" />
+			<description>
+				Sets the dynamic global illumination parameters. See [member Environment.dynamic_gi_enabled].
+			</description>
+		</method>
+		<method name="environment_set_exp_height_fog">
+			<return type="void" />
+			<argument index="0" name="env" type="RID" />
+			<argument index="1" name="enable" type="bool" />
+			<argument index="2" name="density" type="float" />
+			<argument index="3" name="falloff" type="float" />
+			<argument index="4" name="ref_height" type="float" />
+			<argument index="5" name="ref_height_relative" type="bool" />
+			<argument index="6" name="start_distance" type="float" />
+			<argument index="7" name="max_opacity" type="float" />
+			<argument index="8" name="inscatter" type="Color" />
+			<argument index="9" name="directional_enabled" type="bool" />
+			<argument index="10" name="directional_color" type="Color" />
+			<argument index="11" name="light_direction" type="Vector3" />
+			<argument index="12" name="directional_exponent" type="float" />
+			<description>
+				Sets the variables to be used with the exponential height fog pass (GLES3 only) -- the [ExpHeightFog] node's model ported onto Environment. See [Environment] for details on each parameter.
+			</description>
+		</method>
 		<method name="environment_set_glow">
 			<return type="void" />
 			<argument index="0" name="env" type="RID" />
@@ -939,6 +984,21 @@
 			<argument index="6" name="roughness" type="bool" />
 			<description>
 				Sets the variables to be used with the "screen space reflections" post-process effect. See [Environment] for more details.
+			</description>
+		</method>
+		<method name="environment_set_ssgi">
+			<return type="void" />
+			<argument index="0" name="env" type="RID" />
+			<argument index="1" name="enable" type="bool" />
+			<argument index="2" name="radius" type="float" />
+			<argument index="3" name="intensity" type="float" />
+			<argument index="4" name="rays" type="int" />
+			<argument index="5" name="steps" type="int" />
+			<argument index="6" name="thickness" type="float" />
+			<argument index="7" name="temporal_blend" type="float" />
+			<argument index="8" name="half_resolution" type="bool" />
+			<description>
+				Sets the screen space global illumination parameters. See [member Environment.ssgi_enabled].
 			</description>
 		</method>
 		<method name="environment_set_tonemap">
@@ -1554,7 +1614,7 @@
 			<argument index="9" name="weight" type="float" />
 			<argument index="10" name="temporal_blend" type="float" />
 			<description>
-				Enables and configures Unreal-style light shafts ("god rays") for this directional light. GLES3 only; see [DirectionalLightShaft]. Pass [code]bloom_intensity[/code] or [code]occlusion_darkness[/code] as [code]0[/code] to disable that half of the effect.
+				Enables and configures Unreal-style light shafts ("god rays") for this directional light. GLES3 only; see [member DirectionalLight.godrays_enabled]. Pass [code]bloom_intensity[/code] or [code]occlusion_darkness[/code] as [code]0[/code] to disable that half of the effect.
 			</description>
 		</method>
 		<method name="light_directional_set_shadow_depth_range_mode">
@@ -1611,6 +1671,21 @@
 			<argument index="1" name="mask" type="int" />
 			<description>
 				Sets the cull mask for this Light. Lights only affect objects in the selected layers. Equivalent to [member Light.light_cull_mask].
+			</description>
+		</method>
+		<method name="light_set_lens_streak">
+			<return type="void" />
+			<argument index="0" name="light" type="RID" />
+			<argument index="1" name="enabled" type="bool" />
+			<argument index="2" name="color" type="Color" />
+			<argument index="3" name="intensity" type="float" />
+			<argument index="4" name="length" type="float" />
+			<argument index="5" name="thickness" type="float" />
+			<argument index="6" name="angle" type="float" />
+			<argument index="7" name="source_size" type="float" />
+			<argument index="8" name="max_distance" type="float" />
+			<description>
+				Configures the lens streak of this light. GLES3 only; see [member Light.lens_streak_enabled].
 			</description>
 		</method>
 		<method name="light_set_negative">
@@ -3938,6 +4013,21 @@
 		</constant>
 		<constant name="CHANGED_PRIORITY_HIGH" value="2" enum="ChangedPriority">
 			Registered changes which can cause a redraw default to high priority.
+		</constant>
+		<constant name="ENV_DYNAMIC_GI_DEBUG_DISABLED" value="0" enum="EnvironmentDynamicGIDebug">
+			Normal rendering.
+		</constant>
+		<constant name="ENV_DYNAMIC_GI_DEBUG_LIGHTING" value="1" enum="EnvironmentDynamicGIDebug">
+			Shows the lit voxels.
+		</constant>
+		<constant name="ENV_DYNAMIC_GI_DEBUG_ALBEDO" value="2" enum="EnvironmentDynamicGIDebug">
+			Shows the voxel albedo.
+		</constant>
+		<constant name="ENV_DYNAMIC_GI_DEBUG_IRRADIANCE" value="3" enum="EnvironmentDynamicGIDebug">
+			Shows the probe lighting on surfaces.
+		</constant>
+		<constant name="ENV_DYNAMIC_GI_DEBUG_SSGI" value="4" enum="EnvironmentDynamicGIDebug">
+			Shows the denoised screen space GI.
 		</constant>
 	</constants>
 </class>

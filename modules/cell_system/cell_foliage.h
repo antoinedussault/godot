@@ -128,6 +128,10 @@ public:
 	// True if any bucket has instances of a type with keep_loaded enabled.
 	bool has_persistent_instances() const;
 
+	// World-space (x, z, radius) triples for instances whose FoliageType sets
+	// nav_obstacle_radius - fed to the terrain so the navmesh routes around them.
+	PoolRealArray collect_nav_obstacles(const Vector3 &p_cell_world_origin) const;
+
 	PoolRealArray serialize() const;
 	void          deserialize(const PoolRealArray &p_data);
 

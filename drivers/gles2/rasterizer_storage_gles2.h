@@ -969,6 +969,8 @@ public:
 	virtual void light_set_shadow(RID p_light, bool p_enabled);
 	virtual void light_set_shadow_color(RID p_light, const Color &p_color);
 	virtual void light_set_projector(RID p_light, RID p_texture);
+	virtual void light_set_lens_streak(RID p_light, bool p_enabled, const Color &p_color, float p_intensity, float p_length, float p_thickness, float p_angle, float p_source_size, float p_max_distance);
+	virtual bool light_has_lens_streak(RID p_light) const;
 	virtual void light_set_negative(RID p_light, bool p_enable);
 	virtual void light_set_cull_mask(RID p_light, uint32_t p_mask);
 	virtual void light_set_reverse_cull_face_mode(RID p_light, bool p_enabled);

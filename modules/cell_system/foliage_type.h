@@ -14,6 +14,12 @@ public:
 		TYPE_GRASS      = 0,
 		TYPE_TREE       = 1,
 		TYPE_INTERACTOR = 2,
+		// Same pipeline as TYPE_TREE (PackedScene with -lod{n} naming, meshes
+		// extracted to MultiMesh, CollisionShape nodes pulled for collision)
+		// but not implicitly persistent, and collision defaults ON. Kept as a
+		// distinct type so rock-specific behaviour can diverge later without
+		// re-tagging content, and so the inspector reads honestly.
+		TYPE_ROCK       = 3,
 	};
 
 	static const int MAX_LODS = 5;
@@ -41,8 +47,10 @@ private:
 	Ref<Mesh>     grass_mesh[MAX_LODS];
 	Ref<Material> grass_material[MAX_LODS];
 
-	// TREE: single PackedScene whose children use -lod{n} / -imposter naming.
-	// Meshes are extracted at rebuild() time and rendered via MultiMesh.
+	// TREE and ROCK: single PackedScene whose children use -lod{n} / -imposter
+	// naming. Meshes are extracted at rebuild() time and rendered via MultiMesh.
+	// (ROCK reuses this slot rather than adding a parallel one, so existing
+	// resources keep loading; the inspector labels it for both types.)
 	Ref<PackedScene> tree_scene;
 
 	// INTERACTOR: one scene instance per placed foliage item; no LOD.
@@ -60,7 +68,14 @@ private:
 	float y_offset_min  = 0.0f;
 	float y_offset_max  = 0.0f;
 
-	// --- Collision (TREE only; shapes are taken from the tree scene) ---
+	// Radius (world units, at scale 1) within which this instance makes the
+	// terrain non-navigable, so agents path AROUND rocks instead of through
+	// them. 0 disables. Scaled per instance by that instance uniform scale.
+	// Applied when the navmesh is built, NOT baked into the painted nav mask,
+	// so moving or deleting foliage restores navigation by itself.
+	float nav_obstacle_radius = 0.0f;
+
+	// --- Collision (TREE and ROCK; shapes are taken from the source scene) ---
 	bool  collision_enabled = true;
 
 	// --- Rendering ---
@@ -111,6 +126,7 @@ public:
 
 	// Collision
 	void  set_collision_enabled(bool v); bool  get_collision_enabled() const;
+	void  set_nav_obstacle_radius(float v); float get_nav_obstacle_radius() const;
 
 	// Rendering
 	void  set_cast_shadow(bool v);       bool  get_cast_shadow()       const;

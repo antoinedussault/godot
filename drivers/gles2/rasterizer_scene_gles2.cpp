@@ -914,6 +914,22 @@ void RasterizerSceneGLES2::environment_set_volumetric_fog(RID p_env, bool p_enab
 	// Not supported on the GLES2 backend (no readable scene depth / shadow atlas).
 }
 
+void RasterizerSceneGLES2::environment_set_volumetric_fog_height_relative(RID p_env, bool p_relative) {
+	// Not supported on the GLES2 backend.
+}
+
+void RasterizerSceneGLES2::environment_set_exp_height_fog(RID p_env, bool p_enable, float p_density, float p_falloff, float p_ref_height, bool p_ref_height_relative, float p_start_distance, float p_max_opacity, const Color &p_inscatter, bool p_directional_enabled, const Color &p_directional_color, const Vector3 &p_light_direction, float p_directional_exponent) {
+	// Not supported on the GLES2 backend (no readable scene depth).
+}
+
+void RasterizerSceneGLES2::environment_set_dynamic_gi(RID p_env, bool p_enable, int p_cascades, float p_voxel_size, float p_energy, float p_bounce_feedback, float p_normal_bias, float p_hysteresis, int p_rays, bool p_reflection_occlusion, uint32_t p_cull_mask, VS::EnvironmentDynamicGIDebug p_debug) {
+	// Not supported on the GLES2 backend.
+}
+
+void RasterizerSceneGLES2::environment_set_ssgi(RID p_env, bool p_enable, float p_radius, float p_intensity, int p_rays, int p_steps, float p_thickness, float p_temporal_blend, bool p_half_resolution) {
+	// Not supported on the GLES2 backend.
+}
+
 bool RasterizerSceneGLES2::is_environment(RID p_env) {
 	return environment_owner.owns(p_env);
 }

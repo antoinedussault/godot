@@ -38,6 +38,7 @@
 #include "core/os/os.h"
 #include "core/project_settings.h"
 #include "editor_feature_profile.h"
+#include "editor_fs_trace.h"
 #include "editor_node.h"
 #include "editor_resource_preview.h"
 #include "editor_scale.h"
@@ -46,13 +47,216 @@
 #include "scene/main/viewport.h"
 #include "scene/resources/packed_scene.h"
 
-Ref<Texture> FileSystemDock::_get_tree_item_icon(bool p_is_valid, String p_file_type) {
-	Ref<Texture> file_icon;
-	if (!p_is_valid) {
-		file_icon = get_icon("ImportFail", "EditorIcons");
-	} else {
-		file_icon = (has_icon(p_file_type, "EditorIcons")) ? get_icon(p_file_type, "EditorIcons") : get_icon("File", "EditorIcons");
+// Folder color palette. The names are the values stored in project.godot, and match
+// the ones Godot 4 writes for "file_customization/folder_colors", so a project that
+// was colored in either editor reads back the same way in the other.
+struct FolderColorPreset {
+	const char *name;
+	const char *label;
+	float r, g, b;
+};
+
+static const FolderColorPreset folder_color_presets[] = {
+	{ "red", TTRC("Red"), 1.00f, 0.27f, 0.27f },
+	{ "orange", TTRC("Orange"), 1.00f, 0.56f, 0.27f },
+	{ "yellow", TTRC("Yellow"), 1.00f, 0.89f, 0.27f },
+	{ "green", TTRC("Green"), 0.50f, 1.00f, 0.27f },
+	{ "teal", TTRC("Teal"), 0.27f, 1.00f, 0.64f },
+	{ "blue", TTRC("Blue"), 0.27f, 0.84f, 1.00f },
+	{ "purple", TTRC("Purple"), 0.50f, 0.27f, 1.00f },
+	{ "pink", TTRC("Pink"), 1.00f, 0.27f, 0.59f },
+	{ "gray", TTRC("Gray"), 0.60f, 0.60f, 0.60f },
+};
+
+static const int folder_color_preset_count = sizeof(folder_color_presets) / sizeof(folder_color_presets[0]);
+
+void FileSystemDock::_build_folder_color_palette() {
+	folder_color_names.clear();
+	folder_color_palette.clear();
+
+	for (int i = 0; i < folder_color_preset_count; i++) {
+		const FolderColorPreset &preset = folder_color_presets[i];
+		folder_color_names.push_back(preset.name);
+		folder_color_palette[preset.name] = Color(preset.r, preset.g, preset.b);
 	}
+}
+
+void FileSystemDock::_load_assigned_folder_colors() {
+	// Duplicated so that editing the dock's copy does not mutate the stored setting
+	// before it is explicitly saved.
+	const Dictionary stored = GLOBAL_DEF("file_customization/folder_colors", Dictionary());
+	assigned_folder_colors = stored.duplicate();
+}
+
+void FileSystemDock::_save_assigned_folder_colors() {
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+
+	if (assigned_folder_colors.empty()) {
+		// Dictionary compares by reference, so an empty dictionary would not match the
+		// setting's initial value and would be written out as an empty entry. Erase the
+		// setting instead, to keep project.godot free of it when nothing is colored.
+		project_settings->set_setting("file_customization/folder_colors", Variant());
+	} else {
+		project_settings->set_setting("file_customization/folder_colors", assigned_folder_colors);
+	}
+
+	project_settings->save();
+}
+
+Ref<Texture> FileSystemDock::_make_folder_color_swatch(const Color &p_color) const {
+	const int size = MAX(8, (int)(16 * EDSCALE));
+	const float radius = size * 0.5f - 1.0f;
+	const Vector2 center = Vector2(size, size) * 0.5f;
+
+	Ref<Image> image;
+	image.instance();
+	image->create(size, size, false, Image::FORMAT_RGBA8);
+	image->lock();
+	for (int y = 0; y < size; y++) {
+		for (int x = 0; x < size; x++) {
+			// Antialias the disc by using the signed distance to its edge as coverage.
+			const float coverage = CLAMP(radius - center.distance_to(Vector2(x + 0.5f, y + 0.5f)) + 0.5f, 0.0f, 1.0f);
+			image->set_pixel(x, y, Color(p_color.r, p_color.g, p_color.b, coverage));
+		}
+	}
+	image->unlock();
+
+	Ref<ImageTexture> texture;
+	texture.instance();
+	texture->create_from_image(image, Texture::FLAG_FILTER);
+	return texture;
+}
+
+void FileSystemDock::_update_folder_colors_menu() {
+	folder_colors_menu->clear();
+	folder_colors_menu->add_icon_item(get_icon("Remove", "EditorIcons"), TTR("Clear Color"), 0);
+	folder_colors_menu->add_separator();
+
+	for (int i = 0; i < folder_color_names.size(); i++) {
+		const Color color = folder_color_palette[folder_color_names[i]];
+		folder_colors_menu->add_icon_item(_make_folder_color_swatch(color), TTR(folder_color_presets[i].label), i + 1);
+	}
+
+	folder_colors_menu->set_size(Size2(1, 1));
+}
+
+bool FileSystemDock::_get_folder_color(const String &p_path, Color &r_color) const {
+	if (assigned_folder_colors.empty()) {
+		return false;
+	}
+
+	String lookup = p_path;
+	if (!lookup.ends_with("/")) {
+		lookup += "/";
+	}
+
+	// A color assigned to a folder also tints everything below it, unless a closer
+	// parent has its own assignment.
+	while (lookup.begins_with("res://")) {
+		const String color_name = assigned_folder_colors.get(lookup, String());
+		const Map<String, Color>::Element *E = folder_color_palette.find(color_name);
+		if (E) {
+			r_color = E->get();
+			return true;
+		}
+
+		if (lookup == "res://") {
+			break;
+		}
+		lookup = lookup.substr(0, lookup.length() - 1).get_base_dir();
+		if (!lookup.ends_with("/")) {
+			lookup += "/";
+		}
+	}
+
+	return false;
+}
+
+void FileSystemDock::_folder_color_index_pressed(int p_id) {
+	for (int i = 0; i < folder_color_pending_paths.size(); i++) {
+		const String folder_path = folder_color_pending_paths[i];
+		if (!folder_path.ends_with("/")) {
+			continue;
+		}
+
+		if (p_id == 0) {
+			assigned_folder_colors.erase(folder_path);
+		} else if (p_id - 1 < folder_color_names.size()) {
+			assigned_folder_colors[folder_path] = folder_color_names[p_id - 1];
+		}
+	}
+	folder_color_pending_paths.clear();
+
+	_save_assigned_folder_colors();
+	_update_display_mode(true);
+}
+
+void FileSystemDock::_update_folder_colors_after_move(const Map<String, String> &p_folders_renames) {
+	if (assigned_folder_colors.empty()) {
+		return;
+	}
+
+	List<Variant> keys;
+	assigned_folder_colors.get_key_list(&keys);
+
+	Dictionary new_colors;
+	bool changed = false;
+
+	for (List<Variant>::Element *E = keys.front(); E; E = E->next()) {
+		const String old_path = E->get();
+		String new_path = old_path;
+
+		if (p_folders_renames.has(old_path)) {
+			new_path = p_folders_renames[old_path];
+		} else {
+			// The colored folder itself did not move, but one of its parents may have.
+			for (const Map<String, String>::Element *R = p_folders_renames.front(); R; R = R->next()) {
+				if (old_path.begins_with(R->key())) {
+					new_path = R->get() + old_path.substr(R->key().length());
+					break;
+				}
+			}
+		}
+
+		if (new_path != old_path) {
+			changed = true;
+		}
+		if (!new_path.ends_with("/")) {
+			new_path += "/";
+		}
+		new_colors[new_path] = assigned_folder_colors[old_path];
+	}
+
+	if (changed) {
+		assigned_folder_colors = new_colors;
+		_save_assigned_folder_colors();
+	}
+}
+
+void FileSystemDock::_refresh_tree_build_cache() {
+	// Re-resolved per rebuild rather than cached across them, so a theme change
+	// can never leave stale icons behind.
+	tree_item_icon_cache.clear();
+	tree_import_fail_icon = get_icon("ImportFail", "EditorIcons");
+	tree_folder_icon = get_icon("Folder", "EditorIcons");
+	tree_folder_color = get_color("folder_icon_modulate", "FileDialog");
+	tree_main_scene = ProjectSettings::get_singleton()->get("application/run/main_scene");
+}
+
+Ref<Texture> FileSystemDock::_get_tree_item_icon(bool p_is_valid, String p_file_type) {
+	if (!p_is_valid) {
+		return tree_import_fail_icon;
+	}
+
+	// has_icon() plus get_icon() is two theme chain walks, once per file.
+	const StringName key = p_file_type;
+	const Map<StringName, Ref<Texture>>::Element *E = tree_item_icon_cache.find(key);
+	if (E) {
+		return E->get();
+	}
+
+	Ref<Texture> file_icon = has_icon(key, "EditorIcons") ? get_icon(key, "EditorIcons") : get_icon("File", "EditorIcons");
+	tree_item_icon_cache[key] = file_icon;
 	return file_icon;
 }
 
@@ -67,8 +271,10 @@ bool FileSystemDock::_create_tree(TreeItem *p_parent, EditorFileSystemDirectory 
 	}
 
 	subdirectory_item->set_text(0, dname);
-	subdirectory_item->set_icon(0, get_icon("Folder", "EditorIcons"));
-	subdirectory_item->set_icon_modulate(0, get_color("folder_icon_modulate", "FileDialog"));
+	subdirectory_item->set_icon(0, tree_folder_icon);
+	Color subdirectory_color = tree_folder_color;
+	_get_folder_color(p_dir->get_path(), subdirectory_color);
+	subdirectory_item->set_icon_modulate(0, subdirectory_color);
 	subdirectory_item->set_selectable(0, true);
 	String lpath = p_dir->get_path();
 	subdirectory_item->set_metadata(0, lpath);
@@ -98,7 +304,7 @@ bool FileSystemDock::_create_tree(TreeItem *p_parent, EditorFileSystemDirectory 
 
 	// Create all items for the files in the subdirectory.
 	if (display_mode == DISPLAY_MODE_TREE_ONLY) {
-		String main_scene = ProjectSettings::get_singleton()->get("application/run/main_scene");
+		const String &main_scene = tree_main_scene;
 
 		// Build the list of the files to display.
 		List<FileInfo> file_list;
@@ -206,6 +412,7 @@ Vector<String> FileSystemDock::_compute_uncollapsed_paths() {
 
 void FileSystemDock::_update_tree(const Vector<String> &p_uncollapsed_paths, bool p_uncollapse_root, bool p_select_in_favorites, bool p_unfold_path) {
 	// Recreate the tree.
+	_refresh_tree_build_cache();
 	tree->clear();
 	tree_update_id++;
 	updating_tree = true;
@@ -239,8 +446,9 @@ void FileSystemDock::_update_tree(const Vector<String> &p_uncollapsed_paths, boo
 			continue;
 		}
 
-		Ref<Texture> folder_icon = get_icon("Folder", "EditorIcons");
-		const Color folder_color = get_color("folder_icon_modulate", "FileDialog");
+		Ref<Texture> folder_icon = tree_folder_icon;
+		Color folder_color = tree_folder_color;
+		_get_folder_color(fave, folder_color);
 
 		String text;
 		Ref<Texture> icon;
@@ -363,6 +571,8 @@ void FileSystemDock::_notification(int p_what) {
 			button_hist_prev->set_icon(get_icon("Back", ei));
 			file_list_popup->connect("id_pressed", this, "_file_list_rmb_option");
 			tree_popup->connect("id_pressed", this, "_tree_rmb_option");
+			folder_colors_menu->connect("id_pressed", this, "_folder_color_index_pressed");
+			_update_folder_colors_menu();
 
 			current_path->connect("text_entered", this, "_navigate_to_path");
 
@@ -403,6 +613,7 @@ void FileSystemDock::_notification(int p_what) {
 		} break;
 
 		case NOTIFICATION_THEME_CHANGED: {
+			_update_folder_colors_menu();
 			if (is_visible_in_tree()) {
 				_update_display_mode(true);
 			}
@@ -746,7 +957,7 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 	}
 
 	Ref<Texture> folder_icon = (use_thumbnails) ? folder_thumbnail : get_icon("folder", "FileDialog");
-	const Color folder_color = get_color("folder_icon_modulate", "FileDialog");
+	const Color default_folder_color = get_color("folder_icon_modulate", "FileDialog");
 
 	// Build the FileInfo list.
 	List<FileInfo> file_list;
@@ -823,9 +1034,12 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 						bd += "/";
 					}
 
+					Color parent_folder_color = default_folder_color;
+					_get_folder_color(bd, parent_folder_color);
+
 					files->set_item_metadata(files->get_item_count() - 1, bd);
 					files->set_item_selectable(files->get_item_count() - 1, false);
-					files->set_item_icon_modulate(files->get_item_count() - 1, folder_color);
+					files->set_item_icon_modulate(files->get_item_count() - 1, parent_folder_color);
 				}
 
 				bool reversed = file_sort == FILE_SORT_NAME_REVERSE;
@@ -834,9 +1048,13 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 						reversed ? i-- : i++) {
 					String dname = efd->get_subdir(i)->get_name();
 
+					const String dpath = directory.plus_file(dname) + "/";
+					Color subfolder_color = default_folder_color;
+					_get_folder_color(dpath, subfolder_color);
+
 					files->add_item(dname, folder_icon, true);
-					files->set_item_metadata(files->get_item_count() - 1, directory.plus_file(dname) + "/");
-					files->set_item_icon_modulate(files->get_item_count() - 1, folder_color);
+					files->set_item_metadata(files->get_item_count() - 1, dpath);
+					files->set_item_icon_modulate(files->get_item_count() - 1, subfolder_color);
 
 					if (cselection.has(dname)) {
 						files->select(files->get_item_count() - 1, false);
@@ -864,6 +1082,11 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 	// Fills the ItemList control node from the FileInfos.
 	String main_scene = ProjectSettings::get_singleton()->get("application/run/main_scene");
 	String oi = "Object";
+	// Same reasoning as _get_tree_item_icon(): has_icon() + get_icon() is two
+	// theme chain walks, and a single directory can hold thousands of files.
+	// Local to this rebuild, so a theme change can never be served stale icons.
+	Map<StringName, Ref<Texture>> type_icon_cache;
+	Ref<Texture> import_fail_icon;
 	for (List<FileInfo>::Element *E = file_list.front(); E; E = E->next()) {
 		FileInfo *finfo = &(E->get());
 		String fname = finfo->name;
@@ -877,10 +1100,20 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 
 		// Select the icons.
 		if (!finfo->import_broken) {
-			type_icon = (has_icon(ftype, ei)) ? get_icon(ftype, ei) : get_icon(oi, ei);
+			const StringName type_key = ftype;
+			const Map<StringName, Ref<Texture>>::Element *C = type_icon_cache.find(type_key);
+			if (C) {
+				type_icon = C->get();
+			} else {
+				type_icon = (has_icon(type_key, ei)) ? get_icon(type_key, ei) : get_icon(oi, ei);
+				type_icon_cache[type_key] = type_icon;
+			}
 			big_icon = file_thumbnail;
 		} else {
-			type_icon = get_icon("ImportFail", ei);
+			if (import_fail_icon.is_null()) {
+				import_fail_icon = get_icon("ImportFail", ei);
+			}
+			type_icon = import_fail_icon;
 			big_icon = file_thumbnail_broken;
 			tooltip += "\n" + TTR("Status: Import of file failed. Please fix file and reimport manually.");
 		}
@@ -1000,16 +1233,19 @@ void FileSystemDock::_preview_invalidated(const String &p_path) {
 }
 
 void FileSystemDock::_fs_changed() {
+	FS_TRACE("FileSystemDock::_fs_changed");
 	button_hist_prev->set_disabled(history_pos == 0);
 	button_hist_next->set_disabled(history_pos == history.size() - 1);
 	scanning_vb->hide();
 	split_box->show();
 
 	if (tree->is_visible()) {
+		FS_TRACE("  FileSystemDock::_update_tree");
 		_update_tree(_compute_uncollapsed_paths());
 	}
 
 	if (file_list_vb->is_visible()) {
+		FS_TRACE("  FileSystemDock::_update_file_list");
 		_update_file_list(true);
 	}
 
@@ -1434,6 +1670,28 @@ void FileSystemDock::_file_removed(String p_file) {
 void FileSystemDock::_folder_removed(String p_folder) {
 	emit_signal("folder_removed", p_folder);
 
+	// Drop the color assigned to the removed folder and to anything under it, so a
+	// folder later recreated at the same path does not inherit a stale color.
+	if (!assigned_folder_colors.empty()) {
+		String removed_path = p_folder;
+		if (!removed_path.ends_with("/")) {
+			removed_path += "/";
+		}
+
+		List<Variant> keys;
+		assigned_folder_colors.get_key_list(&keys);
+		bool changed = false;
+		for (List<Variant>::Element *E = keys.front(); E; E = E->next()) {
+			if (String(E->get()).begins_with(removed_path)) {
+				assigned_folder_colors.erase(E->get());
+				changed = true;
+			}
+		}
+		if (changed) {
+			_save_assigned_folder_colors();
+		}
+	}
+
 	// Find the closest parent directory available, in case multiple items were deleted along the same path.
 	path = p_folder.get_base_dir();
 	DirAccessRef da = DirAccess::create(DirAccess::ACCESS_RESOURCES);
@@ -1497,6 +1755,7 @@ void FileSystemDock::_rename_operation_confirm() {
 	_update_resource_paths_after_move(file_renames);
 	_update_project_settings_after_move(file_renames);
 	_update_favorites_list_after_move(file_renames, folder_renames);
+	_update_folder_colors_after_move(folder_renames);
 
 	editor->set_current_tab(current_tab);
 
@@ -1608,6 +1867,7 @@ void FileSystemDock::_move_operation_confirm(const String &p_to_path, bool overw
 		_update_resource_paths_after_move(file_renames);
 		_update_project_settings_after_move(file_renames);
 		_update_favorites_list_after_move(file_renames, folder_renames);
+	_update_folder_colors_after_move(folder_renames);
 
 		editor->set_current_tab(current_tab);
 
@@ -2440,6 +2700,16 @@ void FileSystemDock::_file_and_folders_fill_popup(PopupMenu *p_popup, Vector<Str
 
 	} else if (all_folders && foldernames.size() > 0) {
 		p_popup->add_icon_item(get_icon("Load", "EditorIcons"), TTR("Open"), FILE_OPEN);
+
+		// add_submenu_item() resolves the submenu as a child of the popup it is added
+		// to, so the shared menu has to move between the tree and file list popups.
+		if (folder_colors_menu->get_parent() != p_popup) {
+			folder_colors_menu->get_parent()->remove_child(folder_colors_menu);
+			p_popup->add_child(folder_colors_menu);
+		}
+		folder_color_pending_paths = p_paths;
+		p_popup->add_submenu_item(TTR("Set Folder Color..."), folder_colors_menu->get_name());
+
 		p_popup->add_separator();
 	}
 
@@ -2761,6 +3031,7 @@ void FileSystemDock::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("_file_removed"), &FileSystemDock::_file_removed);
 	ClassDB::bind_method(D_METHOD("_folder_removed"), &FileSystemDock::_folder_removed);
+	ClassDB::bind_method(D_METHOD("_folder_color_index_pressed"), &FileSystemDock::_folder_color_index_pressed);
 
 	ClassDB::bind_method(D_METHOD("_file_list_thumbnail_done"), &FileSystemDock::_file_list_thumbnail_done);
 	ClassDB::bind_method(D_METHOD("_tree_thumbnail_done"), &FileSystemDock::_tree_thumbnail_done);
@@ -2881,6 +3152,14 @@ FileSystemDock::FileSystemDock(EditorNode *p_editor) {
 	tree_popup = memnew(PopupMenu);
 	tree_popup->set_hide_on_window_lose_focus(true);
 	add_child(tree_popup);
+
+	_build_folder_color_palette();
+	_load_assigned_folder_colors();
+
+	folder_colors_menu = memnew(PopupMenu);
+	folder_colors_menu->set_name("FolderColors");
+	folder_colors_menu->set_hide_on_window_lose_focus(true);
+	add_child(folder_colors_menu);
 
 	split_box = memnew(VSplitContainer);
 	split_box->set_v_size_flags(SIZE_EXPAND_FILL);

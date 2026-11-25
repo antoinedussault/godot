@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="WorldLocationArea" inherits="Area" version="3.5">
+	<brief_description>
+		A named, discoverable location a body can enter and exit.
+	</brief_description>
+	<description>
+		Marks a region of a scene as a location — a settlement, dungeon, or landmark, Creation-Engine "Location" style — and fires signals as a body crosses its bounds. Independent of [SceneManager]/[SceneDoor]: it lives inside a scene and never loads anything, it only announces itself for a HUD banner, map reveal, or fast-travel list to react to.
+		When the scene's root is a [GameWorld], every [WorldLocationArea] under it is reachable without holding a reference of your own: [method GameWorld.get_locations] / [method GameWorld.get_location_by_id], or the [SceneManager] passthroughs [code]SceneManager.get_locations()[/code] / [code]SceneManager.get_location_by_id(id)[/code] / [code]SceneManager.get_world_game()[/code].
+		Nest a smaller [WorldLocationArea] inside a bigger one freely (e.g. a house inside a settlement) — each fires its own [signal location_entered]/[signal location_exited] independently; there is no built-in "innermost wins" resolution here.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="is_body_inside" qualifiers="const">
+			<return type="bool" />
+			<description>
+				True while at least one body matching [member body_filter] is inside.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="body_filter" type="String" setter="set_body_filter" getter="get_body_filter" default="&quot;player&quot;">
+			Group an entering/exiting body must belong to. Empty means any body.
+		</member>
+		<member name="discover_on_enter" type="bool" setter="set_discover_on_enter" getter="get_discover_on_enter" default="true">
+			If set, the first matching body to enter sets [member discovered] to [code]true[/code] (and fires [signal location_discovered]).
+		</member>
+		<member name="discovered" type="bool" setter="set_discovered" getter="is_discovered" default="false">
+			Whether this location has been found yet — pre-set it [code]true[/code] on a location the player should already know about (e.g. the starting settlement).
+		</member>
+		<member name="display_name" type="String" setter="set_display_name" getter="get_display_name" default="&quot;&quot;">
+			Human-readable name for a HUD banner or map label.
+		</member>
+		<member name="location_id" type="String" setter="set_location_id" getter="get_location_id" default="&quot;&quot;">
+			Stable identifier, looked up via [method GameWorld.get_location_by_id] / [code]SceneManager.get_location_by_id(id)[/code].
+		</member>
+		<member name="location_type" type="int" setter="set_location_type" getter="get_location_type" enum="WorldLocationArea.LocationType" default="0">
+			Broad category, informational for a map icon / filter.
+		</member>
+		<member name="map_icon" type="Texture" setter="set_map_icon" getter="get_map_icon">
+			Optional icon a map/HUD script can read for this location's marker.
+		</member>
+		<member name="notify_on_enter" type="bool" setter="set_notify_on_enter" getter="get_notify_on_enter" default="true">
+			If false, [signal location_entered] / [signal location_exited] never fire (discovery via [member discover_on_enter] still can).
+		</member>
+	</members>
+	<signals>
+		<signal name="location_entered">
+			<argument index="0" name="location_id" type="String" />
+			<argument index="1" name="display_name" type="String" />
+			<description>
+				Emitted when the first matching body enters (a second matching body inside at the same time does not retrigger it).
+			</description>
+		</signal>
+		<signal name="location_exited">
+			<argument index="0" name="location_id" type="String" />
+			<argument index="1" name="display_name" type="String" />
+			<description>
+				Emitted when the last matching body leaves.
+			</description>
+		</signal>
+		<signal name="location_discovered">
+			<argument index="0" name="location_id" type="String" />
+			<argument index="1" name="display_name" type="String" />
+			<description>
+				Emitted once, the first time [member discovered] flips to [code]true[/code].
+			</description>
+		</signal>
+	</signals>
+	<constants>
+		<constant name="TYPE_WILDERNESS" value="0" enum="LocationType">
+		</constant>
+		<constant name="TYPE_SETTLEMENT" value="1" enum="LocationType">
+		</constant>
+		<constant name="TYPE_DUNGEON" value="2" enum="LocationType">
+		</constant>
+		<constant name="TYPE_LANDMARK" value="3" enum="LocationType">
+		</constant>
+	</constants>
+</class>

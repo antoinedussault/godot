@@ -70,6 +70,16 @@ private:
 	Color color;
 	float param[PARAM_MAX];
 	Color shadow_color;
+	Ref<Texture> projector;
+	bool lens_streak_enabled = false;
+	Color lens_streak_color = Color(1, 1, 1);
+	float lens_streak_intensity = 1.0;
+	float lens_streak_length = 0.6;
+	float lens_streak_thickness = 0.02;
+	float lens_streak_angle = 0.0;
+	float lens_streak_source_size = 0.1;
+	float lens_streak_max_distance = 100.0;
+	void _update_lens_streak();
 	bool shadow;
 	bool negative;
 	bool reverse_cull;
@@ -116,6 +126,26 @@ public:
 	void set_shadow_color(const Color &p_shadow_color);
 	Color get_shadow_color() const;
 
+	void set_projector(const Ref<Texture> &p_texture);
+	Ref<Texture> get_projector() const;
+
+	void set_lens_streak_enabled(bool p_enabled);
+	bool is_lens_streak_enabled() const;
+	void set_lens_streak_color(const Color &p_color);
+	Color get_lens_streak_color() const;
+	void set_lens_streak_intensity(float p_intensity);
+	float get_lens_streak_intensity() const;
+	void set_lens_streak_length(float p_length);
+	float get_lens_streak_length() const;
+	void set_lens_streak_thickness(float p_thickness);
+	float get_lens_streak_thickness() const;
+	void set_lens_streak_angle(float p_angle);
+	float get_lens_streak_angle() const;
+	void set_lens_streak_source_size(float p_source_size);
+	float get_lens_streak_source_size() const;
+	void set_lens_streak_max_distance(float p_max_distance);
+	float get_lens_streak_max_distance() const;
+
 	void set_shadow_reverse_cull_face(bool p_enable);
 	bool get_shadow_reverse_cull_face() const;
 
@@ -152,6 +182,18 @@ private:
 	ShadowMode shadow_mode;
 	ShadowDepthRange shadow_depth_range;
 
+	bool godrays_enabled = false;
+	float godrays_intensity = 0.6;
+	float godrays_threshold = 1.0;
+	Color godrays_tint = Color(1.0, 0.95, 0.85);
+	float godrays_occlusion = 0.35;
+	int godrays_samples = 64;
+	float godrays_density = 0.7;
+	float godrays_decay = 0.9;
+	float godrays_weight = 1.0;
+	float godrays_temporal_blend = 0.0;
+	void _update_godrays();
+
 protected:
 	static void _bind_methods();
 	virtual void _validate_property(PropertyInfo &property) const;
@@ -165,6 +207,27 @@ public:
 
 	void set_blend_splits(bool p_enable);
 	bool is_blend_splits_enabled() const;
+
+	void set_godrays_enabled(bool p_enabled);
+	bool is_godrays_enabled() const;
+	void set_godrays_intensity(float p_intensity);
+	float get_godrays_intensity() const;
+	void set_godrays_threshold(float p_threshold);
+	float get_godrays_threshold() const;
+	void set_godrays_tint(const Color &p_tint);
+	Color get_godrays_tint() const;
+	void set_godrays_occlusion(float p_occlusion);
+	float get_godrays_occlusion() const;
+	void set_godrays_samples(int p_samples);
+	int get_godrays_samples() const;
+	void set_godrays_density(float p_density);
+	float get_godrays_density() const;
+	void set_godrays_decay(float p_decay);
+	float get_godrays_decay() const;
+	void set_godrays_weight(float p_weight);
+	float get_godrays_weight() const;
+	void set_godrays_temporal_blend(float p_temporal_blend);
+	float get_godrays_temporal_blend() const;
 
 	DirectionalLight();
 };

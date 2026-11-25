@@ -10,6 +10,7 @@
 #include "core/set.h"
 #include "editor/editor_file_dialog.h"
 #include "editor/editor_file_system.h"
+#include "editor/editor_fs_trace.h"
 #include "editor/editor_inspector.h"
 #include "editor/editor_node.h"
 #include "editor/editor_scale.h"
@@ -26,6 +27,25 @@
 #include "scene/gui/popup_menu.h"
 #include "scene/gui/split_container.h"
 #include "scene/gui/tree.h"
+
+// Registering a single written/removed file with the editor filesystem.
+// A full EditorFileSystem::scan() rebuilds the whole res:// tree from disk,
+// which is very slow on a large project and is silently dropped if any other
+// scan is already in flight. update_file() does the same job for one path at
+// no cost, but it only works once the containing directory is known to the
+// editor, so fall back to a (still cheap) changes scan for freshly created
+// directories.
+static void _notify_fs_file(const String &p_path) {
+	EditorFileSystem *efs = EditorFileSystem::get_singleton();
+	if (!efs) {
+		return;
+	}
+	if (efs->get_filesystem_path(p_path.get_base_dir())) {
+		efs->update_file(p_path);
+	} else {
+		efs->scan_changes();
+	}
+}
 
 static const char *ITEM_BASE_CLASS = "ItemResource";
 static const char *RECIPE_BASE_CLASS = "ItemRecipeResource";
@@ -194,6 +214,7 @@ void ItemsEditor::_update_visibility() {
 //=============================================================
 
 void ItemsEditor::_refresh() {
+	FS_TRACE("ItemsEditor::_refresh");
 	_read_settings();
 	_load_catalog();
 	_update_visibility();
@@ -410,17 +431,31 @@ String ItemsEditor::_slugify(const String &p_name) {
 	return slug.empty() ? String("item") : slug;
 }
 
-String ItemsEditor::_make_item_id(const String &p_name) const {
-	String slug = _slugify(p_name);
+// Creation Kit auto-assigns new records starting at 0x800, keeping the block
+// below it free for hardcoded/engine forms — mirrored here even though we
+// only have one "file" to assign out of.
+static const uint32_t FORM_ID_START = 0x800;
 
+String ItemsEditor::_make_form_id() const {
 	Set<String> ids;
 	_collect_item_ids(&ids);
-	String cand = slug;
-	int n = 2;
-	while (ids.has(cand)) {
-		cand = slug + "_" + itos(n++);
+
+	uint32_t max_id = FORM_ID_START - 1;
+	for (Set<String>::Element *E = ids.front(); E; E = E->next()) {
+		const String &s = E->get();
+		if (s.length() == 8 && s.is_valid_hex_number(false)) {
+			uint32_t v = (uint32_t)s.hex_to_int64(false);
+			if (v > max_id) {
+				max_id = v;
+			}
+		}
 	}
-	return cand;
+
+	String hex = String::num_uint64((uint64_t)(max_id + 1), 16, true);
+	while (hex.length() < 8) {
+		hex = "0" + hex;
+	}
+	return hex;
 }
 
 void ItemsEditor::_create_recipe(const String &p_global_class) {
@@ -448,7 +483,7 @@ void ItemsEditor::_create_recipe(const String &p_global_class) {
 		EditorNode::get_singleton()->show_warning(vformat("Failed to save %s (error %d)", target, err));
 		return;
 	}
-	EditorFileSystem::get_singleton()->scan();
+	_notify_fs_file(target);
 	selected_path = target;
 	_refresh();
 	_edit_resource(target);
@@ -460,9 +495,10 @@ void ItemsEditor::_create_recipe(const String &p_global_class) {
 
 void ItemsEditor::_open_create_dialog(const String &p_global_class) {
 	pending_class = p_global_class;
+	pending_id = _make_form_id();
 	create_name->set_text("");
 	create_scene->set_text("");
-	create_id_preview->set_text("");
+	create_id_preview->set_text(vformat(TTR("id: %s (auto)"), pending_id));
 	_populate_create_categories();
 	create_dialog->get_ok()->set_disabled(true);
 	create_dialog->set_title(vformat(TTR("New %s"), p_global_class));
@@ -505,9 +541,7 @@ void ItemsEditor::_on_create_main_selected(int p_idx) {
 }
 
 void ItemsEditor::_on_create_name_changed(const String &p_text) {
-	bool empty = p_text.strip_edges().empty();
-	create_dialog->get_ok()->set_disabled(empty);
-	create_id_preview->set_text(empty ? String() : vformat(TTR("id: %s"), _slugify(p_text)));
+	create_dialog->get_ok()->set_disabled(p_text.strip_edges().empty());
 }
 
 void ItemsEditor::_on_create_scene_browse() {
@@ -535,7 +569,7 @@ void ItemsEditor::_on_create_confirmed() {
 		return;
 	}
 
-	String id = _make_item_id(name);
+	String id = pending_id;
 	res->set("id", id);
 	res->set("name", name);
 	if (!scene.empty()) {
@@ -550,7 +584,14 @@ void ItemsEditor::_on_create_confirmed() {
 		memdelete(da);
 	}
 
-	String target = items_dir.plus_file(id + ".tres");
+	// The FormID is the identity; the filename just stays human-browsable.
+	String file_base = _slugify(name);
+	String target = items_dir.plus_file(file_base + ".tres");
+	int n = 2;
+	while (FileAccess::exists(target)) {
+		target = items_dir.plus_file(vformat("%s_%d.tres", file_base, n++));
+	}
+
 	Error err = ResourceSaver::save(target, res);
 	if (err != OK) {
 		EditorNode::get_singleton()->show_warning(vformat("Failed to save %s (error %d)", target, err));
@@ -562,9 +603,10 @@ void ItemsEditor::_on_create_confirmed() {
 		_save_catalog();
 	}
 
-	EditorFileSystem::get_singleton()->scan();
+	_notify_fs_file(target);
 	selected_path = target;
 	pending_class = "";
+	pending_id = "";
 	_refresh();
 	_edit_resource(target);
 }
@@ -588,7 +630,7 @@ void ItemsEditor::_on_duplicate_pressed() {
 		memdelete(da);
 	}
 	if (err == OK) {
-		EditorFileSystem::get_singleton()->scan();
+		_notify_fs_file(target);
 		selected_path = target;
 		_refresh();
 		_edit_resource(target);
@@ -681,7 +723,8 @@ void ItemsEditor::_on_dialog_confirmed() {
 				memdelete(da);
 			}
 			if (err == OK) {
-				EditorFileSystem::get_singleton()->scan();
+				_notify_fs_file(selected_path); // drops the old entry
+				_notify_fs_file(target);
 				selected_path = target;
 				_refresh();
 				_edit_resource(target);
@@ -708,7 +751,7 @@ void ItemsEditor::_on_dialog_confirmed() {
 					da->remove(selected_path);
 					memdelete(da);
 				}
-				EditorFileSystem::get_singleton()->scan();
+				_notify_fs_file(selected_path);
 				selected_path = "";
 				selected_res.unref();
 				inspector->edit(nullptr);
@@ -844,7 +887,7 @@ void ItemsEditor::_save_catalog() {
 		memdelete(da);
 	}
 	ResourceSaver::save(catalog_path, catalog);
-	EditorFileSystem::get_singleton()->scan();
+	_notify_fs_file(catalog_path);
 }
 
 void ItemsEditor::_populate_category_options() {

@@ -20,8 +20,11 @@
 // Setting `auto_build` off skips all of it and leaves you to author the
 // CollisionShape children on this node yourself.
 //
-// It plugs straight into the cell_system streaming: CellWorld already routes any
-// RigidBody into its DynamicObjects container. A CellPlayerBody walking into the
+// It plugs straight into the cell_system streaming: GameWorld treats any
+// RigidBody as a dynamic object - it follows the cell it is actually in, is
+// parked while the ground under it has no collision, and its position is part
+// of the world's persistent state. Hand one created at runtime (a dropped
+// item) to GameWorld.add_object(). A CellPlayerBody walking into the
 // body shoves it (see `_direct_state_changed`); `push()` does the same from code,
 // and `pickup()` removes it and emits `picked_up`.
 class CellItemBody : public RigidBody {

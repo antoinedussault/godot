@@ -251,7 +251,7 @@ void OS_Windows::_touch_event(bool p_pressed, float p_x, float p_y, int idx) {
 	event->set_position(Vector2(p_x, p_y));
 
 	if (main_loop) {
-		input->parse_input_event(event);
+		_parse_window_input(event);
 	}
 };
 
@@ -271,7 +271,7 @@ void OS_Windows::_drag_event(float p_x, float p_y, int idx) {
 	event->set_relative(Vector2(p_x, p_y) - curr->get());
 
 	if (main_loop)
-		input->parse_input_event(event);
+		_parse_window_input(event);
 
 	curr->get() = Vector2(p_x, p_y);
 };
@@ -285,10 +285,22 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		}
 	};
 
+	const int msg_window = _window_id_from_hwnd(hWnd);
+	current_message_window = msg_window;
+	const bool is_sub_window = (msg_window != MAIN_WINDOW_ID);
+	// Input belongs to whichever of our windows has focus; window_has_focus alone
+	// would drop every event as soon as a secondary window is focused.
+	const bool source_focused = (focused_window == msg_window);
+
 	switch (uMsg) // Check For Windows Messages
 	{
 		case WM_SETFOCUS: {
+			focused_window = msg_window;
+			if (is_sub_window) {
+				break;
+			}
 			window_has_focus = true;
+	focused_window = MAIN_WINDOW_ID;
 
 			// Restore mouse mode
 			_set_mouse_mode_impl(mouse_mode);
@@ -296,6 +308,12 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			break;
 		}
 		case WM_KILLFOCUS: {
+			if (focused_window == msg_window) {
+				focused_window = INVALID_WINDOW_ID;
+			}
+			if (is_sub_window) {
+				break;
+			}
 			window_has_focus = false;
 
 			// Release capture unconditionally because it can be set due to dragging, in addition to captured mode
@@ -311,31 +329,57 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		}
 		case WM_ACTIVATE: // Watch For Window Activate Message
 		{
-			minimized = HIWORD(wParam) != 0;
+			const bool activating = (LOWORD(wParam) == WA_ACTIVE || LOWORD(wParam) == WA_CLICKACTIVE);
+			// For WM_ACTIVATE, lParam is the other window involved in the switch. If it
+			// is also ours, the application as a whole keeps focus.
+			const bool other_is_ours = _is_our_window((HWND)lParam);
+
+			if (activating) {
+				focused_window = msg_window;
+			}
+
+			if (!is_sub_window) {
+				minimized = HIWORD(wParam) != 0;
+			}
+
 			if (!main_loop) {
 				return 0;
 			};
-			if (LOWORD(wParam) == WA_ACTIVE || LOWORD(wParam) == WA_CLICKACTIVE) {
-				main_loop->notification(MainLoop::NOTIFICATION_WM_FOCUS_IN);
+
+			if (activating) {
 				window_focused = true;
 				alt_mem = false;
 				control_mem = false;
 				shift_mem = false;
 				gr_mem = false;
-			} else { // WM_INACTIVE
-				input->release_pressed_events();
-				main_loop->notification(MainLoop::NOTIFICATION_WM_FOCUS_OUT);
+				if (!is_sub_window) {
+					window_has_focus = true;
+				}
+				if (!app_has_focus) {
+					app_has_focus = true;
+					main_loop->notification(MainLoop::NOTIFICATION_WM_FOCUS_IN);
+				}
+			} else if (!other_is_ours) {
+				// Focus actually left the application, not just this window.
 				window_focused = false;
 				alt_mem = false;
-			};
+				if (app_has_focus) {
+					app_has_focus = false;
+					input->release_pressed_events();
+					main_loop->notification(MainLoop::NOTIFICATION_WM_FOCUS_OUT);
+				}
+			}
 
-			if ((get_current_tablet_driver() == "wintab") && wintab_available && wtctx) {
+			if (!is_sub_window && (get_current_tablet_driver() == "wintab") && wintab_available && wtctx) {
 				wintab_WTEnable(wtctx, GET_WM_ACTIVATE_STATE(wParam, lParam));
 			}
 
 			return 0; // Return  To The Message Loop
 		}
 		case WM_GETMINMAXINFO: {
+			if (is_sub_window) {
+				break;
+			}
 			if (video_mode.resizable && !video_mode.fullscreen) {
 				Size2 decor = get_real_window_size() - get_window_size(); // Size of window decorations
 				MINMAXINFO *min_max_info = (MINMAXINFO *)lParam;
@@ -373,6 +417,15 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
 		case WM_CLOSE: // Did We Receive A Close Message?
 		{
+			if (is_sub_window) {
+				// Closing an extra window must not quit the application; flag it so the
+				// owner can tear it down on its next frame.
+				Map<int, SubWindow>::Element *E = sub_windows.find(msg_window);
+				if (E) {
+					E->get().close_requested = true;
+				}
+				return 0;
+			}
 			if (main_loop)
 				main_loop->notification(MainLoop::NOTIFICATION_WM_QUIT_REQUEST);
 			//force_quit=true;
@@ -454,8 +507,8 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 					*/
 				}
 
-				if (window_has_focus && main_loop && mm->get_relative() != Vector2())
-					input->parse_input_event(mm);
+				if (source_focused && main_loop && mm->get_relative() != Vector2())
+					_parse_window_input(mm);
 			}
 			delete[] lpb;
 		} break;
@@ -544,8 +597,8 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 					mm->set_relative(Vector2(mm->get_position() - Vector2(old_x, old_y)));
 					old_x = mm->get_position().x;
 					old_y = mm->get_position().y;
-					if (window_has_focus && main_loop)
-						input->parse_input_event(mm);
+					if (source_focused && main_loop)
+						_parse_window_input(mm);
 				}
 				return 0;
 			}
@@ -689,8 +742,8 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			mm->set_relative(Vector2(mm->get_position() - Vector2(old_x, old_y)));
 			old_x = mm->get_position().x;
 			old_y = mm->get_position().y;
-			if (window_has_focus && main_loop)
-				input->parse_input_event(mm);
+			if (source_focused && main_loop)
+				_parse_window_input(mm);
 			return 0;
 		} break;
 		case WM_MOUSEMOVE: {
@@ -793,8 +846,8 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			mm->set_relative(Vector2(mm->get_position() - Vector2(old_x, old_y)));
 			old_x = mm->get_position().x;
 			old_y = mm->get_position().y;
-			if (window_has_focus && main_loop)
-				input->parse_input_event(mm);
+			if (source_focused && main_loop)
+				_parse_window_input(mm);
 
 		} break;
 		case WM_LBUTTONDOWN:
@@ -819,6 +872,16 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		case WM_XBUTTONDBLCLK:
 		case WM_XBUTTONDOWN:
 		case WM_XBUTTONUP: {
+			// When this window is embedded as a child of another application (the external
+			// editor reparents it into its own panel), clicking it activates that application's
+			// top-level window -- this HWND never receives WM_SETFOCUS, so window_has_focus
+			// stays false and captured-mode mouse motion is discarded further up. Taking focus
+			// on a click restores the behaviour a top-level window gets for free, and is a
+			// no-op for one, which already has focus by the time a click arrives.
+			if ((GetWindowLongPtr(hWnd, GWL_STYLE) & WS_CHILD) && GetFocus() != hWnd) {
+				SetFocus(hWnd);
+			}
+
 			Ref<InputEventMouseButton> mb;
 			mb.instance();
 
@@ -957,19 +1020,22 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			mb->set_global_position(mb->get_position());
 
 			if (main_loop) {
-				input->parse_input_event(mb);
+				_parse_window_input(mb);
 				if (mb->is_pressed() && mb->get_button_index() > 3 && mb->get_button_index() < 8) {
 					//send release for mouse wheel
 					Ref<InputEventMouseButton> mbd = mb->duplicate();
 					last_button_state &= ~(1 << (mbd->get_button_index() - 1));
 					mbd->set_button_mask(last_button_state);
 					mbd->set_pressed(false);
-					input->parse_input_event(mbd);
+					_parse_window_input(mbd);
 				}
 			}
 		} break;
 
 		case WM_MOVE: {
+			if (is_sub_window) {
+				break;
+			}
 			if (!IsIconic(hWnd)) {
 				int x = LOWORD(lParam);
 				int y = HIWORD(lParam);
@@ -978,6 +1044,10 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		} break;
 
 		case WM_SIZE: {
+			if (is_sub_window) {
+				// Extra windows track their own size; the main video mode must not change.
+				break;
+			}
 			// Ignore size when a SIZE_MINIMIZED event is triggered
 			if (wParam != SIZE_MINIMIZED) {
 				int window_w = LOWORD(lParam);
@@ -1057,6 +1127,7 @@ LRESULT OS_Windows::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			ke.control = (wParam != VK_CONTROL) ? control_mem : false;
 			ke.meta = meta_mem;
 			ke.uMsg = uMsg;
+			ke.window = msg_window;
 
 			if (ke.uMsg == WM_SYSKEYDOWN)
 				ke.uMsg = WM_KEYDOWN;
@@ -1172,6 +1243,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 void OS_Windows::process_key_events() {
 	for (int i = 0; i < key_event_pos; i++) {
 		KeyEvent &ke = key_event_buffer[i];
+		// Restore the window the key was actually pressed in, so it routes to the
+		// right viewport rather than to whatever sent the most recent message.
+		current_message_window = ke.window;
 		switch (ke.uMsg) {
 			case WM_CHAR: {
 				// extended keys should only be processed as WM_KEYDOWN message.
@@ -1195,7 +1269,7 @@ void OS_Windows::process_key_events() {
 					if (k->get_unicode() < 32)
 						k->set_unicode(0);
 
-					input->parse_input_event(k);
+					_parse_window_input(k);
 				}
 
 				//do nothing
@@ -1234,7 +1308,7 @@ void OS_Windows::process_key_events() {
 
 				k->set_echo((ke.uMsg == WM_KEYDOWN && (ke.lParam & (1 << 30))));
 
-				input->parse_input_event(k);
+				_parse_window_input(k);
 
 			} break;
 		}
@@ -1877,6 +1951,157 @@ void OS_Windows::update_real_mouse_position() {
 
 int OS_Windows::get_mouse_button_state() const {
 	return last_button_state;
+}
+
+int OS_Windows::_window_id_from_hwnd(HWND p_hwnd) const {
+	if (p_hwnd == hWnd) {
+		return MAIN_WINDOW_ID;
+	}
+	for (const Map<int, SubWindow>::Element *E = sub_windows.front(); E; E = E->next()) {
+		if (E->get().hWnd == p_hwnd) {
+			return E->key();
+		}
+	}
+	return MAIN_WINDOW_ID;
+}
+
+bool OS_Windows::_is_our_window(HWND p_hwnd) const {
+	if (!p_hwnd) {
+		return false;
+	}
+	if (p_hwnd == hWnd) {
+		return true;
+	}
+	for (const Map<int, SubWindow>::Element *E = sub_windows.front(); E; E = E->next()) {
+		if (E->get().hWnd == p_hwnd) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void OS_Windows::_parse_window_input(Ref<InputEvent> p_event) {
+	if (p_event.is_valid()) {
+		p_event->set_window(current_message_window);
+	}
+
+	input->parse_input_event(p_event);
+}
+
+bool OS_Windows::window_get_close_requested(int p_window) const {
+	const Map<int, SubWindow>::Element *E = sub_windows.find(p_window);
+	return E ? E->get().close_requested : false;
+}
+
+void OS_Windows::window_clear_close_request(int p_window) {
+	Map<int, SubWindow>::Element *E = sub_windows.find(p_window);
+	if (E) {
+		E->get().close_requested = false;
+	}
+}
+
+int OS_Windows::window_create(const String &p_title, const Rect2 &p_rect) {
+#if defined(OPENGL_ENABLED)
+	ERR_FAIL_COND_V_MSG(!gl_context, INVALID_WINDOW_ID, "Cannot create a window before the rendering context exists.");
+
+	// Must run on the thread that pumps messages: PeekMessage only retrieves messages
+	// for windows owned by the calling thread.
+	RECT rect;
+	rect.left = p_rect.position.x;
+	rect.top = p_rect.position.y;
+	rect.right = p_rect.position.x + p_rect.size.width;
+	rect.bottom = p_rect.position.y + p_rect.size.height;
+	AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+
+	HWND window = CreateWindowExW(
+			0,
+			L"Engine", p_title.c_str(),
+			WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+			rect.left, rect.top,
+			rect.right - rect.left, rect.bottom - rect.top,
+			NULL, NULL, hInstance, NULL);
+	ERR_FAIL_COND_V_MSG(!window, INVALID_WINDOW_ID, "Failed to create an additional OS window.");
+
+	SubWindow sw;
+	sw.hWnd = window;
+	sw.hDC = GetDC(window);
+
+	// The main context is reused rather than sharing a second one, so this DC has to
+	// carry the same pixel format the context was created against.
+	if (!sw.hDC || gl_context->prepare_dc(sw.hDC) != OK) {
+		if (sw.hDC) {
+			ReleaseDC(window, sw.hDC);
+		}
+		DestroyWindow(window);
+		ERR_FAIL_V_MSG(INVALID_WINDOW_ID, "Failed to prepare the drawable for an additional OS window.");
+	}
+
+	const int id = sub_window_next_id++;
+	sub_windows[id] = sw;
+
+	ShowWindow(window, SW_SHOW);
+	return id;
+#else
+	return INVALID_WINDOW_ID;
+#endif
+}
+
+void OS_Windows::window_destroy(int p_window) {
+	Map<int, SubWindow>::Element *E = sub_windows.find(p_window);
+	ERR_FAIL_COND(!E);
+
+	if (E->get().hDC) {
+		ReleaseDC(E->get().hWnd, E->get().hDC);
+	}
+	DestroyWindow(E->get().hWnd);
+	sub_windows.erase(E);
+}
+
+Size2 OS_Windows::window_get_size(int p_window) const {
+	if (p_window == MAIN_WINDOW_ID) {
+		return get_window_size();
+	}
+
+	const Map<int, SubWindow>::Element *E = sub_windows.find(p_window);
+	ERR_FAIL_COND_V(!E, Size2());
+
+	RECT r;
+	if (!GetClientRect(E->get().hWnd, &r)) {
+		return Size2();
+	}
+	return Size2(r.right - r.left, r.bottom - r.top);
+}
+
+void OS_Windows::window_make_current(int p_window) {
+#if defined(OPENGL_ENABLED)
+	if (!gl_context) {
+		return;
+	}
+	if (p_window == MAIN_WINDOW_ID) {
+		gl_context->make_current();
+		return;
+	}
+
+	const Map<int, SubWindow>::Element *E = sub_windows.find(p_window);
+	ERR_FAIL_COND(!E);
+	gl_context->make_current_on(E->get().hDC);
+#endif
+}
+
+void OS_Windows::window_swap_buffers(int p_window) {
+#if defined(OPENGL_ENABLED)
+	if (!gl_context) {
+		return;
+	}
+	if (p_window == MAIN_WINDOW_ID) {
+		gl_context->swap_buffers();
+		return;
+	}
+
+	const Map<int, SubWindow>::Element *E = sub_windows.find(p_window);
+	ERR_FAIL_COND(!E);
+	gl_context->swap_buffers_on(E->get().hDC);
+#endif
 }
 
 void OS_Windows::set_window_title(const String &p_title) {
@@ -3912,6 +4137,10 @@ OS_Windows::OS_Windows(HINSTANCE _hInstance) {
 	}
 
 	hInstance = _hInstance;
+	sub_window_next_id = MAIN_WINDOW_ID + 1;
+	current_message_window = MAIN_WINDOW_ID;
+	focused_window = MAIN_WINDOW_ID;
+	app_has_focus = true;
 	pressrc = 0;
 	old_invalid = true;
 	mouse_mode = MOUSE_MODE_VISIBLE;

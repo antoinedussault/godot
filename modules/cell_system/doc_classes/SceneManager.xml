@@ -44,6 +44,25 @@
 				Load progress of the in-flight travel, [code]0..1[/code].
 			</description>
 		</method>
+		<method name="get_location_by_id" qualifiers="const">
+			<return type="Node" />
+			<argument index="0" name="id" type="String" />
+			<description>
+				Shortcut for [code]get_world_game().get_location_by_id(id)[/code] — the [WorldLocationArea] with this [member WorldLocationArea.location_id] under the current scene's [GameWorld] root, or [code]null[/code] if there is no such location or the current scene isn't GameWorld-rooted.
+			</description>
+		</method>
+		<method name="get_locations" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Shortcut for [code]get_world_game().get_locations()[/code] — every [WorldLocationArea] under the current scene's [GameWorld] root, or an empty array if the current scene isn't GameWorld-rooted.
+			</description>
+		</method>
+		<method name="get_world_game" qualifiers="const">
+			<return type="GameWorld" />
+			<description>
+				The current scene's root, if it is a [GameWorld]; otherwise [code]null[/code].
+			</description>
+		</method>
 		<method name="is_travelling" qualifiers="const">
 			<return type="bool" />
 			<description>

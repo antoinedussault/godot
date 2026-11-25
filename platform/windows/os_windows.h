@@ -305,6 +305,9 @@ class OS_Windows : public OS {
 		UINT uMsg;
 		WPARAM wParam;
 		LPARAM lParam;
+		// Key events are buffered here and flushed after the message pump, by which
+		// time the "current" window would be whatever sent the last message.
+		int window;
 	};
 
 	KeyEvent key_event_buffer[KEY_EVENT_BUFFER_SIZE];
@@ -324,6 +327,29 @@ class OS_Windows : public OS {
 	int pressrc;
 	HINSTANCE hInstance; // Holds The Instance Of The Application
 	HWND hWnd;
+
+	// Additional OS windows. They share the main window's rendering context, which is
+	// made current on their DC only to present into them.
+	struct SubWindow {
+		HWND hWnd;
+		HDC hDC;
+		bool close_requested;
+
+		SubWindow() :
+				hWnd(NULL),
+				hDC(NULL),
+				close_requested(false) {}
+	};
+
+	Map<int, SubWindow> sub_windows;
+	int sub_window_next_id;
+	// Window the message currently being processed belongs to, used to stamp input
+	// events so they can be routed to the right viewport.
+	int current_message_window;
+
+	int _window_id_from_hwnd(HWND p_hwnd) const;
+	bool _is_our_window(HWND p_hwnd) const;
+	void _parse_window_input(Ref<InputEvent> p_event);
 
 	Vector<Vector2> mpath;
 	Point2 last_pos;
@@ -360,6 +386,12 @@ class OS_Windows : public OS {
 	bool meta_mem;
 	bool force_quit;
 	bool window_has_focus;
+	// Which of our OS windows currently holds keyboard focus. window_has_focus only
+	// tracks the main window, so it cannot gate input for additional windows.
+	int focused_window;
+	// Whether ANY of our windows holds focus. WM_FOCUS_IN/OUT are application-level
+	// notifications, so moving focus between our own windows must not fire them.
+	bool app_has_focus;
 	uint32_t last_button_state;
 	bool use_raw_input;
 	bool drop_events;
@@ -445,6 +477,15 @@ public:
 	virtual int get_mouse_button_state() const;
 	virtual void set_window_title(const String &p_title);
 	virtual void set_window_mouse_passthrough(const PoolVector2Array &p_region);
+
+	virtual bool has_multiple_windows() const { return true; }
+	virtual int window_create(const String &p_title, const Rect2 &p_rect);
+	virtual void window_destroy(int p_window);
+	virtual Size2 window_get_size(int p_window) const;
+	virtual void window_make_current(int p_window);
+	virtual void window_swap_buffers(int p_window);
+	virtual bool window_get_close_requested(int p_window) const;
+	virtual void window_clear_close_request(int p_window);
 
 	virtual void set_video_mode(const VideoMode &p_video_mode, int p_screen = 0);
 	virtual VideoMode get_video_mode(int p_screen = 0) const;

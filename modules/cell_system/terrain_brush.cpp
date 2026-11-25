@@ -57,6 +57,9 @@ void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float str
 		}
 	}
 
+	// Resolved once per stroke, not per vertex.
+	const bool slope_filter_active = (paint_min_angle > 0.001f) || (paint_max_angle < 89.999f);
+
 	Set<int64_t> touched;
 
 	// Lock the brush image once for the whole stroke, not per vertex.
@@ -82,6 +85,22 @@ void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float str
 				float v = (dz / radius) * 0.5f + 0.5f;
 				int px = CLAMP((int)(u * brush_image->get_width()), 0, brush_image->get_width() - 1);
 				int py = CLAMP((int)(v * brush_image->get_height()), 0, brush_image->get_height() - 1);
+			// Slope filter (MODE_PAINT only). Evaluated per grid vertex and
+			// skipped entirely when the range is wide open, so the common case
+			// costs nothing. Sampled through the manager rather than the cell so
+			// vertices on a cell border read their neighbour correctly instead
+			// of clamping at the edge.
+			if (mode == MODE_PAINT && slope_filter_active) {
+				float hl = manager->get_height_at_world(vx - spacing, vz);
+				float hr = manager->get_height_at_world(vx + spacing, vz);
+				float hd = manager->get_height_at_world(vx, vz - spacing);
+				float hu = manager->get_height_at_world(vx, vz + spacing);
+				Vector3 nrm(hl - hr, 2.0f * spacing, hd - hu);
+				nrm.normalize();
+				float angle = Math::rad2deg(Math::acos(CLAMP(nrm.y, -1.0f, 1.0f)));
+				if (angle < paint_min_angle || angle > paint_max_angle) continue;
+			}
+
 				fo *= brush_image->get_pixel(px, py).r; // red channel as intensity
 			}
 
@@ -101,6 +120,20 @@ void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float str
 					if (mode == MODE_PAINT) {
 						// Texture painting: write to splatmap.
 						cell->paint_layer(lx, lz, paint_layer, strength * fo);
+					} else if (mode == MODE_COLOR) {
+						// Colour painting: blend the cell's tint map toward the
+						// picked colour. Same "textures only" class of edit as
+						// MODE_PAINT - no geometry changes, so no rebuild.
+						cell->paint_color_at(lx, lz, paint_color, strength * fo);
+					} else if (mode == MODE_HOLE) {
+						// Hole painting: hard 0/1, not a blend. A quad is either
+						// there or it is not (see CellTerrain::_quad_is_hole_s),
+						// so an intermediate value would only ever read as one
+						// of the two anyway - and lerping would make a soft
+						// brush edge need many passes to actually cut through.
+						if (strength * fo > 0.01f) {
+							cell->set_hole_at(lx, lz, hole_erase ? 1.0f : 0.0f);
+						}
 					} else if (mode == MODE_NAV_MASK) {
 						// Navmesh mask painting: blend toward 0 (excluded) or 1
 						// (navigable) — leaves a hole in the baked navmesh, same
@@ -179,14 +212,17 @@ void TerrainBrush::apply_brush(const Vector3 &world_pos, float radius, float str
 
 	if (use_brush_img) brush_image->unlock();
 
-	if (mode == MODE_PAINT) {
-		// Painting only changes splatmaps; update those textures in place. No mesh
-		// or collision rebuild is needed (the material already binds the textures).
+	if (mode == MODE_PAINT || mode == MODE_COLOR) {
+		// Painting only changes textures; update those in place. No mesh or
+		// collision rebuild is needed (the material already binds them).
 		for (Set<int64_t>::Element *E = touched.front(); E; E = E->next()) {
 			int cx = (int32_t)(E->get() >> 32);
 			int cz = (int32_t)(E->get() & 0xffffffff);
 			CellTerrain *cell = manager->get_cell(cx, cz);
-			if (cell) cell->update_splatmap_textures();
+			if (cell) {
+				if (mode == MODE_PAINT) cell->update_splatmap_textures();
+				else cell->update_color_texture();
+			}
 			manager->mark_dirty(cx, cz);
 		}
 	} else {
@@ -222,6 +258,10 @@ void TerrainBrush::end_stroke(UndoRedo *undo_redo) {
 void TerrainBrush::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("begin_stroke"), &TerrainBrush::begin_stroke);
 	ClassDB::bind_method(D_METHOD("apply_brush", "world_pos", "radius", "strength", "mode"), &TerrainBrush::apply_brush);
+	ClassDB::bind_method(D_METHOD("set_paint_min_angle", "v"), &TerrainBrush::set_paint_min_angle);
+	ClassDB::bind_method(D_METHOD("get_paint_min_angle"), &TerrainBrush::get_paint_min_angle);
+	ClassDB::bind_method(D_METHOD("set_paint_max_angle", "v"), &TerrainBrush::set_paint_max_angle);
+	ClassDB::bind_method(D_METHOD("get_paint_max_angle"), &TerrainBrush::get_paint_max_angle);
 	ClassDB::bind_method(D_METHOD("set_paint_layer", "l"), &TerrainBrush::set_paint_layer);
 	ClassDB::bind_method(D_METHOD("get_paint_layer"), &TerrainBrush::get_paint_layer);
 	ClassDB::bind_method(D_METHOD("set_falloff_type", "t"), &TerrainBrush::set_falloff_type);
@@ -242,6 +282,8 @@ void TerrainBrush::_bind_methods() {
 	BIND_ENUM_CONSTANT(MODE_NOISE);
 	BIND_ENUM_CONSTANT(MODE_ERODE);
 	BIND_ENUM_CONSTANT(MODE_NAV_MASK);
+	BIND_ENUM_CONSTANT(MODE_HOLE);
+	BIND_ENUM_CONSTANT(MODE_COLOR);
 	BIND_ENUM_CONSTANT(FALLOFF_SMOOTH);
 	BIND_ENUM_CONSTANT(FALLOFF_LINEAR);
 	BIND_ENUM_CONSTANT(FALLOFF_SPHERICAL);

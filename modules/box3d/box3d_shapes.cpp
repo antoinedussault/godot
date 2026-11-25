@@ -46,20 +46,46 @@ static b3HullData *b3_build_hull_within_limits(const Vector<b3Vec3> &p_points) {
 	return nullptr;
 }
 
+// Scale reaches this file baked into the local transform. A round shape cannot be
+// stretched, so it takes the largest axis.
+static real_t b3_radius_scale(const Basis &p_basis) {
+	return MAX(p_basis.get_axis(0).length(), MAX(p_basis.get_axis(1).length(), p_basis.get_axis(2).length()));
+}
+
+// Z-aligned, so only X and Y widen a capsule. Z already lengthens its axis.
+static real_t b3_capsule_radius_scale(const Basis &p_basis) {
+	return MAX(p_basis.get_axis(0).length(), p_basis.get_axis(1).length());
+}
+
 static b3ShapeId attach_sphere(b3BodyId p_body, const b3ShapeDef *p_def, const Variant &p_data, const Transform &p_local) {
 	b3Sphere sphere;
 	sphere.center = b3_from_godot(p_local.origin);
-	sphere.radius = (float)(real_t)p_data;
+	sphere.radius = (float)((real_t)p_data * b3_radius_scale(p_local.basis));
 	return b3CreateSphereShape(p_body, p_def, &sphere);
 }
 
-static b3ShapeId attach_box(b3BodyId p_body, const b3ShapeDef *p_def, const Variant &p_data, const Transform &p_local) {
+static b3ShapeId attach_box(b3BodyId p_body, const b3ShapeDef *p_def, const Variant &p_data, const Transform &p_local, const Box3DShape *p_shape) {
 	Vector3 extents = p_data;
+
+	const Vector3 x = p_local.basis.get_axis(0);
+	const Vector3 y = p_local.basis.get_axis(1);
+	const Vector3 z = p_local.basis.get_axis(2);
+	const bool sheared = Math::abs(x.dot(y)) > 0.001 * x.length() * y.length() ||
+			Math::abs(y.dot(z)) > 0.001 * y.length() * z.length() ||
+			Math::abs(z.dot(x)) > 0.001 * z.length() * x.length();
+	if (sheared) {
+		// A rotated box under a non-uniform scale is not a box any more.
+		b3HullData *hull = p_shape->create_hull(p_local);
+		ERR_FAIL_NULL_V(hull, b3_nullShapeId);
+		b3ShapeId id = b3CreateHullShape(p_body, p_def, hull);
+		b3DestroyHull(hull);
+		return id;
+	}
 
 	// b3MakeBoxHull returns a self-contained value; it must NOT be passed to
 	// b3DestroyHull. b3CreateTransformedHullShape clones it, so the stack copy
 	// can die at the end of this scope.
-	b3BoxHull box = b3MakeBoxHull((float)extents.x, (float)extents.y, (float)extents.z);
+	b3BoxHull box = b3MakeBoxHull((float)(extents.x * x.length()), (float)(extents.y * y.length()), (float)(extents.z * z.length()));
 
 	b3Transform xform;
 	xform.p = b3_from_godot(p_local.origin);
@@ -84,71 +110,118 @@ static b3ShapeId attach_capsule(b3BodyId p_body, const b3ShapeDef *p_def, const 
 	b3Capsule capsule;
 	capsule.center1 = b3_from_godot(c1);
 	capsule.center2 = b3_from_godot(c2);
-	capsule.radius = (float)radius;
+	capsule.radius = (float)(radius * b3_capsule_radius_scale(p_local.basis));
+	if ((c1 - c2).length() <= B3_MIN_CAPSULE_LENGTH) {
+		b3Sphere sphere;
+		sphere.center = b3_from_godot(p_local.origin);
+		sphere.radius = capsule.radius;
+		return b3CreateSphereShape(p_body, p_def, &sphere);
+	}
 	return b3CreateCapsuleShape(p_body, p_def, &capsule);
 }
 
-static b3ShapeId attach_cylinder(b3BodyId p_body, const b3ShapeDef *p_def, const Variant &p_data, const Transform &p_local) {
-	Dictionary d = p_data;
-	ERR_FAIL_COND_V(!d.has("radius"), b3_nullShapeId);
-	ERR_FAIL_COND_V(!d.has("height"), b3_nullShapeId);
+// Note this is a tessellated hull, not a true cylinder. Box3D has no cylinder
+// primitive, so a rolling cylinder will settle on a facet rather than roll forever.
+// That is a real behaviour difference from Bullet.
+#define B3_CYLINDER_SIDES 16
 
-	real_t radius = d["radius"];
-	real_t height = d["height"];
-
-	// Box3D ships b3CreateCylinder(height, radius, yOffset, sides), but the
-	// meaning of yOffset is undocumented and Godot's cylinder must end up
-	// centered on the origin. Generating the ring points directly removes the
-	// guess: 2 * SIDES points, Y-aligned, centered — exactly Godot's convention.
-	//
-	// Note this is a tessellated hull, not a true cylinder. Box3D has no
-	// cylinder primitive, so a rolling cylinder will settle on a facet rather
-	// than roll forever. That is a real behaviour difference from Bullet and
-	// belongs in the docs, not just here.
-	const int SIDES = 16;
+b3HullData *Box3DShape::create_hull(const Transform &p_xform) const {
 	Vector<b3Vec3> points;
-	points.resize(SIDES * 2);
-	b3Vec3 *pw = points.ptrw();
 
-	const real_t half_h = height * 0.5;
-	for (int i = 0; i < SIDES; i++) {
-		real_t a = (Math_TAU * (real_t)i) / (real_t)SIDES;
-		real_t x = Math::cos(a) * radius;
-		real_t z = Math::sin(a) * radius;
-		pw[i * 2 + 0] = b3_from_godot(p_local.xform(Vector3(x, half_h, z)));
-		pw[i * 2 + 1] = b3_from_godot(p_local.xform(Vector3(x, -half_h, z)));
+	switch (type) {
+		case PhysicsServer::SHAPE_BOX: {
+			const Vector3 e = data;
+			for (int i = 0; i < 8; i++) {
+				points.push_back(b3_from_godot(p_xform.xform(Vector3((i & 1) ? e.x : -e.x, (i & 2) ? e.y : -e.y, (i & 4) ? e.z : -e.z))));
+			}
+		} break;
+
+		case PhysicsServer::SHAPE_CYLINDER: {
+			Dictionary d = data;
+			ERR_FAIL_COND_V(!d.has("radius"), nullptr);
+			ERR_FAIL_COND_V(!d.has("height"), nullptr);
+			const real_t radius = d["radius"];
+			const real_t half_h = (real_t)d["height"] * 0.5;
+			// Y-aligned and centered, exactly Godot's convention.
+			for (int i = 0; i < B3_CYLINDER_SIDES; i++) {
+				const real_t a = (Math_TAU * (real_t)i) / (real_t)B3_CYLINDER_SIDES;
+				const real_t x = Math::cos(a) * radius;
+				const real_t z = Math::sin(a) * radius;
+				points.push_back(b3_from_godot(p_xform.xform(Vector3(x, half_h, z))));
+				points.push_back(b3_from_godot(p_xform.xform(Vector3(x, -half_h, z))));
+			}
+		} break;
+
+		case PhysicsServer::SHAPE_CONVEX_POLYGON: {
+			Vector<Vector3> godot_points = data;
+			if (godot_points.size() < 4) {
+				return nullptr;
+			}
+			points.resize(godot_points.size());
+			for (int i = 0; i < godot_points.size(); i++) {
+				points.write[i] = b3_from_godot(p_xform.xform(godot_points[i]));
+			}
+		} break;
+
+		default:
+			return nullptr;
 	}
 
-	b3HullData *hull = b3_build_hull_within_limits(points);
-	ERR_FAIL_NULL_V(hull, b3_nullShapeId);
+	return b3_build_hull_within_limits(points);
+}
+
+bool Box3DShape::get_ray(real_t &r_length, bool &r_slips_on_slope) const {
+	if (type != PhysicsServer::SHAPE_RAY) {
+		return false;
+	}
+	Dictionary d = data;
+	if (!d.has("length")) {
+		return false;
+	}
+	r_length = d["length"];
+	r_slips_on_slope = d.has("slips_on_slope") ? (bool)d["slips_on_slope"] : false;
+	return r_length > 0;
+}
+
+static b3ShapeId attach_hull(b3BodyId p_body, const b3ShapeDef *p_def, const Box3DShape *p_shape, const Transform &p_local) {
+	b3HullData *hull = p_shape->create_hull(p_local);
+	if (!hull) {
+		WARN_PRINT_ONCE("Box3D: a convex shape is degenerate or too complex to simplify into a hull; "
+						"that shape has no collision. Check its point count.");
+		return b3_nullShapeId;
+	}
 
 	b3ShapeId id = b3CreateHullShape(p_body, p_def, hull);
 	b3DestroyHull(hull); // Cloned by b3CreateHullShape.
 	return id;
 }
 
-static b3ShapeId attach_convex(b3BodyId p_body, const b3ShapeDef *p_def, const Variant &p_data, const Transform &p_local) {
-	Vector<Vector3> godot_points = p_data;
-	ERR_FAIL_COND_V_MSG(godot_points.size() < 4, b3_nullShapeId, "Box3D: a convex shape needs at least 4 points.");
+// Box3D has no infinite plane. This is a slab whose top face is the plane, large
+// enough that nothing is expected to walk off it.
+#define B3_PLANE_HALF_EXTENT 4000.0
+#define B3_PLANE_THICKNESS 200.0
 
-	Vector<b3Vec3> points;
-	points.resize(godot_points.size());
-	b3Vec3 *pw = points.ptrw();
-	for (int i = 0; i < godot_points.size(); i++) {
-		pw[i] = b3_from_godot(p_local.xform(godot_points[i]));
-	}
+static b3ShapeId attach_plane(b3BodyId p_body, const b3ShapeDef *p_def, const Variant &p_data, const Transform &p_local) {
+	const Plane plane = p_local.xform(Plane(p_data));
+	const Vector3 n = plane.normal.normalized();
+	ERR_FAIL_COND_V(n == Vector3(), b3_nullShapeId);
 
-	b3HullData *hull = b3_build_hull_within_limits(points);
-	if (!hull) {
-		WARN_PRINT_ONCE("Box3D: a ConvexPolygonShape was too complex to simplify into a hull; "
-						"that shape has no collision. Reduce its point count.");
-		return b3_nullShapeId;
-	}
+	const Vector3 side = Math::abs(n.y) < 0.9 ? Vector3(0, 1, 0) : Vector3(1, 0, 0);
+	const Vector3 x = side.cross(n).normalized();
+	Basis basis;
+	basis.set_axis(0, x);
+	basis.set_axis(1, n);
+	basis.set_axis(2, x.cross(n));
 
-	b3ShapeId id = b3CreateHullShape(p_body, p_def, hull);
-	b3DestroyHull(hull);
-	return id;
+	b3BoxHull box = b3MakeBoxHull(B3_PLANE_HALF_EXTENT, B3_PLANE_THICKNESS * 0.5, B3_PLANE_HALF_EXTENT);
+	b3Transform xform;
+	xform.p = b3_from_godot(n * (plane.d - B3_PLANE_THICKNESS * 0.5));
+	xform.q = b3_quat_from_godot(basis.get_rotation_quat());
+	b3Vec3 scale = { 1.0f, 1.0f, 1.0f };
+	return b3CreateTransformedHullShape(p_body, p_def, &box.base, xform, scale);
 }
+
+
 
 bool Box3DShape::get_heightmap_dimensions(int &r_width, int &r_depth) const {
 	if (type != PhysicsServer::SHAPE_HEIGHTMAP) {
@@ -320,13 +393,12 @@ b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Tra
 		case PhysicsServer::SHAPE_SPHERE:
 			return attach_sphere(p_body, p_def, data, p_local_xform);
 		case PhysicsServer::SHAPE_BOX:
-			return attach_box(p_body, p_def, data, p_local_xform);
+			return attach_box(p_body, p_def, data, p_local_xform, this);
 		case PhysicsServer::SHAPE_CAPSULE:
 			return attach_capsule(p_body, p_def, data, p_local_xform);
 		case PhysicsServer::SHAPE_CYLINDER:
-			return attach_cylinder(p_body, p_def, data, p_local_xform);
 		case PhysicsServer::SHAPE_CONVEX_POLYGON:
-			return attach_convex(p_body, p_def, data, p_local_xform);
+			return attach_hull(p_body, p_def, this, p_local_xform);
 
 		case PhysicsServer::SHAPE_CONCAVE_POLYGON:
 			// Box3D only generates mesh contacts against static bodies, which
@@ -341,11 +413,11 @@ b3ShapeId Box3DShape::attach(b3BodyId p_body, const b3ShapeDef *p_def, const Tra
 			return attach_heightmap(p_body, p_def, this, p_local_xform.basis.get_scale(), r_owner);
 
 		case PhysicsServer::SHAPE_PLANE:
-			WARN_PRINT_ONCE("Box3D: PlaneShape has no Box3D equivalent (use a large box for a floor).");
-			return b3_nullShapeId;
+			return attach_plane(p_body, p_def, data, p_local_xform);
 
 		case PhysicsServer::SHAPE_RAY:
-			WARN_PRINT_ONCE("Box3D: RayShape has no Box3D equivalent.");
+			// Never solver geometry: rays are cast each step (Box3DSpace::solve_rays)
+			// and in body_test_ray_separation().
 			return b3_nullShapeId;
 
 		default:
@@ -365,7 +437,7 @@ bool Box3DShape::build_proxy(Vector<b3Vec3> &r_points, const Transform &p_xform,
 	switch (type) {
 		case PhysicsServer::SHAPE_SPHERE: {
 			r_points.push_back(b3_from_godot(p_xform.origin));
-			r_proxy->radius = (float)(real_t)data;
+			r_proxy->radius = (float)((real_t)data * b3_radius_scale(p_xform.basis));
 		} break;
 
 		case PhysicsServer::SHAPE_BOX: {
@@ -388,7 +460,7 @@ bool Box3DShape::build_proxy(Vector<b3Vec3> &r_points, const Transform &p_xform,
 			// Z-aligned, matching CapsuleShapeSW.
 			r_points.push_back(b3_from_godot(p_xform.xform(Vector3(0, 0, height * 0.5))));
 			r_points.push_back(b3_from_godot(p_xform.xform(Vector3(0, 0, -height * 0.5))));
-			r_proxy->radius = (float)radius;
+			r_proxy->radius = (float)(radius * b3_capsule_radius_scale(p_xform.basis));
 		} break;
 
 		case PhysicsServer::SHAPE_CYLINDER: {
@@ -410,6 +482,20 @@ bool Box3DShape::build_proxy(Vector<b3Vec3> &r_points, const Transform &p_xform,
 		case PhysicsServer::SHAPE_CONVEX_POLYGON: {
 			Vector<Vector3> pts = data;
 			ERR_FAIL_COND_V(pts.size() < 4, false);
+			if (pts.size() > B3_MAX_SHAPE_CAST_POINTS) {
+				// Over budget for a proxy. Simplify the way attaching it would.
+				b3HullData *hull = create_hull(p_xform);
+				if (!hull) {
+					return false;
+				}
+				const b3Vec3 *hp = b3GetHullPoints(hull);
+				for (int i = 0; i < hull->vertexCount; i++) {
+					r_points.push_back(hp[i]);
+				}
+				b3DestroyHull(hull);
+				r_proxy->radius = 0.0f;
+				break;
+			}
 			for (int i = 0; i < pts.size(); i++) {
 				r_points.push_back(b3_from_godot(p_xform.xform(pts[i])));
 			}

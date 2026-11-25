@@ -254,6 +254,7 @@ public:
 	FUNC2(light_set_shadow, RID, bool)
 	FUNC2(light_set_shadow_color, RID, const Color &)
 	FUNC2(light_set_projector, RID, RID)
+	FUNC9(light_set_lens_streak, RID, bool, const Color &, float, float, float, float, float, float)
 	FUNC2(light_set_negative, RID, bool)
 	FUNC2(light_set_cull_mask, RID, uint32_t)
 	FUNC2(light_set_reverse_cull_face_mode, RID, bool)
@@ -467,6 +468,10 @@ public:
 	FUNC7(environment_set_fog_depth, RID, bool, float, float, float, bool, float)
 	FUNC5(environment_set_fog_height, RID, bool, float, float, float)
 	FUNC13(environment_set_volumetric_fog, RID, bool, float, float, float, const Color &, const Color &, float, float, float, float, int, float)
+	FUNC2(environment_set_volumetric_fog_height_relative, RID, bool)
+	FUNC12(environment_set_dynamic_gi, RID, bool, int, float, float, float, float, float, int, bool, uint32_t, EnvironmentDynamicGIDebug)
+	FUNC9(environment_set_ssgi, RID, bool, float, float, int, int, float, float, bool)
+	FUNC13(environment_set_exp_height_fog, RID, bool, float, float, float, bool, float, float, const Color &, bool, const Color &, const Vector3 &, float)
 
 	/* INTERPOLATION API */
 

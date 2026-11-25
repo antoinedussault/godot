@@ -9,11 +9,8 @@
 
 // PhysicsServer backend built on Box3D (https://github.com/erincatto/box3d).
 //
-// STATUS: partial. Rigid bodies simulate — world, body lifetime, sphere/box/
-// capsule/cylinder/convex shapes, mass, impulses and transform writeback are
-// live. Scene queries, KinematicBody motion, areas, joints, contact reporting
-// and trimesh/heightmap shapes are not wired up yet. See README.md for the
-// subsystem checklist and the order to fill them in.
+// Everything but soft bodies is implemented; see README.md for how, and for the
+// places where Box3D itself behaves differently from the other backends.
 //
 // It registers alongside "Bullet" and "GodotPhysics" through PhysicsServerManager
 // and is NOT the default, so enabling this module cannot change how an existing
@@ -35,8 +32,7 @@ class Box3DPhysicsServer : public PhysicsServer {
 	mutable RID_Owner<Box3DBody> body_owner;
 	mutable RID_Owner<Box3DJoint> joint_owner;
 
-	// True only between step() and the end of flush_queries(), which is when
-	// body_get_direct_state() is legal.
+	// True only during flush_queries().
 	bool doing_sync = false;
 
 protected:
@@ -54,6 +50,7 @@ public:
 	Box3DBody *get_body(RID p_rid) const { return body_owner.getornull(p_rid); }
 	Box3DArea *get_area(RID p_rid) const { return area_owner.getornull(p_rid); }
 	Box3DShape *get_shape(RID p_rid) const { return shape_owner.getornull(p_rid); }
+	bool owns_area(RID p_rid) const { return area_owner.owns(p_rid); }
 
 	// Resolves an RID that may be either a body or an area, the way most of the
 	// CollisionObject-shaped APIs need.
@@ -71,6 +68,13 @@ private:
 	// Recomputes offset/transform/mass after shape edits. No geometry rebuilt.
 	void _body_finish_shape_edit(Box3DBody *p_body);
 	void _body_apply_mass(Box3DBody *p_body);
+	void _body_apply_locks(Box3DBody *p_body);
+	// Friction, bounce and conveyor velocity.
+	b3SurfaceMaterial _body_make_material(const Box3DBody *p_body) const;
+	void _body_update_material(Box3DBody *p_body);
+	// Makes the solver re-evaluate who this body collides with.
+	void _body_refilter(Box3DBody *p_body);
+	void _release_shape(RID p_owner, RID p_shape);
 
 	// Pushes the body's collision layer/mask onto its live b3 shapes. Godot sets
 	// these independently of the shape list, and often after the shapes exist.
@@ -88,7 +92,20 @@ private:
 	void _area_enter_world(Box3DArea *p_area, Box3DSpace *p_space);
 	void _area_exit_world(Box3DArea *p_area);
 	void _area_rebuild_shapes(Box3DArea *p_area);
+	void _area_rebuild_shape_at(Box3DArea *p_area, int p_index);
+	void _area_drop_shape(Box3DArea *p_area, int p_index);
 	void _area_sync_transform(Box3DArea *p_area);
+
+	// Joints, see box3d_joints.cpp.
+	RID _joint_make(JointType p_type, RID p_body_a, const Transform &p_frame_a, RID p_body_b, const Transform &p_frame_b);
+	void _joint_create(Box3DJoint *p_joint);
+	void _joint_destroy(Box3DJoint *p_joint);
+	void _joint_update(Box3DJoint *p_joint);
+	void _joint_free(Box3DJoint *p_joint);
+	b3GenericAxis _joint_generic_axis(const Box3DJoint *p_joint, int p_row) const;
+	void _body_destroy_joints(Box3DBody *p_body);
+	void _body_create_joints(Box3DBody *p_body);
+	void _body_break_joints(Box3DBody *p_body);
 
 public:
 

@@ -304,6 +304,28 @@ typedef struct b3WheelJoint
 	bool enableSteeringMotor;
 } b3WheelJoint;
 
+// Tuna addition, see generic_joint.c
+typedef struct b3GenericRow
+{
+	b3GenericAxis axis;
+	float lowerImpulse;
+	float upperImpulse;
+	float motorImpulse;
+	float springImpulse;
+} b3GenericRow;
+
+typedef struct b3GenericJoint
+{
+	// Three linear rows, then three angular rows.
+	b3GenericRow rows[6];
+
+	int indexA;
+	int indexB;
+	b3Transform frameA;
+	b3Transform frameB;
+	b3Vec3 deltaCenter;
+} b3GenericJoint;
+
 /// The base joint class. Joints are used to constraint two bodies together in
 /// various fashions. Some joints also feature limits and motors.
 typedef struct b3JointSim
@@ -342,6 +364,7 @@ typedef struct b3JointSim
 		b3PrismaticJoint prismaticJoint;
 		b3WeldJoint weldJoint;
 		b3WheelJoint wheelJoint;
+		b3GenericJoint genericJoint; // Tuna addition
 	};
 } b3JointSim;
 
@@ -405,6 +428,13 @@ void b3SolveRevoluteJoint( b3JointSim* base, b3StepContext* context, bool useBia
 void b3SolveSphericalJoint( b3JointSim* base, b3StepContext* context, bool useBias );
 void b3SolveWeldJoint( b3JointSim* base, b3StepContext* context, bool useBias );
 void b3SolveWheelJoint( b3JointSim* base, b3StepContext* context, bool useBias );
+
+// Tuna addition, see generic_joint.c
+b3Vec3 b3GetGenericJointForce( b3World* world, b3JointSim* base );
+b3Vec3 b3GetGenericJointTorque( b3World* world, b3JointSim* base );
+void b3PrepareGenericJoint( b3JointSim* base, b3StepContext* context );
+void b3WarmStartGenericJoint( b3JointSim* base, b3StepContext* context );
+void b3SolveGenericJoint( b3JointSim* base, b3StepContext* context, bool useBias );
 
 void b3DrawDistanceJoint( b3DebugDraw* draw, b3JointSim* base, b3WorldTransform transformA, b3WorldTransform transformB );
 void b3DrawParallelJoint( b3DebugDraw* draw, b3JointSim* base, b3WorldTransform transformA, b3WorldTransform transformB, float scale );

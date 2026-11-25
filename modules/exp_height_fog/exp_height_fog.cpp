@@ -16,6 +16,7 @@ static const char *FOG_SHADER_CODE =
 		"uniform float density = 0.04;\n"
 		"uniform float falloff = 0.15;\n"
 		"uniform float ref_height = 0.0;\n"
+		"uniform bool ref_relative = false;\n"
 		"uniform float start_distance = 0.0;\n"
 		"uniform float max_opacity = 1.0;\n"
 		"uniform vec4 inscatter : hint_color = vec4(0.55, 0.62, 0.72, 1.0);\n"
@@ -53,7 +54,11 @@ static const char *FOG_SHADER_CODE =
 		"        if (effective_len > 0.0) {\n"
 		"            float fo = max(falloff, 0.0001);\n"
 		"            float dz = ray.y; // Godot is Y-up.\n"
-		"            float d_cam = density * exp(-fo * (cam_world.y - ref_height));\n"
+		"            // ref_relative: ref_height is an offset from the camera, so the\n"
+		"            // fog 'sea level' tracks the camera and density stays constant\n"
+		"            // at eye level regardless of altitude.\n"
+		"            float eff_ref = ref_relative ? (cam_world.y + ref_height) : ref_height;\n"
+		"            float d_cam = density * exp(-fo * (cam_world.y - eff_ref));\n"
 		"            float fd = fo * dz;\n"
 		"            float integral;\n"
 		"            if (abs(fd) > 0.0001) {\n"
@@ -122,6 +127,7 @@ void ExpHeightFog::_update_material_params() {
 	material->set_shader_param("density", density);
 	material->set_shader_param("falloff", falloff);
 	material->set_shader_param("ref_height", ref_height);
+	material->set_shader_param("ref_relative", ref_height_relative);
 	material->set_shader_param("start_distance", start_distance);
 	material->set_shader_param("max_opacity", max_opacity);
 	material->set_shader_param("inscatter", inscatter.to_linear());
@@ -179,6 +185,12 @@ void ExpHeightFog::set_ref_height(float p_v) {
 }
 float ExpHeightFog::get_ref_height() const { return ref_height; }
 
+void ExpHeightFog::set_ref_height_relative(bool p_enabled) {
+	ref_height_relative = p_enabled;
+	_update_material_params();
+}
+bool ExpHeightFog::is_ref_height_relative() const { return ref_height_relative; }
+
 void ExpHeightFog::set_start_distance(float p_v) {
 	start_distance = p_v;
 	_update_material_params();
@@ -230,6 +242,8 @@ void ExpHeightFog::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_falloff"), &ExpHeightFog::get_falloff);
 	ClassDB::bind_method(D_METHOD("set_ref_height", "ref_height"), &ExpHeightFog::set_ref_height);
 	ClassDB::bind_method(D_METHOD("get_ref_height"), &ExpHeightFog::get_ref_height);
+	ClassDB::bind_method(D_METHOD("set_ref_height_relative", "enabled"), &ExpHeightFog::set_ref_height_relative);
+	ClassDB::bind_method(D_METHOD("is_ref_height_relative"), &ExpHeightFog::is_ref_height_relative);
 	ClassDB::bind_method(D_METHOD("set_start_distance", "start"), &ExpHeightFog::set_start_distance);
 	ClassDB::bind_method(D_METHOD("get_start_distance"), &ExpHeightFog::get_start_distance);
 	ClassDB::bind_method(D_METHOD("set_max_opacity", "max_opacity"), &ExpHeightFog::set_max_opacity);
@@ -251,6 +265,7 @@ void ExpHeightFog::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "density", PROPERTY_HINT_RANGE, "0,1,0.0001"), "set_density", "get_density");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "falloff", PROPERTY_HINT_RANGE, "0,2,0.001"), "set_falloff", "get_falloff");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "ref_height"), "set_ref_height", "get_ref_height");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ref_height_relative"), "set_ref_height_relative", "is_ref_height_relative");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "start_distance", PROPERTY_HINT_RANGE, "0,10000,0.1"), "set_start_distance", "get_start_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::REAL, "max_opacity", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_max_opacity", "get_max_opacity");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "inscatter"), "set_inscatter", "get_inscatter");

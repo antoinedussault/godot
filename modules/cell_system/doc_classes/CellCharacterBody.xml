@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="CellCharacterBody" inherits="CellPlayerBody" version="3.5">
+	<brief_description>
+		A [CellPlayerBody] that handles its own acceleration, gravity and view.
+	</brief_description>
+	<description>
+		A [KinematicBody] (through [CellPlayerBody], so it also waits for streamed ground and can shove a [CellItemBody]) that moves itself every physics frame: the horizontal velocity eases toward [member move_input], gravity pulls it down while it is off the floor, and [member view_input] turns [member yaw_node] and [member pitch_node].
+		It never reads the keyboard or the mouse. Game code sets [member move_input], feeds mouse motion to [member view_input] or [method add_view_input], calls [method jump], and changes [member max_speed] for walk / run / sprint.
+		The step runs after the script's own [code]_physics_process[/code], so what a script sets in a tick is what the body moves with in that tick. To run the step at another point, turn [member movement_enabled] and [member view_enabled] off and call [method process_movement] and [method process_view] yourself.
+		[codeblock]
+		extends CellCharacterBody
+
+		func _unhandled_input(event):
+		    if event is InputEventMouseMotion:
+		        add_view_input(-event.relative)
+		    if event.is_action_pressed("jump"):
+		        jump()
+
+		func _physics_process(_delta):
+		    move_input = Input.get_vector("strafe_left", "strafe_right", "move_forward", "move_backward")
+		    max_speed = 7.2 if Input.is_action_pressed("sprint") else 4.26
+		[/codeblock]
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="add_view_input">
+			<return type="void" />
+			<argument index="0" name="input" type="Vector2" />
+			<description>
+				Adds to the pending [member view_input] instead of replacing it. Use this from an input callback: several mouse events can arrive inside one physics frame.
+			</description>
+		</method>
+		<method name="get_horizontal_velocity" qualifiers="const">
+			<return type="Vector2" />
+			<description>
+				The X and Z of [member velocity].
+			</description>
+		</method>
+		<method name="get_move_direction">
+			<return type="Vector3" />
+			<description>
+				The world-space direction [member move_input] points at, on the horizontal plane and relative to where [member yaw_node] faces. Unit length, or zero when there is no input.
+			</description>
+		</method>
+		<method name="get_view_pitch">
+			<return type="float" />
+			<description>
+				The pitch of [member pitch_node], in degrees.
+			</description>
+		</method>
+		<method name="get_view_yaw">
+			<return type="float" />
+			<description>
+				The yaw of [member yaw_node], in degrees.
+			</description>
+		</method>
+		<method name="jump">
+			<return type="void" />
+			<description>
+				Jumps with [member jump_speed] on the next movement step, if the body is on the floor by then. A jump asked for in mid-air is dropped. Emits [signal jumped] when it happens.
+			</description>
+		</method>
+		<method name="process_movement">
+			<return type="void" />
+			<argument index="0" name="delta" type="float" />
+			<description>
+				Runs one movement step: acceleration, gravity, jump, then [method KinematicBody.move_and_slide_with_snap]. Called automatically while [member movement_enabled] is on.
+			</description>
+		</method>
+		<method name="process_view">
+			<return type="void" />
+			<argument index="0" name="delta" type="float" />
+			<description>
+				Runs one view step: consumes [member view_input], smooths it and turns the view. Called automatically while [member view_enabled] is on.
+			</description>
+		</method>
+		<method name="rotate_view">
+			<return type="void" />
+			<argument index="0" name="degrees" type="Vector2" />
+			<description>
+				Turns the view by [code]degrees.x[/code] of yaw and [code]degrees.y[/code] of pitch. The pitch is clamped to [member view_pitch_min] / [member view_pitch_max].
+			</description>
+		</method>
+		<method name="set_view_pitch">
+			<return type="void" />
+			<argument index="0" name="degrees" type="float" />
+			<description>
+				Sets the pitch of [member pitch_node], clamped.
+			</description>
+		</method>
+		<method name="set_view_yaw">
+			<return type="void" />
+			<argument index="0" name="degrees" type="float" />
+			<description>
+				Sets the yaw of [member yaw_node].
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="acceleration" type="float" setter="set_acceleration" getter="get_acceleration" default="9.0">
+			How fast the horizontal velocity eases toward the input direction. It is the rate of [code]lerp(velocity, target, acceleration * delta)[/code].
+		</member>
+		<member name="air_control" type="float" setter="set_air_control" getter="get_air_control" default="1.0">
+			Multiplier on [member acceleration] and [member deceleration] while off the floor. [code]0[/code] keeps the take-off velocity untouched.
+		</member>
+		<member name="deceleration" type="float" setter="set_deceleration" getter="get_deceleration" default="12.0">
+			Same as [member acceleration], used when there is no input.
+		</member>
+		<member name="floor_max_angle" type="float" setter="set_floor_max_angle" getter="get_floor_max_angle" default="55.0">
+			Steepest slope, in degrees, that counts as a floor. The body cannot walk up anything steeper.
+		</member>
+		<member name="gravity" type="float" setter="set_gravity" getter="get_gravity" default="9.8">
+			Downward acceleration applied while the body is not on the floor.
+		</member>
+		<member name="infinite_inertia" type="bool" setter="set_infinite_inertia" getter="is_infinite_inertia_enabled" default="false">
+			Passed to [method KinematicBody.move_and_slide_with_snap]. Off, so a [RigidBody] in the way pushes back instead of being bulldozed.
+		</member>
+		<member name="jump_speed" type="float" setter="set_jump_speed" getter="get_jump_speed" default="2.1">
+			Upward velocity given by [method jump].
+		</member>
+		<member name="max_fall_speed" type="float" setter="set_max_fall_speed" getter="get_max_fall_speed" default="0.0">
+			Terminal velocity. [code]0[/code] means no limit.
+		</member>
+		<member name="max_slides" type="int" setter="set_max_slides" getter="get_max_slides" default="4">
+			Passed to [method KinematicBody.move_and_slide_with_snap].
+		</member>
+		<member name="max_speed" type="float" setter="set_max_speed" getter="get_max_speed" default="4.26">
+			Horizontal speed reached at full [member move_input]. Change it at runtime for walk, run and sprint.
+		</member>
+		<member name="move_input" type="Vector2" setter="set_move_input" getter="get_move_input">
+			The wanted movement: [code]x[/code] is strafe (right positive), [code]y[/code] is forward / back (forward negative). A length under 1 scales the speed. Runtime only, not saved.
+		</member>
+		<member name="movement_enabled" type="bool" setter="set_movement_enabled" getter="is_movement_enabled" default="true">
+			Whether the movement step runs by itself. Turning it off also clears [member velocity].
+		</member>
+		<member name="pitch_node" type="NodePath" setter="set_pitch_node_path" getter="get_pitch_node_path" default="NodePath(&quot;&quot;)">
+			The [Spatial] that looks up and down, usually a child of [member yaw_node] holding the camera. Empty disables pitch.
+		</member>
+		<member name="snap_length" type="float" setter="set_snap_length" getter="get_snap_length" default="0.8">
+			How far down the body is held to the floor on slopes and steps. Released while jumping or moving upward.
+		</member>
+		<member name="stop_on_slope" type="bool" setter="set_stop_on_slope" getter="is_stop_on_slope_enabled" default="true">
+			Passed to [method KinematicBody.move_and_slide_with_snap].
+		</member>
+		<member name="stop_speed" type="float" setter="set_stop_speed" getter="get_stop_speed" default="0.02">
+			With no input, a horizontal speed below this is set to zero.
+		</member>
+		<member name="velocity" type="Vector3" setter="set_velocity" getter="get_velocity">
+			The current velocity. Set it to launch or stop the body. Runtime only, not saved.
+		</member>
+		<member name="view_enabled" type="bool" setter="set_view_enabled" getter="is_view_enabled" default="true">
+			Whether the view step runs by itself. Turning it off discards pending [member view_input].
+		</member>
+		<member name="view_input" type="Vector2" setter="set_view_input" getter="get_view_input">
+			Pending view motion ([code]x[/code] yaw, [code]y[/code] pitch), consumed by the next view step. Setting it replaces what is pending; see [method add_view_input]. Runtime only, not saved.
+		</member>
+		<member name="view_pitch_max" type="float" setter="set_view_pitch_max" getter="get_view_pitch_max" default="89.0">
+			Highest pitch, in degrees.
+		</member>
+		<member name="view_pitch_min" type="float" setter="set_view_pitch_min" getter="get_view_pitch_min" default="-82.0">
+			Lowest pitch, in degrees.
+		</member>
+		<member name="view_sensitivity" type="float" setter="set_view_sensitivity" getter="get_view_sensitivity" default="0.05">
+			Degrees turned per unit of [member view_input].
+		</member>
+		<member name="view_smoothing" type="float" setter="set_view_smoothing" getter="get_view_smoothing" default="22.0">
+			Rate the view eases toward its input, like [member acceleration]. [code]0[/code] applies the input raw.
+		</member>
+		<member name="yaw_node" type="NodePath" setter="set_yaw_node_path" getter="get_yaw_node_path" default="NodePath(&quot;&quot;)">
+			The [Spatial] that turns left and right, and that movement is relative to. Empty turns the body itself.
+		</member>
+	</members>
+	<constants>
+	</constants>
+	<signals>
+		<signal name="jumped">
+			<description>
+				Emitted when a [method jump] actually leaves the floor.
+			</description>
+		</signal>
+	</signals>
+</class>

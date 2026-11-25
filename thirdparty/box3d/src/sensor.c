@@ -107,8 +107,10 @@ static bool b3SensorQueryCallback( int proxyId, uint64_t userData, void* context
 	b3World* world = queryContext->world;
 	b3Shape* otherShape = b3Array_Get( world->shapes, shapeId );
 
-	// Visitors must be convex.
-	if ( b3IsConvex( otherShape->type ) == false )
+	// Tuna change: upstream only accepts convex visitors. Overlap is symmetric and only one
+	// side has to be convex, so a convex sensor can detect a mesh or height field.
+	bool swap = b3IsConvex( otherShape->type ) == false;
+	if ( swap && ( b3IsConvex( sensorShape->type ) == false || otherShape->type == b3_compoundShape ) )
 	{
 		return true;
 	}
@@ -149,7 +151,8 @@ static bool b3SensorQueryCallback( int proxyId, uint64_t userData, void* context
 
 	b3Transform otherTransform = b3ToRelativeTransform( b3GetBodyTransform( world, otherShape->bodyId ), b3Pos_zero );
 
-	bool overlap = b3OverlapSensor( sensorShape, queryContext->transform, otherShape, otherTransform );
+	bool overlap = swap ? b3OverlapSensor( otherShape, otherTransform, sensorShape, queryContext->transform )
+						: b3OverlapSensor( sensorShape, queryContext->transform, otherShape, otherTransform );
 	if ( overlap == false )
 	{
 		return true;

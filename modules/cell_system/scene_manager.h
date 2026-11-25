@@ -9,6 +9,7 @@
 
 class Node;
 class SceneTransition;
+class GameWorld;
 
 // Engine singleton (`SceneManager` in GDScript) that owns runtime scene travel,
 // Creation-Kit style: one PackedScene is current at a time; travelling to
@@ -87,6 +88,26 @@ public:
 	bool can_travel_back() const { return !history.empty(); }
 	bool is_travelling() const { return travelling; }
 	float get_progress() const { return progress; }
+
+	// Convenience passthroughs to the current scene's GameWorld root (null if
+	// the current scene isn't GameWorld-rooted) — the usual way script code
+	// reaches the location registry without holding a GameWorld reference.
+	GameWorld *get_world_game() const;
+
+	// Per-scene persistent state, keyed by scene path. A GameWorld drops its
+	// state here when it leaves the tree and picks it back up when it returns,
+	// which is what makes "the crate I pushed is still where I left it" hold
+	// across a trip through a door. get_world_states() / set_world_states() are
+	// the whole thing as plain data, for a save game.
+	Dictionary world_states;
+	void store_world_state(const String &p_key, const Dictionary &p_state);
+	bool has_world_state(const String &p_key) const;
+	Dictionary get_world_state(const String &p_key) const;
+	Dictionary get_world_states() const;
+	void set_world_states(const Dictionary &p_states);
+	void clear_world_states();
+	Node *get_location_by_id(const String &p_id) const;
+	Array get_locations() const;
 
 	SceneManager();
 	~SceneManager();

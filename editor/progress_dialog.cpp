@@ -32,6 +32,7 @@
 
 #include "core/message_queue.h"
 #include "core/os/os.h"
+#include "editor_loading_screen.h"
 #include "editor_scale.h"
 #include "main/main.h"
 
@@ -140,6 +141,13 @@ void ProgressDialog::_notification(int p_what) {
 }
 
 void ProgressDialog::_popup() {
+	// The startup loading screen shows the task itself; only cancellable ones,
+	// which need their button, still get the dialog on top of it.
+	EditorLoadingScreen *loading = EditorLoadingScreen::get_singleton();
+	if (loading && loading->is_covering() && !cancel_hb->is_visible()) {
+		return;
+	}
+
 	Size2 ms = main->get_combined_minimum_size();
 	ms.width = MAX(500 * EDSCALE, ms.width);
 
@@ -176,6 +184,9 @@ void ProgressDialog::add_task(const String &p_task, const String &p_label, int p
 	main->add_child(t.vb);
 
 	tasks[p_task] = t;
+	if (EditorLoadingScreen::get_singleton()) {
+		EditorLoadingScreen::get_singleton()->task_begin(p_label, p_steps);
+	}
 	if (p_can_cancel) {
 		cancel_hb->show();
 	} else {
@@ -207,6 +218,9 @@ bool ProgressDialog::task_step(const String &p_task, const String &p_state, int 
 	}
 
 	t.state->set_text(p_state);
+	if (EditorLoadingScreen::get_singleton()) {
+		EditorLoadingScreen::get_singleton()->task_update(p_state, p_step);
+	}
 	t.last_progress_tick = OS::get_singleton()->get_ticks_usec();
 	if (cancel_hb->is_visible()) {
 		OS::get_singleton()->force_process_input();
@@ -224,6 +238,9 @@ void ProgressDialog::end_task(const String &p_task) {
 	tasks.erase(p_task);
 
 	if (tasks.empty()) {
+		if (EditorLoadingScreen::get_singleton()) {
+			EditorLoadingScreen::get_singleton()->task_end();
+		}
 		hide();
 	} else {
 		_popup();

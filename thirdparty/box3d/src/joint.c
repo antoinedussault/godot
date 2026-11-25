@@ -62,6 +62,14 @@ b3MotorJointDef b3DefaultMotorJointDef( void )
 	return def;
 }
 
+// Tuna addition
+b3GenericJointDef b3DefaultGenericJointDef( void )
+{
+	b3GenericJointDef def = { 0 };
+	def.base = b3DefaultJointDef();
+	return def;
+}
+
 b3FilterJointDef b3DefaultFilterJointDef( void )
 {
 	b3FilterJointDef def = { 0 };
@@ -499,6 +507,27 @@ b3JointId b3CreateMotorJoint( b3WorldId worldId, const b3MotorJointDef* def )
 	b3JointId jointId = { joint->jointId + 1, world->worldId, pair.joint->generation };
 	B3_REC_CREATE( world, CreateMotorJoint, jointId, worldId, *def );
 	return jointId;
+}
+
+// Tuna addition, see generic_joint.c
+b3JointId b3CreateGenericJoint( b3WorldId worldId, const b3GenericJointDef* def )
+{
+	B3_CHECK_JOINT_DEF( def );
+	b3World* world = b3GetUnlockedWorldFromId( worldId );
+	if ( world == NULL )
+	{
+		return (b3JointId){ 0 };
+	}
+
+	b3JointPair pair = b3CreateJoint( world, &def->base, b3_genericJoint );
+	b3JointSim* joint = pair.jointSim;
+	joint->genericJoint = (b3GenericJoint){ 0 };
+	for ( int i = 0; i < 6; ++i )
+	{
+		joint->genericJoint.rows[i].axis = def->axes[i];
+	}
+
+	return (b3JointId){ joint->jointId + 1, world->worldId, pair.joint->generation };
 }
 
 b3JointId b3CreateFilterJoint( b3WorldId worldId, const b3FilterJointDef* def )
@@ -1033,6 +1062,20 @@ void b3GetJointReaction( b3World* world, b3JointSim* sim, float invTimeStep, flo
 		}
 		break;
 
+		case b3_genericJoint:
+		{
+			float sums[2] = { 0.0f, 0.0f };
+			for ( int i = 0; i < 6; ++i )
+			{
+				b3GenericRow* row = sim->genericJoint.rows + i;
+				float p = row->lowerImpulse - row->upperImpulse + row->motorImpulse + row->springImpulse;
+				sums[i / 3] += p * p;
+			}
+			linearImpulse = sqrtf( sums[0] );
+			angularImpulse = sqrtf( sums[1] );
+		}
+		break;
+
 		case b3_motorJoint:
 		{
 			b3MotorJoint* joint = &sim->motorJoint;
@@ -1133,6 +1176,9 @@ static b3Vec3 b3GetJointConstraintForce( b3World* world, b3Joint* joint )
 		case b3_filterJoint:
 			return b3Vec3_zero;
 
+		case b3_genericJoint:
+			return b3GetGenericJointForce( world, base );
+
 		case b3_motorJoint:
 			return b3GetMotorJointForce( world, base );
 
@@ -1171,6 +1217,9 @@ static b3Vec3 b3GetJointConstraintTorque( b3World* world, b3Joint* joint )
 
 		case b3_filterJoint:
 			return b3Vec3_zero;
+
+		case b3_genericJoint:
+			return b3GetGenericJointTorque( world, base );
 
 		case b3_motorJoint:
 			return b3GetMotorJointTorque( world, base );
@@ -1254,6 +1303,9 @@ float b3Joint_GetLinearSeparation( b3JointId jointId )
 
 			return b3AbsFloat( length - distanceJoint->length );
 		}
+
+		case b3_genericJoint:
+			return 0.0f;
 
 		case b3_motorJoint:
 			return 0.0f;
@@ -1355,6 +1407,9 @@ float b3Joint_GetAngularSeparation( b3JointId jointId )
 		}
 
 		case b3_distanceJoint:
+			return 0.0f;
+
+		case b3_genericJoint:
 			return 0.0f;
 
 		case b3_motorJoint:
@@ -1488,6 +1543,10 @@ void b3PrepareJoint( b3JointSim* joint, b3StepContext* context )
 		case b3_filterJoint:
 			break;
 
+		case b3_genericJoint:
+			b3PrepareGenericJoint( joint, context );
+			break;
+
 		case b3_motorJoint:
 			b3PrepareMotorJoint( joint, context );
 			break;
@@ -1530,6 +1589,10 @@ void b3WarmStartJoint( b3JointSim* joint, b3StepContext* context )
 			break;
 
 		case b3_filterJoint:
+			break;
+
+		case b3_genericJoint:
+			b3WarmStartGenericJoint( joint, context );
 			break;
 
 		case b3_motorJoint:
@@ -1576,6 +1639,10 @@ void b3SolveJoint( b3JointSim* joint, b3StepContext* context, bool useBias )
 			break;
 
 		case b3_filterJoint:
+			break;
+
+		case b3_genericJoint:
+			b3SolveGenericJoint( joint, context, useBias );
 			break;
 
 		case b3_motorJoint:
@@ -1692,6 +1759,7 @@ void b3DrawJoint( b3DebugDraw* draw, b3World* world, b3Joint* joint )
 			draw->DrawSegmentFcn( pA, pB, b3_colorGold, draw->context );
 			break;
 
+		case b3_genericJoint:
 		case b3_motorJoint:
 			draw->DrawSegmentFcn( pA, pB, b3_colorPlum, draw->context );
 			draw->DrawPointFcn( pA, 8.0f, b3_colorYellowGreen, draw->context );

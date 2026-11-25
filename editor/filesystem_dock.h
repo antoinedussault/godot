@@ -142,6 +142,7 @@ private:
 
 	PopupMenu *file_list_popup;
 	PopupMenu *tree_popup;
+	PopupMenu *folder_colors_menu;
 
 	DependencyEditor *deps_editor;
 	DependencyEditorOwners *owners_editor;
@@ -161,6 +162,14 @@ private:
 	CreateDialog *new_resource_dialog;
 
 	bool always_show_folders;
+
+	// Per-folder colors. The assignment (folder path -> palette color name) is stored
+	// in project.godot under "file_customization/folder_colors"; the palette itself is
+	// built in code, so the same project reads back the same colors in any editor build.
+	Dictionary assigned_folder_colors;
+	Vector<String> folder_color_names;
+	Map<String, Color> folder_color_palette;
+	Vector<String> folder_color_pending_paths;
 
 	class FileOrFolder {
 	public:
@@ -192,6 +201,18 @@ private:
 	Tree *tree;
 	ItemList *files;
 	bool import_dock_needs_update;
+
+	// Theme lookups walk the whole theme chain (own theme, every parent's, then
+	// the defaults). _create_tree() recurses over every directory in the project
+	// and every file in it, so these were being re-resolved thousands of times
+	// per rebuild -- and a rebuild happens on every filesystem_changed. Resolved
+	// once per rebuild in _update_tree() instead.
+	Map<StringName, Ref<Texture>> tree_item_icon_cache;
+	Ref<Texture> tree_import_fail_icon;
+	Ref<Texture> tree_folder_icon;
+	Color tree_folder_color;
+	String tree_main_scene;
+	void _refresh_tree_build_cache();
 
 	Ref<Texture> _get_tree_item_icon(bool p_is_valid, String p_file_type);
 	bool _create_tree(TreeItem *p_parent, EditorFileSystemDirectory *p_dir, Vector<String> &uncollapsed_paths, bool p_select_in_favorites, bool p_unfold_path = false);
@@ -256,6 +277,15 @@ private:
 
 	MenuButton *_create_file_menu_button();
 	void _file_sort_popup(int p_id);
+
+	void _build_folder_color_palette();
+	void _load_assigned_folder_colors();
+	void _save_assigned_folder_colors();
+	void _update_folder_colors_menu();
+	void _update_folder_colors_after_move(const Map<String, String> &p_folders_renames);
+	Ref<Texture> _make_folder_color_swatch(const Color &p_color) const;
+	bool _get_folder_color(const String &p_path, Color &r_color) const;
+	void _folder_color_index_pressed(int p_id);
 
 	void _file_and_folders_fill_popup(PopupMenu *p_popup, Vector<String> p_paths, bool p_display_path_dependent_options = true);
 	void _tree_rmb_select(const Vector2 &p_pos);

@@ -41,6 +41,7 @@
 #include "editor/editor_run_script.h"
 #include "editor/editor_scale.h"
 #include "editor/editor_settings.h"
+#include "editor/editor_window_wrapper.h"
 #include "editor/filesystem_dock.h"
 #include "editor/find_in_files.h"
 #include "editor/node_dock.h"
@@ -3163,6 +3164,15 @@ void ScriptEditor::_filter_methods_text_changed(const String &p_newtext) {
 	_update_members_overview();
 }
 
+void ScriptEditor::_request_float() {
+	emit_signal("float_requested");
+}
+
+void ScriptEditor::set_floating(bool p_floating) {
+	make_floating->set_text(p_floating ? TTR("Dock") : TTR("Make Floating"));
+	make_floating->set_tooltip(p_floating ? TTR("Return the script editor to the main window.") : TTR("Open the script editor in its own window."));
+}
+
 void ScriptEditor::_bind_methods() {
 	ClassDB::bind_method("_file_dialog_action", &ScriptEditor::_file_dialog_action);
 	ClassDB::bind_method("_tab_changed", &ScriptEditor::_tab_changed);
@@ -3219,6 +3229,7 @@ void ScriptEditor::_bind_methods() {
 	ClassDB::bind_method("_script_changed", &ScriptEditor::_script_changed);
 	ClassDB::bind_method("_filter_scripts_text_changed", &ScriptEditor::_filter_scripts_text_changed);
 	ClassDB::bind_method("_filter_methods_text_changed", &ScriptEditor::_filter_methods_text_changed);
+	ClassDB::bind_method("_request_float", &ScriptEditor::_request_float);
 	ClassDB::bind_method("_update_recent_scripts", &ScriptEditor::_update_recent_scripts);
 	ClassDB::bind_method("_on_find_in_files_requested", &ScriptEditor::_on_find_in_files_requested);
 	ClassDB::bind_method("_on_replace_in_files_requested", &ScriptEditor::_on_replace_in_files_requested);
@@ -3236,6 +3247,7 @@ void ScriptEditor::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open_script_create_dialog", "base_name", "base_path"), &ScriptEditor::open_script_create_dialog);
 	ClassDB::bind_method(D_METHOD("reload_scripts"), &ScriptEditor::reload_scripts);
 
+	ADD_SIGNAL(MethodInfo("float_requested"));
 	ADD_SIGNAL(MethodInfo("editor_script_changed", PropertyInfo(Variant::OBJECT, "script", PROPERTY_HINT_RESOURCE_TYPE, "Script")));
 	ADD_SIGNAL(MethodInfo("script_close", PropertyInfo(Variant::OBJECT, "script", PROPERTY_HINT_RESOURCE_TYPE, "Script")));
 }
@@ -3460,6 +3472,15 @@ ScriptEditor::ScriptEditor(EditorNode *p_editor) {
 
 	menu_hb->add_child(memnew(VSeparator));
 
+	make_floating = memnew(ToolButton);
+	make_floating->set_text(TTR("Make Floating"));
+	make_floating->set_tooltip(TTR("Open the script editor in its own window."));
+	make_floating->connect("pressed", this, "_request_float");
+	make_floating->set_visible(EditorWindowWrapper::is_supported());
+	menu_hb->add_child(make_floating);
+
+	menu_hb->add_child(memnew(VSeparator));
+
 	script_back = memnew(ToolButton);
 	script_back->connect("pressed", this, "_history_back");
 	menu_hb->add_child(script_back);
@@ -3605,7 +3626,41 @@ bool ScriptEditorPlugin::handles(Object *p_object) const {
 	return p_object->is_class("Script");
 }
 
+void ScriptEditorPlugin::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("_float_toggled"), &ScriptEditorPlugin::_float_toggled);
+	ClassDB::bind_method(D_METHOD("_docked_back"), &ScriptEditorPlugin::_docked_back);
+}
+
+// The window was closed from its own title bar rather than the toolbar button.
+void ScriptEditorPlugin::_docked_back() {
+	script_editor->set_floating(false);
+	make_visible(editor->get_editor_plugin_screen() == this);
+}
+
+void ScriptEditorPlugin::_float_toggled() {
+	if (window_wrapper->is_floating()) {
+		window_wrapper->dock_back();
+		script_editor->set_floating(false);
+		// It was detached from the main screen, so restore whatever the main screen
+		// should be showing now.
+		make_visible(editor->get_editor_plugin_screen() == this);
+	} else {
+		window_wrapper->set_window_title(TTR("Script Editor"));
+		if (window_wrapper->make_floating(script_editor, Rect2(120, 120, 1280, 800))) {
+			script_editor->set_floating(true);
+			script_editor->show();
+			script_editor->set_process(true);
+		}
+	}
+}
+
 void ScriptEditorPlugin::make_visible(bool p_visible) {
+	// While floating, the editor lives in its own window and must stay visible
+	// regardless of which main screen tab is selected.
+	if (window_wrapper->is_floating()) {
+		return;
+	}
+
 	if (p_visible) {
 		script_editor->show();
 		script_editor->set_process(true);
@@ -3655,6 +3710,11 @@ ScriptEditorPlugin::ScriptEditorPlugin(EditorNode *p_node) {
 	script_editor = memnew(ScriptEditor(p_node));
 	editor->get_viewport()->add_child(script_editor);
 	script_editor->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+
+	window_wrapper = memnew(EditorWindowWrapper);
+	editor->get_viewport()->add_child(window_wrapper);
+	script_editor->connect("float_requested", this, "_float_toggled");
+	window_wrapper->connect("docked_back", this, "_docked_back");
 
 	script_editor->hide();
 

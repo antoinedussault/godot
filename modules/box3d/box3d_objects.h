@@ -1,6 +1,7 @@
 #ifndef BOX3D_OBJECTS_H
 #define BOX3D_OBJECTS_H
 
+#include "core/map.h"
 #include "core/object.h"
 #include "core/rid.h"
 #include "core/set.h"
@@ -19,6 +20,16 @@
 // joins one and destroyed when it leaves.
 
 class Box3DSpace;
+class Box3DArea;
+class Box3DJoint;
+
+// Godot's layers and masks occupy the low 32 bits of Box3D's 64 bit filters. These
+// mark what kind of object a shape belongs to, so that an object on no layer still
+// reaches the custom filter (see b3_custom_filter in box3d_space.cpp).
+#define B3_CATEGORY_BODY ((uint64_t)1 << 32)
+#define B3_CATEGORY_AREA ((uint64_t)1 << 33)
+// Meaningless by itself. Flipping it is how a filter is forced to be re-evaluated.
+#define B3_CATEGORY_TOGGLE ((uint64_t)1 << 34)
 
 struct Box3DShapeEntry {
 	RID shape;
@@ -79,6 +90,13 @@ public:
 	// the caller owns and must keep alive for the duration of the query.
 	// Returns false for shape types that cannot be proxied.
 	bool build_proxy(Vector<b3Vec3> &r_points, const Transform &p_xform, b3ShapeProxy *r_proxy) const;
+
+	// Builds this shape as a hull with `p_xform` applied, scale and shear included.
+	// The caller owns it. Null for shapes that are not polyhedral.
+	b3HullData *create_hull(const Transform &p_xform) const;
+
+	// For SHAPE_RAY. Returns false for any other type or malformed data.
+	bool get_ray(real_t &r_length, bool &r_slips_on_slope) const;
 };
 
 class Box3DCollisionObject : public RID_Data {
@@ -97,6 +115,11 @@ public:
 	Transform transform;
 	Vector<Box3DShapeEntry> shapes;
 	bool ray_pickable = true;
+
+	// The solver-side body. Null until the object joins a space. An Area lives in
+	// the solver as a STATIC body whose shapes are sensors.
+	b3BodyId body_id = b3_nullBodyId;
+	_FORCE_INLINE_ bool in_world() const { return !B3_IS_NULL(body_id); }
 
 	Box3DCollisionObject(Type p_type) :
 			type(p_type) {}
@@ -123,11 +146,8 @@ public:
 	ObjectID area_monitor_callback_id = 0;
 	StringName area_monitor_callback_method;
 
-	// An Area lives in the solver as a STATIC body whose shapes are sensors.
-	// Box3D reports sensor begin/end touch events, which is what Godot's area
-	// monitoring is built from.
-	b3BodyId body_id = b3_nullBodyId;
-	_FORCE_INLINE_ bool in_world() const { return !B3_IS_NULL(body_id); }
+	// Scale is baked into the shapes, as it is for bodies.
+	Vector3 baked_scale = Vector3(1, 1, 1);
 
 	Box3DArea() :
 			Box3DCollisionObject(TYPE_AREA) {}
@@ -135,9 +155,6 @@ public:
 
 class Box3DBody : public Box3DCollisionObject {
 public:
-	// Null until the body joins a space.
-	b3BodyId body_id = b3_nullBodyId;
-
 	PhysicsServer::BodyMode mode = PhysicsServer::BODY_MODE_RIGID;
 
 	real_t bounce = 0.0;
@@ -170,10 +187,31 @@ public:
 
 	Set<RID> collision_exceptions;
 
-	// Areas currently overlapping this body, maintained from Box3D sensor
-	// events. Box3D has no per-area gravity, so the override is recomputed and
-	// applied per body each step.
-	Vector<Box3DArea *> areas;
+	// Areas currently overlapping this body, and by how many shape pairs. Maintained
+	// from Box3D sensor events. Box3D has no per-area gravity, so the override is
+	// recomputed and applied per body each step.
+	Map<Box3DArea *, int> areas;
+
+	// Joints attached to this body, whether or not they are live.
+	Set<Box3DJoint *> joints;
+
+	// What the areas added up to at the last step, for the direct body state.
+	Vector3 total_gravity;
+	real_t total_linear_damp = 0.0;
+	real_t total_angular_damp = 0.0;
+
+	// Kinematic bodies are teleported by Godot. Queries must see that at once, but
+	// contacts need the motion as velocity, so the step replays it from
+	// kinematic_from (see Box3DSpace::step).
+	bool kinematic_moved = false;
+	bool kinematic_settle = false;
+	bool kinematic_has_velocity = false;
+	Transform kinematic_from;
+
+	// Set when the sleep state changed, so the node hears about it once.
+	bool report_state = false;
+
+	int ray_shape_count = 0;
 
 	// Box3D anchors a height field at the body origin extending positive, while
 	// Godot centers it, and b3CreateHeightFieldShape takes no transform to
@@ -194,7 +232,25 @@ public:
 	// Half the field's scaled extent, negated: the corner Box3D anchors at.
 	Vector3 shape_corner_offset;
 
-	_FORCE_INLINE_ bool in_world() const { return !B3_IS_NULL(body_id); }
+	// True for bodies the solver drives itself.
+	_FORCE_INLINE_ bool is_dynamic() const {
+		return mode == PhysicsServer::BODY_MODE_RIGID || mode == PhysicsServer::BODY_MODE_CHARACTER;
+	}
+
+	// Center of mass relative to the origin, in global axes. Godot measures force
+	// and impulse positions in that frame too.
+	_FORCE_INLINE_ Vector3 get_center_of_mass() const {
+		if (!in_world() || !is_dynamic()) {
+			return Vector3();
+		}
+		const b3Vec3 c = b3Body_GetLocalCenter(body_id);
+		return transform.basis.orthonormalized().xform(Vector3(c.x, c.y, c.z));
+	}
+
+	// p_offset is relative to the origin, in global axes.
+	_FORCE_INLINE_ Vector3 get_velocity_at(const Vector3 &p_offset) const {
+		return linear_velocity + angular_velocity.cross(p_offset - get_center_of_mass());
+	}
 
 	// Godot bakes scale into a body's basis; Box3D transforms are strictly rigid
 	// and carry none. Scale is therefore baked into the SHAPES instead (see
@@ -218,13 +274,28 @@ public:
 class Box3DJoint : public RID_Data {
 public:
 	PhysicsServer::JointType type = PhysicsServer::JOINT_PIN;
-	RID body_a;
-	RID body_b;
+
+	// Live only while both bodies share a space. See box3d_joints.cpp.
+	b3JointId joint_id = b3_nullJointId;
+
+	// body_b is null for a joint anchored to the world.
+	Box3DBody *body_a = nullptr;
+	Box3DBody *body_b = nullptr;
+	// One of the bodies was freed.
+	bool broken = false;
+
+	// In the local space of each body, or in world space without a body B.
+	Transform frame_a;
+	Transform frame_b;
+
 	int solver_priority = 1;
 	bool collisions_disabled = false;
 
-	Vector3 pin_local_a;
-	Vector3 pin_local_b;
+	// Indexed by the parameter enum of the joint type. 6DOF has its own, per axis.
+	float params[PhysicsServer::SLIDER_JOINT_MAX] = {};
+	bool hinge_flags[PhysicsServer::HINGE_JOINT_FLAG_MAX] = {};
+	float g6dof_params[3][PhysicsServer::G6DOF_JOINT_MAX] = {};
+	bool g6dof_flags[3][PhysicsServer::G6DOF_JOINT_FLAG_MAX] = {};
 
 	Box3DJoint(PhysicsServer::JointType p_type) :
 			type(p_type) {}

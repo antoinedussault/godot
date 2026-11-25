@@ -1,20 +1,16 @@
 #include "directional_light_shaft.h"
 
-#include "servers/visual_server.h"
-
 void DirectionalLightShaft::_apply() {
-	VisualServer::get_singleton()->light_directional_set_light_shafts(
-			light,
-			shaft_enabled,
-			bloom_enabled ? bloom_intensity : 0.0f,
-			bloom_threshold,
-			bloom_tint,
-			occlusion_enabled ? occlusion_darkness : 0.0f,
-			shaft_samples,
-			shaft_density,
-			shaft_decay,
-			shaft_weight,
-			temporal_blend);
+	set_godrays_enabled(shaft_enabled);
+	set_godrays_intensity(bloom_enabled ? bloom_intensity : 0.0f);
+	set_godrays_threshold(bloom_threshold);
+	set_godrays_tint(bloom_tint);
+	set_godrays_occlusion(occlusion_enabled ? occlusion_darkness : 0.0f);
+	set_godrays_samples(shaft_samples);
+	set_godrays_density(shaft_density);
+	set_godrays_decay(shaft_decay);
+	set_godrays_weight(shaft_weight);
+	set_godrays_temporal_blend(temporal_blend);
 }
 
 void DirectionalLightShaft::set_shaft_enabled(bool p_enabled) {
@@ -121,6 +117,12 @@ void DirectionalLightShaft::_validate_property(PropertyInfo &property) const {
 	}
 	if (!occlusion_enabled && property.name == "occlusion_darkness") {
 		property.usage = PROPERTY_USAGE_NOEDITOR;
+	}
+	// This node predates DirectionalLight's own god rays and drives them through
+	// its older properties; showing or saving both would let them fight.
+	if (property.name.begins_with("godrays_")) {
+		property.usage = 0;
+		return;
 	}
 	DirectionalLight::_validate_property(property);
 }

@@ -27,6 +27,7 @@ thirdparty_sources = [
     "distance.c",
     "distance_joint.c",
     "dynamic_tree.c",
+    "generic_joint.c",  # Tuna addition, not upstream.
     "height_field.c",
     "hull.c",
     "id_pool.c",

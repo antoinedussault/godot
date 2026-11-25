@@ -102,12 +102,28 @@ bool FoliageManager::_set(const StringName &p_name, const Variant &p_value) {
 // Terrain sync
 // ---------------------------------------------------------------------------
 
-void FoliageManager::world_to_cell(const Vector3 &p_world, int &r_cx, int &r_cz) const {
-	r_cx = (int)Math::floor(p_world.x / cell_size);
-	r_cz = (int)Math::floor(p_world.z / cell_size);
+// The grid hangs off this node's origin. world_to_cell() and
+// cell_world_origin() used to ignore it, which was only correct for a manager
+// sitting at (0, 0, 0): anywhere else the cells were DRAWN offset (they are
+// children of this node) but LOOKED UP unoffset, so painting, LOD and collision
+// all addressed the wrong cell.
+Vector3 FoliageManager::_grid_origin() const {
+	return is_inside_tree() ? get_global_transform().origin : get_transform().origin;
 }
 
+void FoliageManager::world_to_cell(const Vector3 &p_world, int &r_cx, int &r_cz) const {
+	const Vector3 o = _grid_origin();
+	r_cx = (int)Math::floor((p_world.x - o.x) / cell_size);
+	r_cz = (int)Math::floor((p_world.z - o.z) / cell_size);
+}
+
+// WORLD-space corner of a cell. For the transform of a CellFoliage child use
+// _cell_local_origin() instead - the child already inherits this node's origin.
 Vector3 FoliageManager::cell_world_origin(int cx, int cz) const {
+	return _grid_origin() + Vector3(cx * cell_size, 0.0f, cz * cell_size);
+}
+
+Vector3 FoliageManager::_cell_local_origin(int cx, int cz) const {
 	return Vector3(cx * cell_size, 0.0f, cz * cell_size);
 }
 
@@ -152,12 +168,15 @@ void FoliageManager::_save_cell(int cx, int cz, CellFoliage *p_cf) {
 }
 
 CellFoliage *FoliageManager::_spawn_for_cell(int cx, int cz, CellTerrain *p_terrain) {
+	// p_terrain is unused: the caller has already established that terrain
+	// covers this cell, against the correct grid (_terrain_covers_cell).
+	(void)p_terrain;
 	CellFoliage *cf = memnew(CellFoliage);
 	cf->set_cell_size(cell_size);
 	cf->configure_types(_gather_types());
 	add_child(cf);
 	Transform xf;
-	xf.origin = cell_world_origin(cx, cz);
+	xf.origin = _cell_local_origin(cx, cz);
 	cf->set_transform(xf);
 	PoolRealArray data = _load_cell(cx, cz);
 	if (data.size() > 0) cf->deserialize(data);
@@ -203,7 +222,7 @@ void FoliageManager::_load_all_persistent() {
 		cf->configure_types(_gather_types());
 		add_child(cf);
 		Transform xf;
-		xf.origin = cell_world_origin(cx, cz);
+		xf.origin = _cell_local_origin(cx, cz);
 		cf->set_transform(xf);
 		PoolRealArray data = _load_cell(cx, cz);
 		if (data.size() > 0) cf->deserialize(data);
@@ -220,15 +239,51 @@ void FoliageManager::_load_all_persistent() {
 	}
 }
 
+bool FoliageManager::_terrain_covers_cell(CellTerrainManager *p_tm, int fx, int fz) const {
+	const float tcs = p_tm->get_cell_size();
+	if (tcs <= 0.0f) return false;
+	const Vector3 torigin = p_tm->get_global_transform().origin;
+	const Vector3 corner = cell_world_origin(fx, fz);
+
+	// A foliage cell usually spans SEVERAL terrain cells (256 vs 64 here), so
+	// test every terrain cell it overlaps and keep the foliage alive while any
+	// one of them is streamed in. Testing only the centre would unload foliage
+	// whose ground is still half loaded.
+	const int tx0 = (int)Math::floor((corner.x - torigin.x) / tcs);
+	const int tz0 = (int)Math::floor((corner.z - torigin.z) / tcs);
+	const int tx1 = (int)Math::floor((corner.x + cell_size - 0.001f - torigin.x) / tcs);
+	const int tz1 = (int)Math::floor((corner.z + cell_size - 0.001f - torigin.z) / tcs);
+	for (int tz = tz0; tz <= tz1; tz++) {
+		for (int tx = tx0; tx <= tx1; tx++) {
+			if (p_tm->get_cell(tx, tz)) return true;
+		}
+	}
+	return false;
+}
+
 void FoliageManager::_sync_with_terrain() {
 	CellTerrainManager *tm = _get_terrain_manager();
 	if (!tm) return;
+
+	// The probe below is the single most expensive thing this node does per
+	// frame, and in the steady state it finds nothing to do. It only has
+	// anything to find when the camera crossed into a new foliage cell or the
+	// terrain streamed a cell in/out, so gate on exactly that.
+	const int terrain_count = tm->get_loaded_cell_count();
+	if (_has_synced && terrain_count == _last_sync_terrain_count &&
+			_cam_cx == _last_sync_cam_cx && _cam_cz == _last_sync_cam_cz) {
+		return;
+	}
+	_has_synced = true;
+	_last_sync_terrain_count = terrain_count;
+	_last_sync_cam_cx = _cam_cx;
+	_last_sync_cam_cz = _cam_cz;
 
 	List<int64_t> remove;
 	for (Map<int64_t, CellFoliage *>::Element *E = _active.front(); E; E = E->next()) {
 		int x, z;
 		_unkey(E->key(), x, z);
-		if (!tm->get_cell(x, z))
+		if (!_terrain_covers_cell(tm, x, z))
 			remove.push_back(E->key());
 	}
 	for (List<int64_t>::Element *E = remove.front(); E; E = E->next()) {
@@ -246,31 +301,60 @@ void FoliageManager::_sync_with_terrain() {
 		if (cf->has_persistent_instances()) continue;
 		cf->queue_delete();
 		_active.erase(E->get());
+		_nav_obstacles_dirty = true;
 	}
 
 	if (!_has_cam_cell) return;
-	const int probe = 32;
+
+	// Size the probe from how far the TERRAIN actually reaches, in world units,
+	// instead of a flat +/-32 foliage cells. At the defaults that was a 65x65 =
+	// 4225-cell scan every time this ran, of which all but a handful could never
+	// hold a terrain cell. Terrain reaches lod_radius cells of its own size.
+	const float tcs = tm->get_cell_size();
+	const float reach = (tm->get_lod_radius() + 1) * MAX(tcs, 0.001f);
+	const int probe = MAX(1, (int)Math::ceil(reach / MAX(cell_size, 0.001f)));
+
 	for (int z = _cam_cz - probe; z <= _cam_cz + probe; z++) {
 		for (int x = _cam_cx - probe; x <= _cam_cx + probe; x++) {
-			CellTerrain *ct = tm->get_cell(x, z);
-			if (!ct) continue;
+			if (!_terrain_covers_cell(tm, x, z)) continue;
 			int64_t k = _key(x, z);
 			// Already loaded: full/imposter mode is owned by _update_lod_modes().
 			if (_active.has(k)) continue;
-			_active[k] = _spawn_for_cell(x, z, ct);
+			// _spawn_for_cell only needs the terrain for its existence check,
+			// which _terrain_covers_cell just did against the right grid.
+			_active[k] = _spawn_for_cell(x, z, nullptr);
+			// New foliage means new potential nav obstacles.
+			_nav_obstacles_dirty = true;
 		}
 	}
 }
 
 void FoliageManager::_update_lod_modes() {
 	if (!_has_cam_cell) return;
+
+	const int active_count = _active.size();
+	if (_has_lodmode && active_count == _last_lodmode_active &&
+			_cam_cx == _last_lodmode_cam_cx && _cam_cz == _last_lodmode_cam_cz) {
+		return;
+	}
+	_has_lodmode = true;
+	_last_lodmode_active = active_count;
+	_last_lodmode_cam_cx = _cam_cx;
+	_last_lodmode_cam_cz = _cam_cz;
 	for (Map<int64_t, CellFoliage *>::Element *E = _active.front(); E; E = E->next()) {
 		CellFoliage *cf = E->value();
 		if (!cf) continue;
 		int x, z;
 		_unkey(E->key(), x, z);
 		int d = MAX(ABS(x - _cam_cx), ABS(z - _cam_cz));
-		bool want_full = (d <= tree_full_lod_radius);
+		// One cell of hysteresis. Both branches below call rebuild(), which
+		// re-extracts every LOD mesh for the cell, so a camera sitting on the
+		// boundary would otherwise rebuild that cell every time it stepped
+		// back and forth across it. Promote at the radius, demote only one
+		// cell further out.
+		const bool is_full = !cf->get_persistent_only();
+		const bool want_full = is_full ? (d <= tree_full_lod_radius + 1)
+									   : (d <= tree_full_lod_radius);
 		if (want_full) {
 			// Near: build full LOD meshes so close trees render as meshes, not
 			// edge-on imposters.
@@ -309,31 +393,22 @@ void FoliageManager::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_READY: {
 			set_process(true);
-			if (!Engine::get_singleton()->is_editor_hint())
+			if (!Engine::get_singleton()->is_editor_hint() && streaming_enabled)
 				_load_all_persistent();
 		} break;
 
 		case NOTIFICATION_PROCESS: {
 			if (Engine::get_singleton()->is_editor_hint()) break;
+			// Under a GameWorld the focus arrives through stream_focus(), read
+			// once there for terrain, foliage and objects alike.
+			if (external_focus) break;
 			Camera *cam = _get_active_camera();
 			if (!cam) return;
 			Vector3 cam_world = cam->get_global_transform().origin;
-			world_to_cell(cam_world, _cam_cx, _cam_cz);
-			_has_cam_cell = true;
-
+			// Standalone (no GameWorld): this node drives the terrain itself.
 			CellTerrainManager *tm = _get_terrain_manager();
 			if (tm) tm->stream_to(cam_world);
-
-			_sync_with_terrain();
-			_update_lod_modes();
-
-			float dt = get_process_delta_time();
-			_accum += dt;
-			if (lod_update_interval <= 0.0f || _accum >= lod_update_interval) {
-				_accum = 0.0f;
-				_update_all_lod(cam_world);
-				_update_collision(cam_world);
-			}
+			stream_focus(cam_world);
 		} break;
 
 		case NOTIFICATION_EXIT_TREE: {
@@ -342,6 +417,64 @@ void FoliageManager::_notification(int p_what) {
 			_dirty.clear();
 			_has_cam_cell = false;
 		} break;
+	}
+}
+
+void FoliageManager::set_streaming_enabled(bool e) {
+	if (streaming_enabled == e) return;
+	streaming_enabled = e;
+	set_visible(e);
+	if (!e) {
+		save_dirty();
+		for (Map<int64_t, CellFoliage *>::Element *E = _active.front(); E; E = E->next()) {
+			if (E->value()) E->value()->queue_delete();
+		}
+		_active.clear();
+		_has_synced = false;
+		_has_lodmode = false;
+		_has_cam_cell = false;
+	} else if (is_inside_tree() && !Engine::get_singleton()->is_editor_hint()) {
+		_load_all_persistent();
+	}
+}
+
+// One frame of foliage streaming around a WORLD position: attach/detach cells
+// to match the terrain, switch LOD modes, refresh nav obstacles and collision.
+void FoliageManager::stream_focus(const Vector3 &p_focus) {
+	if (!streaming_enabled || !is_inside_tree()) return;
+	{
+		{
+			const Vector3 cam_world = p_focus;
+			world_to_cell(cam_world, _cam_cx, _cam_cz);
+			_has_cam_cell = true;
+
+			const float dt_nav = get_process_delta_time();
+
+			_sync_with_terrain();
+			_update_lod_modes();
+
+			// Rocks only carved the navmesh when the EDITOR plugin called
+			// refresh_nav_obstacles() - at runtime nothing ever did, so a
+			// streamed-in rock was invisible to navigation. Refresh here, but
+			// debounced: this walks every active foliage cell and re-stamps
+			// whole terrain cells, which is far too heavy to do per frame.
+			if (_nav_obstacles_dirty) {
+				_nav_obstacle_accum += dt_nav;
+				if (_nav_obstacle_accum >= 0.5f) {
+					_nav_obstacle_accum = 0.0f;
+					_nav_obstacles_dirty = false;
+					refresh_nav_obstacles();
+				}
+			}
+
+			float dt = get_process_delta_time();
+			_accum += dt;
+			if (lod_update_interval <= 0.0f || _accum >= lod_update_interval) {
+				_accum = 0.0f;
+				_update_all_lod(cam_world);
+				_update_collision(cam_world);
+			}
+		}
 	}
 }
 
@@ -356,7 +489,98 @@ CellFoliage *FoliageManager::get_cell_foliage(int cx, int cz) const {
 
 void FoliageManager::mark_dirty(int cx, int cz) { _dirty.insert(_key(cx, cz)); }
 
+float FoliageManager::get_terrain_height_at(float wx, float wz, bool *r_valid) const {
+	CellTerrainManager *tm = _get_terrain_manager();
+	if (!tm) {
+		if (r_valid) *r_valid = false;
+		return 0.0f;
+	}
+	// A cell that is not streamed in has no height data; get_height_at_world
+	// returns 0 for it, which is indistinguishable from real ground at sea
+	// level - so report validity separately rather than guessing.
+	float cs = tm->get_cell_size();
+	Vector3 o = tm->get_global_transform().origin;
+	int cx = (int)Math::floor((wx - o.x) / cs);
+	int cz = (int)Math::floor((wz - o.z) / cs);
+	if (!tm->get_cell(cx, cz)) {
+		if (r_valid) *r_valid = false;
+		return 0.0f;
+	}
+	if (r_valid) *r_valid = true;
+	return o.y + tm->get_height_at_world(wx, wz);
+}
+
+void FoliageManager::refresh_nav_obstacles() {
+	CellTerrainManager *tm = _get_terrain_manager();
+	if (!tm) return;
+
+	// Foliage cells and terrain cells are DIFFERENT grids (this project runs
+	// foliage at 256 and terrain at 64), so obstacles are gathered in world
+	// space and then redistributed into whichever terrain cells they touch.
+	float tcs = tm->get_cell_size();
+	if (tcs <= 0.0f) return;
+	Vector3 torigin = tm->get_global_transform().origin;
+
+	Map<int64_t, PoolRealArray> per_terrain_cell;
+
+	for (Map<int64_t, CellFoliage *>::Element *E = _active.front(); E; E = E->next()) {
+		CellFoliage *cf = E->value();
+		if (!cf) continue;
+		int fcx, fcz;
+		_unkey(E->key(), fcx, fcz);
+		Vector3 forigin = cell_world_origin(fcx, fcz);
+		PoolRealArray obs = cf->collect_nav_obstacles(forigin);
+		int n = obs.size() / 3;
+		if (n == 0) continue;
+		PoolRealArray::Read r = obs.read();
+		for (int i = 0; i < n; i++) {
+			float wx = r[i * 3 + 0];
+			float wz = r[i * 3 + 1];
+			float rad = r[i * 3 + 2];
+			// Stamp into every terrain cell the disc overlaps, not just the one
+			// holding its centre, or rocks straddling a border would only carve
+			// half their footprint.
+			int cx0 = (int)Math::floor((wx - rad - torigin.x) / tcs);
+			int cx1 = (int)Math::floor((wx + rad - torigin.x) / tcs);
+			int cz0 = (int)Math::floor((wz - rad - torigin.z) / tcs);
+			int cz1 = (int)Math::floor((wz + rad - torigin.z) / tcs);
+			for (int cz = cz0; cz <= cz1; cz++) {
+				for (int cx = cx0; cx <= cx1; cx++) {
+					int64_t key = ((int64_t)(uint32_t)cx << 32) | (uint32_t)cz;
+					PoolRealArray &dst = per_terrain_cell[key];
+					// Converted to that cell's LOCAL space, which is what
+					// CellTerrain::ComputeInput::nav_obstacles expects.
+					dst.push_back(wx - (torigin.x + cx * tcs));
+					dst.push_back(wz - (torigin.z + cz * tcs));
+					dst.push_back(rad);
+				}
+			}
+		}
+	}
+
+	// Push the new lists.
+	for (Map<int64_t, PoolRealArray>::Element *E = per_terrain_cell.front(); E; E = E->next()) {
+		int cx, cz;
+		_unkey(E->key(), cx, cz);
+		tm->set_cell_nav_obstacles(cx, cz, E->get());
+	}
+	// Clear cells that carried obstacles last time but no longer do, otherwise
+	// deleting a rock would leave its hole in the navmesh forever.
+	for (Set<int64_t>::Element *E = _nav_stamped.front(); E; E = E->next()) {
+		if (per_terrain_cell.has(E->get())) continue;
+		int cx, cz;
+		_unkey(E->get(), cx, cz);
+		tm->set_cell_nav_obstacles(cx, cz, PoolRealArray());
+	}
+
+	_nav_stamped.clear();
+	for (Map<int64_t, PoolRealArray>::Element *E = per_terrain_cell.front(); E; E = E->next()) {
+		_nav_stamped.insert(E->key());
+	}
+}
+
 void FoliageManager::editor_stream_to(const Vector3 &p_world_pos) {
+	if (!streaming_enabled) return;
 	world_to_cell(p_world_pos, _cam_cx, _cam_cz);
 	_has_cam_cell = true;
 	CellTerrainManager *tm = _get_terrain_manager();
@@ -384,27 +608,70 @@ void FoliageManager::rebuild_cell(int cx, int cz) {
 	if (cf) cf->rebuild();
 }
 
-static bool _sample_ground(CellTerrainManager *tm, float cell_size,
+// Ground height + normal under a world XZ.
+//
+// Takes NO cell_size: it must use the TERRAIN's grid, not the caller's. This
+// previously received FoliageManager::cell_size (256 in the Solander scenes)
+// and used it to index a terrain that runs at 64, so it looked up the wrong
+// cell AND subtracted the wrong origin - at world x=300 it read the height at
+// roughly x=108. Single-placement mode was unaffected because it uses the
+// raycast hit directly, which is why only Scatter came out at the wrong height.
+//
+// Height is bilinear via get_height_at_world() rather than snapped to the
+// nearest heightmap vertex; snapping was worth up to half a vertex spacing of
+// vertical error on a slope. The neighbour taps go through the same call so
+// they read across cell borders instead of clamping at the edge.
+static bool _sample_ground(CellTerrainManager *tm,
 		const Vector3 &world_xz, float &out_y, Vector3 &out_normal) {
 	if (!tm) return false;
-	int cx = (int)Math::floor(world_xz.x / cell_size);
-	int cz = (int)Math::floor(world_xz.z / cell_size);
+	const float tcs = tm->get_cell_size();
+	if (tcs <= 0.0f) return false;
+	const Vector3 origin = tm->get_global_transform().origin;
+	const int cx = (int)Math::floor((world_xz.x - origin.x) / tcs);
+	const int cz = (int)Math::floor((world_xz.z - origin.z) / tcs);
 	CellTerrain *ct = tm->get_cell(cx, cz);
-	if (!ct) return false;
-	int   vps     = ct->get_verts_per_side();
-	float spacing = cell_size / (float)(vps - 1);
-	float hscale  = ct->get_height_scale();
-	float local_x = world_xz.x - cx * cell_size;
-	float local_z = world_xz.z - cz * cell_size;
-	int   lx      = CLAMP((int)Math::round(local_x / spacing), 0, vps - 1);
-	int   lz      = CLAMP((int)Math::round(local_z / spacing), 0, vps - 1);
-	out_y = ct->get_height_at(lx, lz) * hscale;
-	float hl = ct->get_height_at(CLAMP(lx - 1, 0, vps - 1), lz) * hscale;
-	float hr = ct->get_height_at(CLAMP(lx + 1, 0, vps - 1), lz) * hscale;
-	float hd = ct->get_height_at(lx, CLAMP(lz - 1, 0, vps - 1)) * hscale;
-	float hu = ct->get_height_at(lx, CLAMP(lz + 1, 0, vps - 1)) * hscale;
+	if (!ct) return false; // not streamed in - nothing to stand on
+
+	const int vps = ct->get_verts_per_side();
+	const float spacing = tcs / (float)MAX(1, vps - 1);
+
+	// get_height_at_world returns height relative to the manager, so add its
+	// origin to land in the same world space place_single uses.
+	out_y = origin.y + tm->get_height_at_world(world_xz.x, world_xz.z);
+
+	const float hl = tm->get_height_at_world(world_xz.x - spacing, world_xz.z);
+	const float hr = tm->get_height_at_world(world_xz.x + spacing, world_xz.z);
+	const float hd = tm->get_height_at_world(world_xz.x, world_xz.z - spacing);
+	const float hu = tm->get_height_at_world(world_xz.x, world_xz.z + spacing);
 	out_normal = Vector3(hl - hr, 2.0f * spacing, hd - hu).normalized();
+	if (out_normal.length_squared() < 0.5f) out_normal = Vector3(0, 1, 0);
 	return true;
+}
+
+// Orthonormal, RIGHT-HANDED basis with Y along p_up, built with set_axis so the
+// vectors land in the COLUMNS. Assigning Basis::elements[] instead writes the
+// ROWS, which silently produces the transpose (the inverse rotation) - it looks
+// correct on flat ground, where the basis is identity, and tilts the wrong way
+// on every slope.
+static Basis cs_basis_from_up(const Vector3 &p_up) {
+	Vector3 up = p_up;
+	if (up.length_squared() < 0.000001f) return Basis();
+	up.normalize();
+	// Reference axis must not be parallel to up, or the cross product is zero
+	// and the basis collapses. Hardcoding +X broke on X-facing slopes.
+	Vector3 ref = (Math::abs(up.z) < 0.99f) ? Vector3(0, 0, 1) : Vector3(1, 0, 0);
+	Vector3 right = up.cross(ref);
+	if (right.length_squared() < 0.000001f) return Basis();
+	right.normalize();
+	// right.cross(up) (not up.cross(right)): for up=Y this yields +Z, keeping the
+	// determinant +1. The old order gave -Z, a mirrored basis that inverted
+	// winding and showed the mesh inside-out.
+	Vector3 back = right.cross(up);
+	Basis b;
+	b.set_axis(0, right);
+	b.set_axis(1, up);
+	b.set_axis(2, back);
+	return b;
 }
 
 int FoliageManager::paint_scatter(int p_type_index, const Vector3 &p_world_center,
@@ -439,7 +706,7 @@ int FoliageManager::paint_scatter(int p_type_index, const Vector3 &p_world_cente
 
 		float   gy;
 		Vector3 gnormal;
-		if (!_sample_ground(tm, cell_size, Vector3(wx, 0, wz), gy, gnormal)) continue;
+		if (!_sample_ground(tm, Vector3(wx, 0, wz), gy, gnormal)) continue;
 		if (gnormal.y < slope_cos) continue;
 
 		int cx, cz;
@@ -449,19 +716,17 @@ int FoliageManager::paint_scatter(int p_type_index, const Vector3 &p_world_cente
 
 		float y_off = (y_off_min != y_off_max)
 				? rng->randf_range(y_off_min, y_off_max) : y_off_min;
-		Vector3 local_origin(wx - cx * cell_size, gy + y_off, wz - cz * cell_size);
+		const Vector3 corner = cell_world_origin(cx, cz);
+		Vector3 local_origin(wx - corner.x, gy + y_off - corner.y, wz - corner.z);
 		Basis basis;
 		if (align && align_amt > 0.0f) {
-			Vector3 up    = Vector3(0, 1, 0).linear_interpolate(gnormal, align_amt).normalized();
-			Vector3 right = Vector3(1, 0, 0);
-			Vector3 fwd   = up.cross(right).normalized();
-			right = fwd.cross(up).normalized();
-			basis.elements[0] = right;
-			basis.elements[1] = up;
-			basis.elements[2] = fwd;
+			basis = cs_basis_from_up(Vector3(0, 1, 0).linear_interpolate(gnormal, align_amt));
 		}
 		if (ryaw) {
-			basis.rotate(basis.elements[1].normalized(), rng->randf_range(0.0f, Math_TAU));
+			// Yaw about the instance LOCAL up, then let the align basis tilt it -
+			// matching place_single. The old code rotated about elements[1],
+			// which is a row, not the up axis.
+			basis = basis * Basis(Vector3(0, 1, 0), rng->randf_range(0.0f, Math_TAU));
 		}
 		float s = rng->randf_range(min_s, max_s);
 		basis.scale(Vector3(s, s, s));
@@ -503,14 +768,7 @@ bool FoliageManager::place_single(int p_type_index, const Vector3 &p_world_pos,
 	}
 	if (ft->get_align_to_normal() && ft->get_align_amount() > 0.0f
 			&& p_world_normal.length() > 0.001f) {
-		Vector3 up    = Vector3(0, 1, 0).linear_interpolate(p_world_normal, ft->get_align_amount()).normalized();
-		Vector3 right = Vector3(1, 0, 0);
-		Vector3 fwd   = up.cross(right).normalized();
-		right = fwd.cross(up).normalized();
-		Basis ab;
-		ab.elements[0] = right;
-		ab.elements[1] = up;
-		ab.elements[2] = fwd;
+		Basis ab = cs_basis_from_up(Vector3(0, 1, 0).linear_interpolate(p_world_normal, ft->get_align_amount()));
 		basis = ab * basis;
 	}
 	float s = rng->randf_range(ft->get_min_scale(), ft->get_max_scale());
@@ -518,8 +776,7 @@ bool FoliageManager::place_single(int p_type_index, const Vector3 &p_world_pos,
 
 	Transform xf;
 	xf.basis  = basis;
-	xf.origin = Vector3(p_world_pos.x - cx * cell_size, p_world_pos.y,
-			p_world_pos.z - cz * cell_size);
+	xf.origin = p_world_pos - cell_world_origin(cx, cz);
 	cf->add_instance(p_type_index, xf);
 	mark_dirty(cx, cz);
 	rebuild_cell(cx, cz);
@@ -597,6 +854,7 @@ void FoliageManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_types_array"),               &FoliageManager::get_types_array);
 
 	ClassDB::bind_method(D_METHOD("save_dirty"),                    &FoliageManager::save_dirty);
+	ClassDB::bind_method(D_METHOD("stream_focus", "world_pos"),     &FoliageManager::stream_focus);
 	ClassDB::bind_method(D_METHOD("editor_stream_to", "world_pos"), &FoliageManager::editor_stream_to);
 	ClassDB::bind_method(D_METHOD("mark_dirty", "cx", "cz"),        &FoliageManager::mark_dirty);
 	ClassDB::bind_method(D_METHOD("rebuild_cell", "cx", "cz"),      &FoliageManager::rebuild_cell);

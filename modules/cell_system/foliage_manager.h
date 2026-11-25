@@ -47,6 +47,9 @@ private:
 
 	static int64_t _key(int x, int z);
 	static void    _unkey(int64_t k, int &x, int &z);
+	// Terrain cells currently carrying foliage-derived nav holes, so they can
+	// be cleared when the foliage above them is deleted.
+	Set<int64_t> _nav_stamped;
 
 	CellTerrainManager       *_get_terrain_manager() const;
 	Camera                   *_get_active_camera()   const;
@@ -60,6 +63,34 @@ private:
 	// mode, so all trees are present from game start regardless of camera position.
 	void _load_all_persistent();
 	void _sync_with_terrain();
+	// True when ANY terrain cell overlapping foliage cell (fx, fz) is streamed
+	// in. Foliage and terrain are independent grids with independent cell
+	// sizes, so this converts through WORLD space - passing a foliage index
+	// straight to CellTerrainManager::get_cell() names a completely different
+	// place as soon as the two sizes differ.
+	bool _terrain_covers_cell(class CellTerrainManager *p_tm, int fx, int fz) const;
+	// Cheap change detector for _sync_with_terrain: the expensive probe only
+	// has to run when the camera crossed a foliage cell or the terrain's
+	// streamed set changed.
+	int _last_sync_cam_cx = 0;
+	int _last_sync_cam_cz = 0;
+	int _last_sync_terrain_count = -1;
+	bool _has_synced = false;
+	// Same gate for _update_lod_modes: which LOD mode a cell wants depends only
+	// on its distance from the camera's cell, so it can only change when the
+	// camera crosses a cell boundary or the active set changes. Persistent
+	// (keep_loaded) cells stay in _active for the whole session - a big authored
+	// world keeps thousands of them resident - so scanning them every frame to
+	// re-derive an answer that cannot have changed is pure waste.
+	int _last_lodmode_cam_cx = 0;
+	int _last_lodmode_cam_cz = 0;
+	int _last_lodmode_active = -1;
+	bool _has_lodmode = false;
+	// Rocks carve the navmesh through CellTerrainManager::set_cell_nav_obstacles,
+	// which is far too heavy to run per streamed cell. Set when the foliage set
+	// changes and consumed at most once every nav_obstacle_refresh_interval.
+	bool _nav_obstacles_dirty = false;
+	float _nav_obstacle_accum = 0.0f;
 	void _update_all_lod(const Vector3 &cam_world);
 	void _update_collision(const Vector3 &cam_world);
 
@@ -85,8 +116,33 @@ public:
 
 	void editor_stream_to(const Vector3 &p_world_pos);
 
+	// Set by a parent GameWorld: stop polling the camera, stream only when
+	// stream_focus() is called. See CellTerrainManager::external_focus.
+	bool external_focus = false;
+	void set_external_focus(bool e) { external_focus = e; }
+	bool get_external_focus() const { return external_focus; }
+	// Off = no foliage at all (GameWorld.has_terrain unchecked). Settings kept.
+	bool streaming_enabled = true;
+	void set_streaming_enabled(bool e);
+	bool get_streaming_enabled() const { return streaming_enabled; }
+	void stream_focus(const Vector3 &p_focus);
+
+	// Recomputes which terrain cells are blocked by rock/tree instances and
+	// pushes the result to the terrain. Called once per completed brush stroke
+	// rather than per mouse-move: each push triggers a navmesh rebuild, which
+	// is expensive enough that it must not run continuously.
+	void refresh_nav_obstacles();
+
+	// Terrain height under a world XZ, or 0 with r_valid=false when there is no
+	// terrain manager / no loaded cell there. The foliage brush needs this so a
+	// missed physics raycast can still land on the ground instead of silently
+	// falling back to the y=0 plane and burying everything.
+	float get_terrain_height_at(float wx, float wz, bool *r_valid = nullptr) const;
+
 	void    world_to_cell(const Vector3 &p_world, int &r_cx, int &r_cz) const;
 	Vector3 cell_world_origin(int cx, int cz) const;
+	Vector3 _grid_origin() const;
+	Vector3 _cell_local_origin(int cx, int cz) const;
 
 	int  paint_scatter(int p_type_index, const Vector3 &p_world_center, float p_radius, float p_strength);
 	bool place_single(int p_type_index, const Vector3 &p_world_pos, const Vector3 &p_world_normal);

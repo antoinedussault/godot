@@ -32,7 +32,13 @@ public:
 
 	Box3DBody *body = nullptr;
 	real_t step_delta = 0.0;
-	Vector<ContactData> contacts;
+
+	// Gathered the first time they are asked for, since most bodies never are.
+	mutable Vector<ContactData> contacts;
+	mutable bool contacts_gathered = false;
+
+	void set_body(Box3DBody *p_body, real_t p_step);
+	void gather_contacts() const;
 
 	static void init_singleton();
 	static void free_singleton();

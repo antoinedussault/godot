@@ -1548,6 +1548,7 @@ void b3Body_SetType( b3BodyId bodyId, b3BodyType type )
 			if ( shape->type == b3_compoundShape || shape->type == b3_heightShape )
 			{
 				// Setting the body type is not supported for bodies with compound shapes
+				world->locked = false; // Tuna fix: upstream returned with the world locked
 				return;
 			}
 

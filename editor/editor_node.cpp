@@ -77,6 +77,7 @@
 #include "editor/editor_help.h"
 #include "editor/editor_inspector.h"
 #include "editor/editor_layouts_dialog.h"
+#include "editor/editor_loading_screen.h"
 #include "editor/editor_log.h"
 #include "editor/editor_plugin.h"
 #include "editor/editor_properties.h"
@@ -857,6 +858,16 @@ void EditorNode::_resources_reimported(const Vector<String> &p_resources) {
 	scene_tabs->set_current_tab(current_tab);
 }
 
+void EditorNode::load_startup_scene(const String &p_path, bool p_restoring) {
+	// Preloading already reported this scene's nested dependency errors; loading it
+	// must not clear them first.
+	loading_startup_scene = true;
+	restoring_scenes = p_restoring;
+	load_scene(p_path);
+	restoring_scenes = false;
+	loading_startup_scene = false;
+}
+
 void EditorNode::_sources_changed(bool p_exist) {
 	if (waiting_for_first_scan) {
 		waiting_for_first_scan = false;
@@ -866,11 +877,21 @@ void EditorNode::_sources_changed(bool p_exist) {
 			EditorResourcePreview::get_singleton()->start();
 		}
 
+		EditorLoadingScreen *loading = EditorLoadingScreen::get_singleton();
+
 		_load_docks();
 
 		if (defer_load_scene != "") {
-			load_scene(defer_load_scene);
+			if (loading) {
+				loading->queue_scene(defer_load_scene, false);
+			} else {
+				load_scene(defer_load_scene);
+			}
 			defer_load_scene = "";
+		}
+
+		if (loading) {
+			loading->first_scan_finished();
 		}
 	}
 }
@@ -3609,7 +3630,7 @@ Error EditorNode::load_scene(const String &p_scene, bool p_ignore_broken_deps, b
 		}
 	}
 
-	if (p_clear_errors) {
+	if (p_clear_errors && !loading_startup_scene) {
 		load_errors->clear();
 	}
 
@@ -3632,7 +3653,9 @@ Error EditorNode::load_scene(const String &p_scene, bool p_ignore_broken_deps, b
 		set_current_scene(idx);
 	}
 
-	dependency_errors.clear();
+	if (!loading_startup_scene) {
+		dependency_errors.clear();
+	}
 
 	Error err;
 	Ref<PackedScene> sdata = ResourceLoader::load(lpath, "", true, &err);
@@ -4466,6 +4489,10 @@ void EditorNode::_save_docks() {
 	if (waiting_for_first_scan) {
 		return; //scanning, do not touch docks
 	}
+	EditorLoadingScreen *loading = EditorLoadingScreen::get_singleton();
+	if (loading && loading->has_pending_scenes()) {
+		return; // Would save the open scenes list without the ones still loading.
+	}
 	Ref<ConfigFile> config;
 	config.instance();
 
@@ -4738,6 +4765,15 @@ void EditorNode::_load_open_scenes_from_config(Ref<ConfigFile> p_layout, const S
 	}
 
 	if (!p_layout->has_section(p_section) || !p_layout->has_section_key(p_section, "open_scenes")) {
+		return;
+	}
+
+	EditorLoadingScreen *loading = EditorLoadingScreen::get_singleton();
+	if (loading) {
+		Array to_open = p_layout->get_value(p_section, "open_scenes");
+		for (int i = 0; i < to_open.size(); i++) {
+			loading->queue_scene(to_open[i], true);
+		}
 		return;
 	}
 
@@ -7179,6 +7215,12 @@ EditorNode::EditorNode() {
 	FileAccess::set_file_close_fail_notify_callback(_file_access_close_error_notify);
 
 	waiting_for_first_scan = true;
+	loading_startup_scene = false;
+
+	// Added last so that it covers everything else.
+	if (!cmdline_export_mode && !OS::get_singleton()->is_no_window_mode_enabled()) {
+		gui_base->add_child(memnew(EditorLoadingScreen));
+	}
 
 	print_handler.printfunc = _print_handler;
 	print_handler.userdata = this;

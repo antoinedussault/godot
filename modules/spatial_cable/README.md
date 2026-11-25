@@ -104,3 +104,34 @@ Set `breakable = false` to make it shrug off hits (still emits `cable_hit`).
   `start_position` / `end_position` in the Inspector.
 - The strand is a chain of straight segments, not an analytic catenary; raise
   `cable_segments` for a smoother curve.
+
+## Physics backend compatibility
+
+Verified against all three `physics/3d/physics_engine` options in this fork
+(`DEFAULT`/GodotPhysics, Bullet, Box3D). `detect_shots` never touches the
+physics server at all (it just reads node positions), so it's identical on
+every backend. Collision (`collision_enabled` / `hit()` via your own raycasts)
+uses only scene-level `StaticBody`/`CollisionShape`/`CapsuleShape` — no
+backend-specific code in this module — but two backend quirks are worth
+knowing:
+
+- **`collision_mask` must stay non-zero.** GodotPhysics and Bullet ray/shape
+  queries only check the *target's* `collision_layer` against the query's own
+  mask — a body's own mask is irrelevant to being hit, so `collision_mask = 0`
+  is inert there. Box3D's query filter is bidirectional (Box2D-style: the
+  shape's own mask must *also* match the query's category), so a zero mask
+  silently makes the whole cable invisible to every ray/shape query under Box3D
+  specifically — `hit_radius`/`detect_shots` still work (no query involved),
+  but a weapon's own raycast never sees the cable. The default (`1`) is safe on
+  all three; just don't zero it out.
+- **Collision updates are pricier under Box3D and Bullet than GodotPhysics.**
+  Both rebuild every shape on a body on any single shape's transform/disable/data
+  change (Bullet: `reload_shapes()`; Box3D: `_body_rebuild_shapes()`), where
+  GodotPhysics updates one shape's slot in place. `_update_collision_shapes()`
+  repositions every capsule every frame while simulating, so a cable with N
+  collision capsules costs O(N) per-shape updates × O(N) rebuild = O(N²) shape
+  churn per frame on those two backends (e.g. 24 segments -> 576 shape
+  recreations/frame), versus O(N) on GodotPhysics. Not wrong, just something to
+  budget for with dense bundles (`cable_count` × `cable_segments`) under a
+  non-default backend — lower `cable_segments`, or turn off
+  `collision_enabled` and rely on `detect_shots` alone.

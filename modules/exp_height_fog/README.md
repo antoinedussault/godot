@@ -41,6 +41,9 @@ module. For almost all scenes this pass looks the same.
    - **Density** — thickness at the reference height.
    - **Falloff** — smaller = fog climbs higher; larger = hugs the ground.
    - **Ref Height** — the world Y treated as fog "sea level."
+   - **Ref Height Relative** — when on, **Ref Height** is an offset from the
+     camera's Y instead of an absolute world Y, so the fog "sea level" follows
+     the camera (density at eye level stays constant as you climb).
    - **Start Distance** — clear space near the camera.
    - **Max Opacity** — opacity ceiling.
    - **Inscatter** — fog color.

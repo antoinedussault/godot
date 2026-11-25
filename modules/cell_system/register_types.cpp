@@ -11,6 +11,7 @@
 #include "cell_terrain_manager.h"
 #include "cell_world.h"
 #include "cell_player_body.h"
+#include "cell_character_body.h"
 #include "cell_grid_visualizer.h"
 #include "terrain_brush.h"
 #include "terrain_path.h"
@@ -30,6 +31,7 @@
 #include "scene_transition.h"
 #include "scene_spawn_point.h"
 #include "scene_door.h"
+#include "world_location_area.h"
 
 // Items, recipes, categories + the pushable in-world item body.
 #include "cell_item_body.h"
@@ -57,6 +59,7 @@ void register_cell_system_types() {
 	ClassDB::register_class<Cell>();
 	ClassDB::register_class<CellWorld>();
 	ClassDB::register_class<CellPlayerBody>();
+	ClassDB::register_class<CellCharacterBody>();
 	ClassDB::register_class<CellGridVisualizer>();
 	ClassDB::register_class<TerrainBrush>();
 	ClassDB::register_class<TerrainPath>();
@@ -77,6 +80,7 @@ void register_cell_system_types() {
 	ClassDB::register_class<SceneTransition>();
 	ClassDB::register_class<SceneSpawnPoint>();
 	ClassDB::register_class<SceneDoor>();
+	ClassDB::register_class<WorldLocationArea>();
 
 	// Items / recipes / categories.
 	ClassDB::register_class<CellItemBody>();

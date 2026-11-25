@@ -191,7 +191,9 @@ void TexturePackerDialog::_on_confirmed() {
 		return;
 	}
 
-	if (EditorFileSystem::get_singleton()) EditorFileSystem::get_singleton()->scan();
+	// PNGs are imported resources, so they need the changes scan to queue a
+	// reimport; a full scan() would rebuild the entire res:// tree for two files.
+	if (EditorFileSystem::get_singleton()) EditorFileSystem::get_singleton()->scan_changes();
 
 	EditorNode::get_singleton()->show_warning(
 			"Packed:\n" + albedo_out + "\n" + normal_out +

@@ -1,0 +1,16 @@
+[gd_scene load_steps=2 format=2]
+
+[ext_resource path="res://probe.gd" type="Script" id=1]
+
+[node name="OldExterior" type="GameWorld"]
+
+[node name="CellTerrainManager" type="CellTerrainManager" parent="."]
+world_dir = "user://gwtest_legacy"
+cell_size = 32.0
+
+[node name="FoliageManager" type="FoliageManager" parent="."]
+world_dir = "user://gwtest_legacy"
+cell_size = 128.0
+
+[node name="Probe" type="Node" parent="."]
+script = ExtResource( 1 )

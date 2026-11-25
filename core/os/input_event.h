@@ -198,6 +198,9 @@ class InputEvent : public Resource {
 	GDCLASS(InputEvent, Resource);
 
 	int device;
+	// OS window this event originated from. Always MAIN_WINDOW_ID on single-window
+	// platforms and for events synthesized outside the platform layer.
+	int window;
 
 protected:
 	static void _bind_methods();
@@ -208,6 +211,9 @@ public:
 
 	void set_device(int p_device);
 	int get_device() const;
+
+	void set_window(int p_window);
+	int get_window() const;
 
 	bool is_action(const StringName &p_action, bool p_exact_match = false) const;
 	bool is_action_pressed(const StringName &p_action, bool p_allow_echo = false, bool p_exact_match = false) const;

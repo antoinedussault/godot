@@ -73,6 +73,14 @@ public:
 		DOF_BLUR_QUALITY_HIGH,
 	};
 
+	enum DynamicGIDebug {
+		DYNAMIC_GI_DEBUG_DISABLED,
+		DYNAMIC_GI_DEBUG_LIGHTING,
+		DYNAMIC_GI_DEBUG_ALBEDO,
+		DYNAMIC_GI_DEBUG_IRRADIANCE,
+		DYNAMIC_GI_DEBUG_SSGI,
+	};
+
 	enum SSAOBlur {
 		SSAO_BLUR_DISABLED,
 		SSAO_BLUR_1x1,
@@ -182,6 +190,7 @@ private:
 	float volumetric_fog_density;
 	float volumetric_fog_height_falloff;
 	float volumetric_fog_height_ref;
+	bool volumetric_fog_height_relative;
 	Color volumetric_fog_albedo;
 	Color volumetric_fog_ambient;
 	float volumetric_fog_sun_energy;
@@ -192,6 +201,48 @@ private:
 	float volumetric_fog_temporal_blend;
 
 	void _update_volumetric_fog();
+
+	// Dynamic GI and screen space GI.
+	bool dynamic_gi_enabled;
+	int dynamic_gi_cascades;
+	float dynamic_gi_voxel_size;
+	float dynamic_gi_energy;
+	float dynamic_gi_bounce_feedback;
+	float dynamic_gi_normal_bias;
+	float dynamic_gi_hysteresis;
+	int dynamic_gi_rays;
+	bool dynamic_gi_reflection_occlusion;
+	uint32_t dynamic_gi_cull_mask;
+	DynamicGIDebug dynamic_gi_debug;
+	bool ssgi_enabled;
+	float ssgi_radius;
+	float ssgi_intensity;
+	int ssgi_rays;
+	int ssgi_steps;
+	float ssgi_thickness;
+	float ssgi_temporal_blend;
+	bool ssgi_half_resolution;
+
+	void _update_dynamic_gi();
+	void _update_ssgi();
+
+	// ExpHeightFog (modules/exp_height_fog) ported onto Environment: a cheap
+	// single-pass analytic exponential height fog, no shadow sampling. The node
+	// still works standalone; this is its Environment home for the transition.
+	bool exp_height_fog_enabled;
+	float exp_height_fog_density;
+	float exp_height_fog_falloff;
+	float exp_height_fog_ref_height;
+	bool exp_height_fog_ref_height_relative;
+	float exp_height_fog_start_distance;
+	float exp_height_fog_max_opacity;
+	Color exp_height_fog_inscatter;
+	bool exp_height_fog_directional_enabled;
+	Color exp_height_fog_directional_color;
+	Vector3 exp_height_fog_light_direction;
+	float exp_height_fog_directional_exponent;
+
+	void _update_exp_height_fog();
 
 protected:
 	static void _bind_methods();
@@ -432,6 +483,8 @@ public:
 	float get_volumetric_fog_height_falloff() const;
 	void set_volumetric_fog_height_ref(float p_ref);
 	float get_volumetric_fog_height_ref() const;
+	void set_volumetric_fog_height_relative(bool p_relative);
+	bool is_volumetric_fog_height_relative() const;
 	void set_volumetric_fog_albedo(const Color &p_albedo);
 	Color get_volumetric_fog_albedo() const;
 	void set_volumetric_fog_ambient(const Color &p_ambient);
@@ -449,6 +502,70 @@ public:
 	void set_volumetric_fog_temporal_blend(float p_blend);
 	float get_volumetric_fog_temporal_blend() const;
 
+	void set_dynamic_gi_enabled(bool p_value);
+	bool is_dynamic_gi_enabled() const;
+	void set_dynamic_gi_cascades(int p_value);
+	int get_dynamic_gi_cascades() const;
+	void set_dynamic_gi_voxel_size(float p_value);
+	float get_dynamic_gi_voxel_size() const;
+	void set_dynamic_gi_energy(float p_value);
+	float get_dynamic_gi_energy() const;
+	void set_dynamic_gi_bounce_feedback(float p_value);
+	float get_dynamic_gi_bounce_feedback() const;
+	void set_dynamic_gi_normal_bias(float p_value);
+	float get_dynamic_gi_normal_bias() const;
+	void set_dynamic_gi_hysteresis(float p_value);
+	float get_dynamic_gi_hysteresis() const;
+	void set_dynamic_gi_rays(int p_value);
+	int get_dynamic_gi_rays() const;
+	void set_dynamic_gi_reflection_occlusion(bool p_value);
+	bool is_dynamic_gi_reflection_occlusion() const;
+	void set_dynamic_gi_cull_mask(uint32_t p_value);
+	uint32_t get_dynamic_gi_cull_mask() const;
+	void set_dynamic_gi_debug(DynamicGIDebug p_value);
+	DynamicGIDebug get_dynamic_gi_debug() const;
+	void set_ssgi_enabled(bool p_value);
+	bool is_ssgi_enabled() const;
+	void set_ssgi_radius(float p_value);
+	float get_ssgi_radius() const;
+	void set_ssgi_intensity(float p_value);
+	float get_ssgi_intensity() const;
+	void set_ssgi_rays(int p_value);
+	int get_ssgi_rays() const;
+	void set_ssgi_steps(int p_value);
+	int get_ssgi_steps() const;
+	void set_ssgi_thickness(float p_value);
+	float get_ssgi_thickness() const;
+	void set_ssgi_temporal_blend(float p_value);
+	float get_ssgi_temporal_blend() const;
+	void set_ssgi_half_resolution(bool p_value);
+	bool is_ssgi_half_resolution() const;
+
+	void set_exp_height_fog_enabled(bool p_enabled);
+	bool is_exp_height_fog_enabled() const;
+	void set_exp_height_fog_density(float p_density);
+	float get_exp_height_fog_density() const;
+	void set_exp_height_fog_falloff(float p_falloff);
+	float get_exp_height_fog_falloff() const;
+	void set_exp_height_fog_ref_height(float p_ref_height);
+	float get_exp_height_fog_ref_height() const;
+	void set_exp_height_fog_ref_height_relative(bool p_relative);
+	bool is_exp_height_fog_ref_height_relative() const;
+	void set_exp_height_fog_start_distance(float p_distance);
+	float get_exp_height_fog_start_distance() const;
+	void set_exp_height_fog_max_opacity(float p_opacity);
+	float get_exp_height_fog_max_opacity() const;
+	void set_exp_height_fog_inscatter(const Color &p_color);
+	Color get_exp_height_fog_inscatter() const;
+	void set_exp_height_fog_directional_enabled(bool p_enabled);
+	bool is_exp_height_fog_directional_enabled() const;
+	void set_exp_height_fog_directional_color(const Color &p_color);
+	Color get_exp_height_fog_directional_color() const;
+	void set_exp_height_fog_light_direction(const Vector3 &p_dir);
+	Vector3 get_exp_height_fog_light_direction() const;
+	void set_exp_height_fog_directional_exponent(float p_exponent);
+	float get_exp_height_fog_directional_exponent() const;
+
 	virtual RID get_rid() const;
 
 	Environment();
@@ -460,6 +577,7 @@ VARIANT_ENUM_CAST(Environment::ToneMapper)
 VARIANT_ENUM_CAST(Environment::GlowBlendMode)
 VARIANT_ENUM_CAST(Environment::DOFBlurQuality)
 VARIANT_ENUM_CAST(Environment::SSAOQuality)
+VARIANT_ENUM_CAST(Environment::DynamicGIDebug)
 VARIANT_ENUM_CAST(Environment::SSAOBlur)
 
 #endif // ENVIRONMENT_H

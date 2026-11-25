@@ -61,6 +61,13 @@ public:
 		String fragment_global;
 		String fragment;
 		String light;
+		String tess_control_global;
+		String tess_control;
+		String tess_eval_global;
+		String tess_eval;
+		// True when the shader declares either tessellation stage; drives the
+		// USE_TESSELLATION shader conditional and the GL_PATCHES draw path.
+		bool uses_tessellation;
 
 		bool uses_fragment_time;
 		bool uses_vertex_time;
@@ -84,6 +91,8 @@ private:
 	StringName vertex_name;
 	StringName fragment_name;
 	StringName light_name;
+	StringName tess_control_name;
+	StringName tess_eval_name;
 	StringName time_name;
 
 	Set<StringName> used_name_defines;

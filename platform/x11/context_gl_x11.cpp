@@ -185,15 +185,15 @@ Error ContextGL_X11::initialize() {
 		} break;
 		case GLES_3_0_COMPATIBLE: {
 			static int context_attribs[] = {
-				GLX_CONTEXT_MAJOR_VERSION_ARB, 3,
-				GLX_CONTEXT_MINOR_VERSION_ARB, 3,
+				GLX_CONTEXT_MAJOR_VERSION_ARB, 4,
+				GLX_CONTEXT_MINOR_VERSION_ARB, 6,
 				GLX_CONTEXT_PROFILE_MASK_ARB, GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
 				GLX_CONTEXT_FLAGS_ARB, GLX_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB /*|GLX_CONTEXT_DEBUG_BIT_ARB*/,
 				None
 			};
 
 			p->glx_context = glXCreateContextAttribsARB(x11_display, fbconfig, nullptr, true, context_attribs);
-			ERR_FAIL_COND_V(ctxErrorOccurred || !p->glx_context, ERR_UNCONFIGURED);
+			ERR_FAIL_COND_V_MSG(ctxErrorOccurred || !p->glx_context, ERR_UNCONFIGURED, "Could not create an OpenGL 4.6 core context. This engine requires OpenGL 4.6 (for tessellation and compute); your video card or driver reports a lower version. Update your graphics drivers, or use the GLES2 renderer.");
 			p->glx_context_offscreen = glXCreateContextAttribsARB(x11_display, fbconfig, nullptr, true, context_attribs);
 		} break;
 	}

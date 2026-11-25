@@ -1,151 +1,168 @@
 #include "cell_player_body.h"
 
 #include "cell_terrain_manager.h"
-#include "cell_world.h"
 #include "core/engine.h"
-#include "scene/3d/camera.h"
-#include "scene/main/viewport.h"
+#include "core/list.h"
+#include "game_world.h"
+#include "scene/main/scene_tree.h"
 
 CellPlayerBody::CellPlayerBody() {}
-
-Camera *CellPlayerBody::_get_active_camera() const {
-	if (!is_inside_tree()) return nullptr;
-	Viewport *vp = const_cast<CellPlayerBody *>(this)->get_viewport();
-	return vp ? vp->get_camera() : nullptr;
-}
-
-Vector3 CellPlayerBody::_get_stream_pos() const {
-	Camera *cam = _get_active_camera();
-	return cam ? cam->get_global_transform().origin : get_global_transform().origin;
-}
-
-void CellPlayerBody::set_cell_size(float s) { cell_size = s; }
-float CellPlayerBody::get_cell_size() const { return cell_size; }
 
 void CellPlayerBody::set_terrain_manager_path(const NodePath &p) { terrain_manager_path = p; }
 NodePath CellPlayerBody::get_terrain_manager_path() const { return terrain_manager_path; }
 
-void CellPlayerBody::set_cell_world_path(const NodePath &p) { cell_world_path = p; }
-NodePath CellPlayerBody::get_cell_world_path() const { return cell_world_path; }
-
-CellTerrainManager *CellPlayerBody::_get_terrain_manager() const {
-	if (terrain_manager_path.is_empty()) return nullptr;
-	Node *n = get_node_or_null(terrain_manager_path);
-	return Object::cast_to<CellTerrainManager>(n);
+GameWorld *CellPlayerBody::_get_world() {
+	GameWorld *w = Object::cast_to<GameWorld>(ObjectDB::get_instance(_world_id));
+	if (w && w->is_inside_tree()) {
+		return w;
+	}
+	_world_id = 0;
+	if (!is_inside_tree()) {
+		return nullptr;
+	}
+	// The player usually lives in an autoload, OUTSIDE the world scene, and the
+	// world is swapped under it on every scene change - so this is looked up
+	// through a group rather than a path, and looked up again whenever the one
+	// we knew has gone.
+	List<Node *> worlds;
+	get_tree()->get_nodes_in_group("game_worlds", &worlds);
+	GameWorld *first = nullptr;
+	for (List<Node *>::Element *E = worlds.front(); E; E = E->next()) {
+		GameWorld *g = Object::cast_to<GameWorld>(E->get());
+		if (!g) {
+			continue;
+		}
+		if (g->is_a_parent_of(this)) {
+			first = g; // the one we are actually inside wins
+			break;
+		}
+		if (!first) {
+			first = g;
+		}
+	}
+	if (first) {
+		_world_id = first->get_instance_id();
+	}
+	return first;
 }
 
-CellWorld *CellPlayerBody::_get_cell_world() const {
-	if (cell_world_path.is_empty()) return nullptr;
-	Node *n = get_node_or_null(cell_world_path);
-	return Object::cast_to<CellWorld>(n);
+Node *CellPlayerBody::get_game_world() {
+	return _get_world();
+}
+
+CellTerrainManager *CellPlayerBody::_get_fallback_terrain() const {
+	if (terrain_manager_path.is_empty()) {
+		return nullptr;
+	}
+	return Object::cast_to<CellTerrainManager>(get_node_or_null(terrain_manager_path));
+}
+
+bool CellPlayerBody::_ground_ready(const Vector3 &p_pos) {
+	GameWorld *w = _get_world();
+	if (w) {
+		return w->is_ground_ready(p_pos);
+	}
+	CellTerrainManager *tm = _get_fallback_terrain();
+	return !tm || tm->get_cell_at_world(p_pos) != nullptr;
+}
+
+void CellPlayerBody::_ensure_ground(const Vector3 &p_pos) {
+	GameWorld *w = _get_world();
+	if (w) {
+		// Terrain only. prime() would also start taking objects out of the
+		// tree, and this runs from _ready - while the scene is still handing
+		// out _ready calls and its nodes may not be removed.
+		w->ensure_ground(p_pos);
+		return;
+	}
+	CellTerrainManager *tm = _get_fallback_terrain();
+	if (tm) {
+		tm->ensure_collision_at_world(p_pos);
+	}
+}
+
+bool CellPlayerBody::is_terrain_loaded() {
+	return is_inside_tree() && _ground_ready(get_global_transform().origin);
 }
 
 void CellPlayerBody::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_READY: {
 			if (!Engine::get_singleton()->is_editor_hint()) {
-				// Synchronously load the spawn cell so the player lands on solid
-				// ground immediately instead of falling through an unloaded chunk.
-				CellTerrainManager *mgr = _get_terrain_manager();
-				if (mgr) {
-					Vector3 pos = _get_stream_pos();
-					int cx = (int)Math::floor(pos.x / cell_size);
-					int cz = (int)Math::floor(pos.z / cell_size);
-					mgr->ensure_cell_sync(cx, cz);
-				}
+				// Build what is under us before the first physics step.
+				_ensure_ground(get_global_transform().origin);
 			}
 			set_physics_process(true);
 		} break;
 
 		case NOTIFICATION_PHYSICS_PROCESS: {
-			if (Engine::get_singleton()->is_editor_hint()) break;
-
-			// Track our own velocity from the transform delta so pushable
-			// CellItemBody props know how hard we're leaning into them.
-			{
-				float dt = get_physics_process_delta_time();
-				Vector3 cur = get_global_transform().origin;
-				if (_has_last_pos && dt > 0.0f) {
-					_linear_velocity = (cur - _last_pos) / dt;
-				}
-				_last_pos = cur;
-				_has_last_pos = true;
+			if (Engine::get_singleton()->is_editor_hint()) {
+				break;
 			}
+			const Vector3 pos = get_global_transform().origin;
 
-			Vector3 pos = _get_stream_pos();
-			int cx = (int)Math::floor(pos.x / cell_size);
-			int cz = (int)Math::floor(pos.z / cell_size);
+			// Velocity from the transform delta, for pushable props.
+			const float dt = get_physics_process_delta_time();
+			if (_has_last_pos && dt > 0.0f) {
+				_linear_velocity = (pos - _last_pos) / dt;
+			}
+			_last_pos = pos;
+			_has_last_pos = true;
 
-			bool changed = (!_has_cell || cx != _cell_x || cz != _cell_z);
-
-			if (changed) {
-				int old_x = _cell_x;
-				int old_z = _cell_z;
+			// Cell tracking on the world's grid - the same grid everything else
+			// uses, so these indices mean the same thing to every node.
+			GameWorld *w = _get_world();
+			int cx = _cell_x, cz = _cell_z;
+			if (w) {
+				w->world_to_cell_i(pos, cx, cz);
+			} else {
+				CellTerrainManager *tm = _get_fallback_terrain();
+				const float cs = tm ? MAX(1.0f, tm->get_cell_size()) : 64.0f;
+				cx = (int)Math::floor(pos.x / cs);
+				cz = (int)Math::floor(pos.z / cs);
+			}
+			if (!_has_cell || cx != _cell_x || cz != _cell_z) {
+				const int old_x = _cell_x, old_z = _cell_z;
 				_cell_x = cx;
 				_cell_z = cz;
 				_has_cell = true;
-
-				// Drive terrain streaming directly.
-				CellTerrainManager *mgr = _get_terrain_manager();
-				if (mgr) {
-					mgr->stream_to(pos);
-					// If collision for the new cell isn't ready yet, freeze this node
-					// until it is. NOTIFICATION_PROCESS re-enables physics once loaded.
-					if (!mgr->get_cell(_cell_x, _cell_z)) {
-						_waiting_for_cell = true;
-						set_physics_process(false);
-						set_process(true);
-					}
-				}
-
-				// Drive object streaming.
-				CellWorld *cw = _get_cell_world();
-				if (cw) {
-					cw->stream_around(cx, cz);
-				}
-
 				emit_signal("cell_changed", cx, cz, old_x, old_z);
+
+				// Outran the streamer (teleport, very fast vehicle): stand still
+				// until the ground is there. Asked by WORLD position, about where
+				// the BODY is - the place it would fall from.
+				if (!_ground_ready(pos)) {
+					_waiting_for_ground = true;
+					set_physics_process(false);
+					set_process(true);
+				}
 			}
 		} break;
 
 		case NOTIFICATION_PROCESS: {
-			if (_waiting_for_cell) {
-				CellTerrainManager *mgr = _get_terrain_manager();
-				if (!mgr || mgr->get_cell(_cell_x, _cell_z)) {
-					_waiting_for_cell = false;
-					set_process(false);
-					set_physics_process(true);
-				}
+			if (_waiting_for_ground && _ground_ready(get_global_transform().origin)) {
+				_waiting_for_ground = false;
+				set_process(false);
+				set_physics_process(true);
 			}
 		} break;
 	}
 }
 
-bool CellPlayerBody::is_terrain_loaded() const {
-	if (!_has_cell) return false;
-	CellTerrainManager *mgr = _get_terrain_manager();
-	return mgr && mgr->get_cell(_cell_x, _cell_z) != nullptr;
-}
-
 void CellPlayerBody::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("set_cell_size", "s"), &CellPlayerBody::set_cell_size);
-	ClassDB::bind_method(D_METHOD("get_cell_size"), &CellPlayerBody::get_cell_size);
 	ClassDB::bind_method(D_METHOD("set_terrain_manager_path", "p"), &CellPlayerBody::set_terrain_manager_path);
 	ClassDB::bind_method(D_METHOD("get_terrain_manager_path"), &CellPlayerBody::get_terrain_manager_path);
-	ClassDB::bind_method(D_METHOD("set_cell_world_path", "p"), &CellPlayerBody::set_cell_world_path);
-	ClassDB::bind_method(D_METHOD("get_cell_world_path"), &CellPlayerBody::get_cell_world_path);
 	ClassDB::bind_method(D_METHOD("get_cell_x"), &CellPlayerBody::get_cell_x);
 	ClassDB::bind_method(D_METHOD("get_cell_z"), &CellPlayerBody::get_cell_z);
 	ClassDB::bind_method(D_METHOD("is_terrain_loaded"), &CellPlayerBody::is_terrain_loaded);
+	ClassDB::bind_method(D_METHOD("get_game_world"), &CellPlayerBody::get_game_world);
 	ClassDB::bind_method(D_METHOD("get_linear_velocity"), &CellPlayerBody::get_linear_velocity);
 
-	ADD_PROPERTY(PropertyInfo(Variant::REAL, "cell_size"), "set_cell_size", "get_cell_size");
-	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "terrain_manager_path"), "set_terrain_manager_path", "get_terrain_manager_path");
-	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "cell_world_path"), "set_cell_world_path", "get_cell_world_path");
+	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "terrain_manager_path", PROPERTY_HINT_NODE_PATH_VALID_TYPES, "CellTerrainManager"), "set_terrain_manager_path", "get_terrain_manager_path");
 
 	ADD_SIGNAL(MethodInfo("cell_changed",
-		PropertyInfo(Variant::INT, "new_x"),
-		PropertyInfo(Variant::INT, "new_z"),
-		PropertyInfo(Variant::INT, "old_x"),
-		PropertyInfo(Variant::INT, "old_z")));
+			PropertyInfo(Variant::INT, "new_x"),
+			PropertyInfo(Variant::INT, "new_z"),
+			PropertyInfo(Variant::INT, "old_x"),
+			PropertyInfo(Variant::INT, "old_z")));
 }

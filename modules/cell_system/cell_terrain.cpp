@@ -23,7 +23,11 @@ void CellTerrain::set_cell_size(float s) { cell_size = s; }
 float CellTerrain::get_cell_size() const { return cell_size; }
 void CellTerrain::set_height_scale(float s) { height_scale = s; }
 float CellTerrain::get_height_scale() const { return height_scale; }
-void CellTerrain::set_lod_level(int l) { lod_level = CLAMP(l, 0, 3); }
+// Upper bound is what the grid can actually represent: each level halves the
+// step, so verts_per_side=65 (seg=64) tops out at level 6 (a 2x2 quad). The
+// mesh builder clamps step to seg as well, so an out-of-range level degrades to
+// the coarsest valid mesh instead of producing a degenerate one.
+void CellTerrain::set_lod_level(int l) { lod_level = CLAMP(l, 0, 8); }
 int CellTerrain::get_lod_level() const { return lod_level; }
 void CellTerrain::set_skirt_depth(float d) { skirt_depth = d; }
 float CellTerrain::get_skirt_depth() const { return skirt_depth; }
@@ -44,6 +48,21 @@ void CellTerrain::set_shader_debug_view(int mode) {
 		_material_inst->set_shader_param("debug_view", shader_debug_view);
 		if (mode == 3) _material_inst->set_shader_param("nav_mask_map", nav_mask_tex);
 	}
+}
+
+void CellTerrain::set_shader_height_blend(float v) {
+	shader_height_blend = v;
+	if (_material_inst.is_valid()) _material_inst->set_shader_param("height_blend_sharpness", shader_height_blend);
+}
+
+void CellTerrain::set_shader_texture_scale(float v) {
+	shader_texture_scale = v;
+	if (_material_inst.is_valid()) _material_inst->set_shader_param("texture_scale", shader_texture_scale);
+}
+
+void CellTerrain::set_shader_detail_normal_strength(float v) {
+	shader_detail_normal_strength = v;
+	if (_material_inst.is_valid()) _material_inst->set_shader_param("detail_normal_strength", shader_detail_normal_strength);
 }
 
 void CellTerrain::set_shader_parallax_max_distance(float d) {
@@ -78,6 +97,11 @@ void CellTerrain::_ensure_nav_mask() {
 }
 
 void CellTerrain::set_nav_mask(const PoolRealArray &p_mask) { nav_mask = p_mask; _nav_dirty = true; }
+// Obstacles come from FoliageManager when rock/tree placement changes and are
+// consumed by the next navmesh build, so this only has to mark nav dirty --
+// collision and the render mesh are unaffected (see
+// CellTerrainManager::set_cell_nav_obstacles).
+void CellTerrain::set_nav_obstacles(const PoolRealArray &p_obstacles) { nav_obstacles = p_obstacles; _nav_dirty = true; }
 PoolRealArray CellTerrain::get_nav_mask() const { return nav_mask; }
 
 float CellTerrain::get_nav_mask_at(int lx, int lz) const {
@@ -91,6 +115,100 @@ void CellTerrain::set_nav_mask_at(int lx, int lz, float v) {
 	PoolRealArray::Write w = nav_mask.write();
 	w[lz * verts_per_side + lx] = CLAMP(v, 0.0f, 1.0f);
 	_nav_dirty = true;
+}
+
+void CellTerrain::_ensure_hole_mask() {
+	if (hole_mask.size() == verts_per_side * verts_per_side) return;
+	hole_mask.resize(verts_per_side * verts_per_side);
+	PoolRealArray::Write w = hole_mask.write();
+	for (int i = 0; i < hole_mask.size(); i++) w[i] = 1.0f; // unpainted == solid
+}
+
+void CellTerrain::set_hole_mask(const PoolRealArray &p_mask) {
+	hole_mask = p_mask;
+	// A hole removes geometry, so unlike the nav mask this invalidates the
+	// render mesh and the collision shape as well as the navmesh.
+	_nav_dirty = true;
+}
+PoolRealArray CellTerrain::get_hole_mask() const { return hole_mask; }
+
+float CellTerrain::get_hole_at(int lx, int lz) const {
+	if (hole_mask.size() != verts_per_side * verts_per_side) return 1.0f;
+	lx = CLAMP(lx, 0, verts_per_side - 1); lz = CLAMP(lz, 0, verts_per_side - 1);
+	return hole_mask[lz * verts_per_side + lx];
+}
+void CellTerrain::set_hole_at(int lx, int lz, float v) {
+	if (lx < 0 || lx >= verts_per_side || lz < 0 || lz >= verts_per_side) return;
+	_ensure_hole_mask();
+	PoolRealArray::Write w = hole_mask.write();
+	w[lz * verts_per_side + lx] = CLAMP(v, 0.0f, 1.0f);
+	_nav_dirty = true;
+}
+
+bool CellTerrain::has_holes() const {
+	if (hole_mask.size() != verts_per_side * verts_per_side) return false;
+	PoolRealArray::Read r = hole_mask.read();
+	for (int i = 0; i < hole_mask.size(); i++) {
+		if (r[i] < 0.5f) return true;
+	}
+	return false;
+}
+
+// ---------------------------------------------------------- painted colour
+void CellTerrain::_ensure_color_map() {
+	if (color_map.is_valid() && color_map->get_width() == verts_per_side && color_map->get_height() == verts_per_side) return;
+	color_map.instance();
+	color_map->create(verts_per_side, verts_per_side, false, Image::FORMAT_RGBA8);
+	color_map->fill(Color(1, 1, 1, 1)); // white multiplies to no change
+	color_map->lock();
+	color_map->unlock();
+}
+
+Ref<Image> CellTerrain::get_color_map() const { return color_map; }
+void CellTerrain::set_color_map(const Ref<Image> &p_img) {
+	color_map = p_img;
+	// Force the next _apply_material() to re-upload rather than keep a texture
+	// pointing at the previous cell's image.
+	color_map_tex = Ref<ImageTexture>();
+}
+
+void CellTerrain::update_color_texture() {
+	Ref<Image> src = color_map;
+	if (src.is_null()) {
+		// Unpainted. Bind a tiny white image rather than allocating a full
+		// per-cell map: an UNBOUND sampler2D samples black, and the shader
+		// MULTIPLIES by this, so leaving it unbound turns the cell black.
+		src.instance();
+		src->create(4, 4, false, Image::FORMAT_RGBA8);
+		src->fill(Color(1, 1, 1, 1));
+	}
+	if (color_map_tex.is_null() || color_map_tex->get_width() != src->get_width() ||
+			color_map_tex->get_height() != src->get_height()) {
+		// ImageTexture::set_data cannot change dimensions, so the first paint
+		// (4x4 white -> full-size map) has to recreate.
+		color_map_tex.instance();
+		color_map_tex->create_from_image(src, Texture::FLAG_FILTER);
+	} else {
+		// In place, so a paint stroke does not reallocate the texture per frame
+		// (same reasoning as update_splatmap_textures).
+		color_map_tex->set_data(src);
+	}
+	if (_material_inst.is_valid()) _material_inst->set_shader_param("color_map", color_map_tex);
+}
+
+void CellTerrain::paint_color_at(int lx, int lz, const Color &p_color, float p_strength) {
+	if (lx < 0 || lx >= verts_per_side || lz < 0 || lz >= verts_per_side) return;
+	_ensure_color_map();
+	const float t = CLAMP(p_strength, 0.0f, 1.0f);
+	if (t <= 0.0f) return;
+	color_map->lock();
+	Color cur = color_map->get_pixel(lx, lz);
+	color_map->set_pixel(lx, lz, Color(
+			Math::lerp(cur.r, p_color.r, t),
+			Math::lerp(cur.g, p_color.g, t),
+			Math::lerp(cur.b, p_color.b, t),
+			1.0f));
+	color_map->unlock();
 }
 
 void CellTerrain::set_material(const Ref<Material> &m) { material = m; _material_inst = Ref<ShaderMaterial>(); }
@@ -176,6 +294,11 @@ CellTerrain::ComputeInput CellTerrain::_make_compute_input() const {
 	in.heights = heights;
 	in.edge_n = edge_n; in.edge_s = edge_s; in.edge_e = edge_e; in.edge_w = edge_w;
 	in.nav_mask = nav_mask; // may be empty (unpainted) — _mask_at_s treats that as "fully navigable"
+	in.hole_mask = hole_mask; // may be empty (unpainted) — _hole_at_s treats that as "solid"
+	// Without this the whole foliage-obstacle path is dead: FoliageManager
+	// stamps rocks into CellTerrain::nav_obstacles, but compute() never saw
+	// them, so no rock ever carved the navmesh.
+	in.nav_obstacles = nav_obstacles;
 	in.verts_per_side = verts_per_side;
 	in.cell_size = cell_size;
 	in.height_scale = height_scale;
@@ -204,6 +327,26 @@ float CellTerrain::_mask_at_s(const ComputeInput &in, int x, int z) {
 	return in.nav_mask[z * vps + x];
 }
 
+float CellTerrain::_hole_at_s(const ComputeInput &in, int x, int z) {
+	const int vps = in.verts_per_side;
+	if (in.hole_mask.size() != vps * vps) return 1.0f; // unpainted == solid
+	x = CLAMP(x, 0, vps - 1); z = CLAMP(z, 0, vps - 1);
+	return in.hole_mask[z * vps + x];
+}
+
+bool CellTerrain::_quad_is_hole_s(const ComputeInput &in, int lod_x, int lod_z, int step) {
+	if (in.hole_mask.size() != in.verts_per_side * in.verts_per_side) return false;
+	// Test the four heightmap samples this quad is actually built from - the
+	// same ones _height_sampled_s reads - so the cut-out follows the mesh at
+	// every LOD instead of drifting off it. A quad goes if ANY corner is holed:
+	// erring toward removing geometry keeps the opening clear rather than
+	// leaving a tooth hanging into it.
+	const int x0 = lod_x * step, x1 = (lod_x + 1) * step;
+	const int z0 = lod_z * step, z1 = (lod_z + 1) * step;
+	return _hole_at_s(in, x0, z0) < 0.5f || _hole_at_s(in, x1, z0) < 0.5f ||
+			_hole_at_s(in, x0, z1) < 0.5f || _hole_at_s(in, x1, z1) < 0.5f;
+}
+
 float CellTerrain::_height_sampled_s(const ComputeInput &in, int lod_x, int lod_z, int step) {
 	int hx = CLAMP(lod_x * step, 0, in.verts_per_side - 1);
 	int hz = CLAMP(lod_z * step, 0, in.verts_per_side - 1);
@@ -224,9 +367,27 @@ Vector3 CellTerrain::_sample_normal_s(const ComputeInput &in, int lod_x, int lod
 // --- LOD mesh with skirts (pure compute) ---
 Array CellTerrain::_build_mesh_arrays_s(const ComputeInput &in) {
 	const int vps = in.verts_per_side;
-	const int step = 1 << in.lod_level;
 	const int seg = vps - 1;
+	// Clamp so a high LOD level cannot decimate past a single quad: without
+	// this, step > seg gives lod_vps = 1 and a degenerate (empty) mesh.
+	int step = 1 << in.lod_level;
+	if (step > seg) step = seg;
+	if (step < 1) step = 1;
 	const int lod_vps = seg / step + 1; // vertices per side at this LOD
+
+	// Skirt depth MUST scale with the LOD step.
+	//
+	// There is no edge stitching in this builder - _height_sampled_s() reads
+	// only this cell's own heightmap, and the edge_* arrays are not consulted
+	// here - so the ONLY thing hiding a seam against a neighbour at a different
+	// LOD is the skirt hanging below the edge.
+	//
+	// A coarse cell interpolates linearly across step*spacing metres, so its
+	// deviation from the real surface grows linearly with step. A fixed 4-unit
+	// skirt covers LOD 0-1 and then silently fails: at LOD 5 the mesh spans 32m
+	// per segment and can sit tens of units off the true ground on a slope,
+	// leaving an open gap with the skirt's dark underside showing through.
+	const float lod_skirt_depth = in.skirt_depth * (float)step;
 	const float full_spacing = in.cell_size / (float)seg;
 
 	// Surface vertices.
@@ -273,7 +434,7 @@ Array CellTerrain::_build_mesh_arrays_s(const ComputeInput &in) {
 		for (int lx = 0; lx < lod_vps; lx++, si++) {
 			int hx = lx * step;
 			float y = _height_sampled_s(in, lx, 0, step);
-			vw[si] = Vector3(hx * full_spacing, y - in.skirt_depth, 0);
+			vw[si] = Vector3(hx * full_spacing, y - lod_skirt_depth, 0);
 			nw[si] = Vector3(0, 0, -1);
 			uw[si] = Vector2((float)hx / seg, 0);
 			tw[si*4+0] = 1; tw[si*4+1] = 0; tw[si*4+2] = 0; tw[si*4+3] = -1;
@@ -282,7 +443,7 @@ Array CellTerrain::_build_mesh_arrays_s(const ComputeInput &in) {
 		for (int lx = 0; lx < lod_vps; lx++, si++) {
 			int hx = lx * step, hz = (lod_vps - 1) * step;
 			float y = _height_sampled_s(in, lx, lod_vps - 1, step);
-			vw[si] = Vector3(hx * full_spacing, y - in.skirt_depth, hz * full_spacing);
+			vw[si] = Vector3(hx * full_spacing, y - lod_skirt_depth, hz * full_spacing);
 			nw[si] = Vector3(0, 0, 1);
 			uw[si] = Vector2((float)hx / seg, (float)hz / seg);
 			tw[si*4+0] = 1; tw[si*4+1] = 0; tw[si*4+2] = 0; tw[si*4+3] = -1;
@@ -291,7 +452,7 @@ Array CellTerrain::_build_mesh_arrays_s(const ComputeInput &in) {
 		for (int lz = 0; lz < lod_vps; lz++, si++) {
 			int hz = lz * step;
 			float y = _height_sampled_s(in, 0, lz, step);
-			vw[si] = Vector3(0, y - in.skirt_depth, hz * full_spacing);
+			vw[si] = Vector3(0, y - lod_skirt_depth, hz * full_spacing);
 			nw[si] = Vector3(-1, 0, 0);
 			uw[si] = Vector2(0, (float)hz / seg);
 			tw[si*4+0] = 1; tw[si*4+1] = 0; tw[si*4+2] = 0; tw[si*4+3] = -1;
@@ -300,17 +461,20 @@ Array CellTerrain::_build_mesh_arrays_s(const ComputeInput &in) {
 		for (int lz = 0; lz < lod_vps; lz++, si++) {
 			int hx = (lod_vps - 1) * step, hz = lz * step;
 			float y = _height_sampled_s(in, lod_vps - 1, lz, step);
-			vw[si] = Vector3(hx * full_spacing, y - in.skirt_depth, hz * full_spacing);
+			vw[si] = Vector3(hx * full_spacing, y - lod_skirt_depth, hz * full_spacing);
 			nw[si] = Vector3(1, 0, 0);
 			uw[si] = Vector2((float)hx / seg, (float)hz / seg);
 			tw[si*4+0] = 1; tw[si*4+1] = 0; tw[si*4+2] = 0; tw[si*4+3] = -1;
 		}
 	}
 
-	// Surface indices.
+	// Surface indices. Sized for a full grid and trimmed afterwards, because
+	// painted holes remove quads (see _quad_is_hole_s) and the final count is
+	// only known once the loop has run.
 	int quad_count = (lod_vps - 1) * (lod_vps - 1);
 	int skirt_quads = 4 * (lod_vps - 1);
 	PoolIntArray indices; indices.resize((quad_count + skirt_quads) * 6);
+	int index_count = 0;
 	{
 		PoolIntArray::Write iw = indices.write();
 		int t = 0;
@@ -318,6 +482,10 @@ Array CellTerrain::_build_mesh_arrays_s(const ComputeInput &in) {
 		// Surface triangles.
 		for (int lz = 0; lz < lod_vps - 1; lz++) {
 			for (int lx = 0; lx < lod_vps - 1; lx++) {
+				// Painted hole: emit no triangles here. The vertices stay in the
+				// buffer (unreferenced verts are harmless and keep the index
+				// arithmetic below trivial); only the quad disappears.
+				if (_quad_is_hole_s(in, lx, lz, step)) continue;
 				int i0 = lz * lod_vps + lx;
 				int i1 = i0 + 1;
 				int i2 = i0 + lod_vps;
@@ -361,7 +529,11 @@ Array CellTerrain::_build_mesh_arrays_s(const ComputeInput &in) {
 			iw[t++] = top0; iw[t++] = bot0; iw[t++] = top1;
 			iw[t++] = top1; iw[t++] = bot0; iw[t++] = bot1;
 		}
+		index_count = t;
 	}
+	// Trim the unused tail left by skipped quads. Must happen after the Write
+	// above is released.
+	if (index_count != indices.size()) indices.resize(index_count);
 
 	Array arrays; arrays.resize(Mesh::ARRAY_MAX);
 	arrays[Mesh::ARRAY_VERTEX]  = vertices;
@@ -405,12 +577,46 @@ void CellTerrain::_build_navmesh_data_s(const ComputeInput &in, PoolVector3Array
 		}
 	}
 
+	// Foliage obstacles (rocks and anything else with a nav_obstacle_radius),
+	// already converted to this cell's local space by
+	// FoliageManager::refresh_nav_obstacles.
+	const int obstacle_count = in.nav_obstacles.size() / 3;
+	PoolRealArray::Read obstacles = in.nav_obstacles.read();
+
 	Vector<Vector<int> > polys;
 	const float slope_cos = Math::cos(Math::deg2rad(in.nav_max_slope_deg));
+	const float quad_extent = step * full_spacing;
 	for (int lz = 0; lz < lod_vps - 1; lz++) {
 		for (int lx = 0; lx < lod_vps - 1; lx++) {
 			if (_sample_normal_s(in, lx, lz, step).y < slope_cos) continue; // too steep — leave a hole
-			if (_mask_at_s(in, lx * step, lz * step) < 0.5f) continue; // manually excluded — leave a hole
+			if (_quad_is_hole_s(in, lx, lz, step)) continue; // painted hole: no ground here at all
+			if (_mask_at_s(in, lx * step, lz * step) < 0.5f) continue; // manually excluded
+
+			// Drop the quad if ANY obstacle disc touches it - a circle/rect
+			// overlap test, not a centre-in-circle one. A nav quad is
+			// nav_downsample times coarser than the render grid (4m at the
+			// defaults), so a rock smaller than that would sit entirely inside
+			// a quad and never contain its centre - agents would path straight
+			// through it. Over-carving is the safe direction here.
+			if (obstacle_count > 0) {
+				const float qx0 = lx * quad_extent;
+				const float qz0 = lz * quad_extent;
+				const float qx1 = qx0 + quad_extent;
+				const float qz1 = qz0 + quad_extent;
+				bool blocked = false;
+				for (int o = 0; o < obstacle_count; o++) {
+					const float ox = obstacles[o * 3 + 0];
+					const float oz = obstacles[o * 3 + 1];
+					const float orad = obstacles[o * 3 + 2];
+					// Nearest point on the quad to the disc centre.
+					const float nx = CLAMP(ox, qx0, qx1);
+					const float nz = CLAMP(oz, qz0, qz1);
+					const float ddx = ox - nx;
+					const float ddz = oz - nz;
+					if (ddx * ddx + ddz * ddz <= orad * orad) { blocked = true; break; }
+				}
+				if (blocked) continue;
+			}
 
 			int i0 = lz * lod_vps + lx;
 			int i1 = i0 + 1;
@@ -592,6 +798,11 @@ void CellTerrain::_apply_material() {
 			}
 			inst->set_shader_param("detail_normal_map", detail_normal_tex);
 			inst->set_shader_param("detail_normal_strength", shader_detail_normal_strength);
+			// Must always be bound: colour is a MULTIPLY and an unbound
+			// sampler2D samples black (same hazard as detail_normal_map).
+			// update_color_texture() binds a 4x4 white when nothing is painted.
+			if (color_map_tex.is_null()) update_color_texture();
+			inst->set_shader_param("color_map", color_map_tex);
 			inst->set_shader_param("splatmap0", splatmap_texes[0]);
 			inst->set_shader_param("splatmap1", splatmap_texes[1]);
 			inst->set_shader_param("splatmap2", splatmap_texes[2]);
@@ -605,6 +816,38 @@ void CellTerrain::_apply_material() {
 	}
 }
 
+PoolVector3Array CellTerrain::_build_collision_faces() const {
+	// Triangle soup matching the LOD-0 render surface, holes removed. Built in
+	// cell-local metres, so the owning StaticBody needs NO transform - unlike
+	// the heightfield path, which is anchored at the body origin and scaled.
+	const int vps = verts_per_side;
+	const int seg = vps - 1;
+	const float spacing = cell_size / (float)seg;
+
+	const ComputeInput in = _make_compute_input();
+
+	PoolVector3Array faces;
+	faces.resize(seg * seg * 6);
+	int n = 0;
+	{
+		PoolVector3Array::Write w = faces.write();
+		for (int z = 0; z < seg; z++) {
+			for (int x = 0; x < seg; x++) {
+				if (_quad_is_hole_s(in, x, z, 1)) continue;
+				const Vector3 v00(x * spacing, _height_at_s(in, x, z) * height_scale, z * spacing);
+				const Vector3 v10((x + 1) * spacing, _height_at_s(in, x + 1, z) * height_scale, z * spacing);
+				const Vector3 v01(x * spacing, _height_at_s(in, x, z + 1) * height_scale, (z + 1) * spacing);
+				const Vector3 v11((x + 1) * spacing, _height_at_s(in, x + 1, z + 1) * height_scale, (z + 1) * spacing);
+				// Same diagonal split and winding as the render mesh.
+				w[n++] = v00; w[n++] = v10; w[n++] = v01;
+				w[n++] = v10; w[n++] = v11; w[n++] = v01;
+			}
+		}
+	}
+	faces.resize(n);
+	return faces;
+}
+
 void CellTerrain::_apply_collision() {
 	if (enable_collision) {
 		if (!static_body) {
@@ -612,6 +855,35 @@ void CellTerrain::_apply_collision() {
 			add_child(static_body);
 			collision_shape = memnew(CollisionShape); static_body->add_child(collision_shape);
 		}
+
+		// A HeightMapShape is a dense grid of samples with no way to express a
+		// missing quad, so a cell with painted holes cannot use one - you would
+		// still walk across the cave mouth. Those cells fall back to a triangle
+		// soup of exactly the quads the render mesh kept. Every other cell stays
+		// on the heightfield, which is far cheaper to build and to query.
+		if (has_holes()) {
+			if (hole_shape.is_null()) hole_shape.instance();
+			hole_shape->set_faces(_build_collision_faces());
+			if (!_collision_is_concave) {
+				collision_shape->set_shape(hole_shape);
+				_collision_is_concave = true;
+				// Drop the heightfield: it would otherwise keep a full
+				// verts_per_side^2 map alive for a cell that cannot use it
+				// again unless the holes are painted back in.
+				height_shape = Ref<HeightMapShape>();
+			}
+			// Faces are already in cell-local space.
+			static_body->set_transform(Transform());
+			static_body->set_visible(true);
+			return;
+		}
+		if (_collision_is_concave) {
+			// Last hole was filled back in - return to the fast path.
+			_collision_is_concave = false;
+			hole_shape = Ref<ConcavePolygonShape>();
+			collision_shape->set_shape(Ref<Shape>());
+		}
+
 		PoolRealArray map_data; map_data.resize(verts_per_side * verts_per_side);
 		{ PoolRealArray::Write mw = map_data.write(); for (int i = 0; i < heights.size(); i++) mw[i] = heights[i] * height_scale; }
 		if (height_shape.is_null()) {
@@ -797,6 +1069,15 @@ void CellTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_heights"), &CellTerrain::get_heights);
 	ClassDB::bind_method(D_METHOD("set_nav_mask", "m"), &CellTerrain::set_nav_mask);
 	ClassDB::bind_method(D_METHOD("get_nav_mask"), &CellTerrain::get_nav_mask);
+	ClassDB::bind_method(D_METHOD("set_hole_mask", "m"), &CellTerrain::set_hole_mask);
+	ClassDB::bind_method(D_METHOD("get_hole_mask"), &CellTerrain::get_hole_mask);
+	ClassDB::bind_method(D_METHOD("get_hole_at", "lx", "lz"), &CellTerrain::get_hole_at);
+	ClassDB::bind_method(D_METHOD("set_hole_at", "lx", "lz", "v"), &CellTerrain::set_hole_at);
+	ClassDB::bind_method(D_METHOD("has_holes"), &CellTerrain::has_holes);
+	ClassDB::bind_method(D_METHOD("set_color_map", "img"), &CellTerrain::set_color_map);
+	ClassDB::bind_method(D_METHOD("get_color_map"), &CellTerrain::get_color_map);
+	ClassDB::bind_method(D_METHOD("update_color_texture"), &CellTerrain::update_color_texture);
+	ClassDB::bind_method(D_METHOD("paint_color_at", "lx", "lz", "color", "strength"), &CellTerrain::paint_color_at);
 	ClassDB::bind_method(D_METHOD("set_verts_per_side", "v"), &CellTerrain::set_verts_per_side);
 	ClassDB::bind_method(D_METHOD("get_verts_per_side"), &CellTerrain::get_verts_per_side);
 	ClassDB::bind_method(D_METHOD("set_cell_size", "s"), &CellTerrain::set_cell_size);

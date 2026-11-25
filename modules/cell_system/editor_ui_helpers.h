@@ -9,6 +9,8 @@
 // top-of-viewport strip of controls.
 
 #include "core/color.h"
+#include "core/rid.h"
+#include "scene/resources/material.h"
 #include "core/math/vector2.h"
 #include "core/reference.h"
 #include "core/ustring.h"
@@ -25,6 +27,7 @@ class Image;
 class ImageTexture;
 class Object;
 class Texture;
+class Spatial;
 
 // Builds a ScrollContainer > MarginContainer > VBoxContainer stack (the usual
 // shape for a left-side inspector-style dock) and returns the outer, dock-
@@ -44,6 +47,13 @@ Button *cs_add_mode_button(GridContainer *p_grid, const Ref<ButtonGroup> &p_grou
 // p_callback via "value_changed" (receives the new float value).
 EditorSpinSlider *cs_add_slider_row(VBoxContainer *p_parent, const String &p_label,
 		double p_min, double p_max, double p_step, double p_default,
+		Object *p_target, const StringName &p_callback);
+
+// Compact slider for the viewport top toolbar. Unlike cs_add_slider_row, it
+// does NOT expand to fill - in a horizontal bar an expanding slider swallows
+// the whole row - so it takes an explicit pixel width instead.
+EditorSpinSlider *cs_add_toolbar_slider(Container *p_parent, const String &p_label,
+		double p_min, double p_max, double p_step, double p_default, int p_width,
 		Object *p_target, const StringName &p_callback);
 
 // Flat, icon-only toggle button (no text) in p_parent, mutually exclusive
@@ -66,6 +76,44 @@ void cs_icon_line(Ref<Image> p_img, const Vector2 &p_a, const Vector2 &p_b, floa
 // Wraps a finished Image (call icon draw calls between p_img->lock()/unlock())
 // into an ImageTexture.
 Ref<ImageTexture> cs_icon_to_texture(const Ref<Image> &p_img);
+
+// --- Viewport line overlay that is deliberately NOT a scene node ---
+//
+// The paint brush rings used to be an ImmediateGeometry child of the edited
+// manager node. That was an editor freeze on every trip in or out of the
+// viewport: Node::add_child() and remove_child() emit SceneTree::tree_changed,
+// which makes SceneTreeEditor hash-walk the whole edited scene and then clear
+// and rebuild the entire Scene dock. Under a streamed terrain manager that
+// scene is thousands of cell/mesh/body/shape nodes. Moving the cursor off the
+// terrain - e.g. up towards the toolbar, where the ray hits sky and misses -
+// destroyed the ring, and moving back created it again, so a single round trip
+// cost two full dock rebuilds.
+//
+// Editor gizmos never put overlay geometry in the scene; they talk to the
+// VisualServer directly. So does this: an immediate mesh plus one instance in
+// the anchor's scenario. No Node, so no tree_changed, so no dock rebuild.
+class CSViewportOverlay {
+	RID immediate;
+	RID instance;
+	Ref<SpatialMaterial> material;
+
+public:
+	// Creates the overlay if needed, clears it, points it at p_anchor's world
+	// and makes it visible. Returns the immediate-mesh RID to emit geometry
+	// into via VisualServer::immediate_begin/immediate_color/immediate_vertex/
+	// immediate_end, in coordinates local to p_anchor. Returns an invalid RID
+	// when there is nothing to draw into, so callers must check.
+	RID begin_rebuild(Spatial *p_anchor);
+	// "Cursor left the terrain" - stop drawing without destroying anything.
+	// This is the per-mouse-move path, so it must stay allocation-free.
+	void hide();
+	// Full teardown. Only for when the edited object goes away, since a later
+	// begin_rebuild() would otherwise re-home a stale scenario.
+	void destroy();
+
+	CSViewportOverlay() {}
+	~CSViewportOverlay() { destroy(); }
+};
 
 #endif
 #endif

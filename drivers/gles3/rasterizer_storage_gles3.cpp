@@ -31,6 +31,7 @@
 #include "rasterizer_storage_gles3.h"
 
 #include "core/engine.h"
+#include "core/math/geometry.h"
 #include "core/os/os.h"
 #include "core/project_settings.h"
 #include "core/threaded_callable_queue.h"
@@ -702,6 +703,15 @@ void RasterizerStorageGLES3::texture_allocate(RID p_texture, int p_width, int p_
 
 void RasterizerStorageGLES3::texture_set_data(RID p_texture, const Ref<Image> &p_image, int p_layer) {
 	Texture *texture = texture_owner.get(p_texture);
+
+	// A cookie whose pixels changed has to be re-baked into the projector atlas.
+	// The map is empty in every project that uses no projectors, so this costs
+	// nothing in the common case.
+	if (!projector_atlas.entries.empty() &&
+			(projector_atlas.entries.has(ProjectorAtlas::Key(p_texture, false)) ||
+					projector_atlas.entries.has(ProjectorAtlas::Key(p_texture, true)))) {
+		projector_atlas.dirty = true;
+	}
 
 	ERR_FAIL_COND(!texture);
 	ERR_FAIL_COND(!texture->active);
@@ -2498,6 +2508,7 @@ void RasterizerStorageGLES3::_update_shader(Shader *p_shader) const {
 			p_shader->spatial.uses_depth_texture = false;
 			p_shader->spatial.uses_vertex = false;
 			p_shader->spatial.uses_tangent = false;
+			p_shader->spatial.uses_tessellation = false;
 			p_shader->spatial.uses_ensure_correct_normals = false;
 			p_shader->spatial.writes_modelview_or_projection = false;
 			p_shader->spatial.uses_world_coordinates = false;
@@ -2586,6 +2597,9 @@ void RasterizerStorageGLES3::_update_shader(Shader *p_shader) const {
 
 	p_shader->uses_vertex_time = gen_code.uses_vertex_time;
 	p_shader->uses_fragment_time = gen_code.uses_fragment_time;
+	if (p_shader->mode == VS::SHADER_SPATIAL) {
+		p_shader->spatial.uses_tessellation = gen_code.uses_tessellation;
+	}
 
 	// some logic for batching
 	if (p_shader->mode == VS::SHADER_CANVAS_ITEM) {
@@ -2600,7 +2614,7 @@ void RasterizerStorageGLES3::_update_shader(Shader *p_shader) const {
 		}
 	}
 
-	p_shader->shader->set_custom_shader_code(p_shader->custom_code_id, gen_code.vertex, gen_code.vertex_global, gen_code.fragment, gen_code.light, gen_code.fragment_global, gen_code.uniforms, gen_code.texture_uniforms, gen_code.defines, (ShaderGLES3::AsyncMode)async_mode);
+	p_shader->shader->set_custom_shader_code(p_shader->custom_code_id, gen_code.vertex, gen_code.vertex_global, gen_code.fragment, gen_code.light, gen_code.fragment_global, gen_code.uniforms, gen_code.texture_uniforms, gen_code.defines, (ShaderGLES3::AsyncMode)async_mode, gen_code.tess_control, gen_code.tess_control_global, gen_code.tess_eval, gen_code.tess_eval_global);
 
 	//all materials using this shader will have to be invalidated, unfortunately
 
@@ -5702,11 +5716,287 @@ void RasterizerStorageGLES3::light_set_shadow_color(RID p_light, const Color &p_
 	light->shadow_color = p_color;
 }
 
+void RasterizerStorageGLES3::_projector_atlas_reference(RID p_texture, bool p_dual_paraboloid) {
+	if (!p_texture.is_valid()) {
+		return;
+	}
+
+	ProjectorAtlas::Key key(p_texture, p_dual_paraboloid);
+	Map<ProjectorAtlas::Key, ProjectorAtlas::Entry>::Element *E = projector_atlas.entries.find(key);
+	if (E) {
+		E->get().users++;
+	} else {
+		projector_atlas.entries[key].users = 1;
+		projector_atlas.dirty = true;
+	}
+}
+
+void RasterizerStorageGLES3::_projector_atlas_unreference(RID p_texture, bool p_dual_paraboloid) {
+	if (!p_texture.is_valid()) {
+		return;
+	}
+
+	Map<ProjectorAtlas::Key, ProjectorAtlas::Entry>::Element *E = projector_atlas.entries.find(ProjectorAtlas::Key(p_texture, p_dual_paraboloid));
+	if (!E) {
+		return;
+	}
+
+	E->get().users--;
+	if (E->get().users <= 0) {
+		projector_atlas.entries.erase(E);
+		projector_atlas.dirty = true;
+	}
+}
+
+void RasterizerStorageGLES3::_projector_atlas_clear() {
+	if (projector_atlas.fbo) {
+		glDeleteFramebuffers(1, &projector_atlas.fbo);
+		projector_atlas.fbo = 0;
+	}
+	if (projector_atlas.texture) {
+		glDeleteTextures(1, &projector_atlas.texture);
+		projector_atlas.texture = 0;
+	}
+	projector_atlas.size = 0;
+	projector_atlas.mipmaps = 0;
+}
+
+bool RasterizerStorageGLES3::projector_atlas_get_rect(RID p_texture, bool p_dual_paraboloid, Rect2 &r_uv_rect) const {
+	if (!projector_atlas.texture) {
+		return false;
+	}
+
+	const Map<ProjectorAtlas::Key, ProjectorAtlas::Entry>::Element *E = projector_atlas.entries.find(ProjectorAtlas::Key(p_texture, p_dual_paraboloid));
+	if (!E || E->get().uv_rect.size.x <= 0.0) {
+		return false;
+	}
+
+	r_uv_rect = E->get().uv_rect;
+	return true;
+}
+
+void RasterizerStorageGLES3::update_projector_atlas() {
+	if (!projector_atlas.dirty) {
+		return;
+	}
+
+	projector_atlas.dirty = false;
+	_projector_atlas_clear();
+
+	if (projector_atlas.entries.empty()) {
+		return;
+	}
+
+	// Gutter between packed cookies. Every mip level is rendered explicitly rather
+	// than generated, so filtering only ever reaches one texel past a rect; the
+	// gutter is left black so residual bleed darkens the border instead of
+	// dragging in a neighbouring cookie.
+	const int PADDING = 4;
+	const int MAX_MIPMAPS = 4;
+
+	int projector_size = int(GLOBAL_GET("rendering/quality/lights/projector_size"));
+	projector_size = CLAMP((int)next_power_of_2(projector_size), 32, config.max_texture_size);
+
+	Vector<ProjectorAtlas::Key> keys;
+	Vector<Size2i> content_sizes;
+	Vector<Size2i> sizes;
+
+	for (Map<ProjectorAtlas::Key, ProjectorAtlas::Entry>::Element *E = projector_atlas.entries.front(); E; E = E->next()) {
+		E->get().uv_rect = Rect2();
+
+		Texture *t = texture_owner.getornull(E->key().texture);
+		if (!t) {
+			continue;
+		}
+		t = t->get_ptr();
+		if (!t->active || t->width <= 0 || t->height <= 0) {
+			continue;
+		}
+
+		Size2i content;
+		if (E->key().dual_paraboloid) {
+			// Two paraboloid halves stacked vertically, matching the sample in
+			// light_process_omni(). The panorama is resampled, so the source
+			// resolution does not drive the packed size.
+			content = Size2i(projector_size, projector_size * 2);
+		} else {
+			content.x = MIN((int)next_power_of_2(t->width), projector_size);
+			content.y = MIN((int)next_power_of_2(t->height), projector_size);
+		}
+
+		keys.push_back(E->key());
+		content_sizes.push_back(content);
+		sizes.push_back(Size2i(content.x + PADDING * 2, content.y + PADDING * 2));
+	}
+
+	if (sizes.empty()) {
+		return;
+	}
+
+	Vector<Point2i> offsets;
+	Size2i packed_size;
+	::Geometry::make_atlas(sizes, offsets, packed_size);
+	ERR_FAIL_COND(offsets.size() != sizes.size());
+
+	int side = next_power_of_2(MAX(packed_size.x, packed_size.y));
+	if (side > config.max_texture_size) {
+		ERR_PRINT("Light projector atlas exceeded the maximum texture size; some projectors will not render. Lower rendering/quality/lights/projector_size or use fewer distinct projector textures.");
+		side = config.max_texture_size;
+	}
+
+	// Cap the mip chain so the smallest cookie is still a few texels across.
+	int smallest = side;
+	for (int i = 0; i < content_sizes.size(); i++) {
+		smallest = MIN(smallest, MIN(content_sizes[i].x, content_sizes[i].y));
+	}
+	int mipmaps = 1;
+	while (mipmaps < MAX_MIPMAPS && (smallest >> mipmaps) >= 4) {
+		mipmaps++;
+	}
+
+	projector_atlas.size = side;
+	projector_atlas.mipmaps = mipmaps;
+
+	glActiveTexture(GL_TEXTURE0);
+	glGenTextures(1, &projector_atlas.texture);
+	glBindTexture(GL_TEXTURE_2D, projector_atlas.texture);
+	for (int i = 0; i < mipmaps; i++) {
+		glTexImage2D(GL_TEXTURE_2D, i, GL_RGBA8, MAX(1, side >> i), MAX(1, side >> i), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+	}
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, mipmaps - 1);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mipmaps > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	glGenFramebuffers(1, &projector_atlas.fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, projector_atlas.fbo);
+
+	glDisable(GL_BLEND);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glDepthMask(GL_FALSE);
+	glColorMask(1, 1, 1, 1);
+
+	shaders.copy.set_conditional(CopyShaderGLES3::USE_LOD, true);
+
+	for (int level = 0; level < mipmaps; level++) {
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, projector_atlas.texture, level);
+		glViewport(0, 0, MAX(1, side >> level), MAX(1, side >> level));
+		glClearColor(0, 0, 0, 0);
+		glClear(GL_COLOR_BUFFER_BIT);
+
+		for (int i = 0; i < keys.size(); i++) {
+			Texture *t = texture_owner.getornull(keys[i].texture);
+			if (!t) {
+				continue;
+			}
+			t = t->get_ptr();
+
+			Point2i pos = offsets[i] + Point2i(PADDING, PADDING);
+			Size2i content = content_sizes[i];
+
+			int vx = pos.x >> level;
+			int vy = pos.y >> level;
+			int vw = MAX(1, content.x >> level);
+			int vh = MAX(1, content.y >> level);
+
+			// How far down the source's own mip chain to fetch, so that cookies keep
+			// anti-aliasing as they shrink instead of point-sampling.
+			float src_lod = float(level);
+			if (t->width > content.x) {
+				src_lod += Math::log(float(t->width) / float(content.x)) / Math::log(2.0f);
+			}
+
+			bool dp = keys[i].dual_paraboloid;
+			shaders.copy.set_conditional(CopyShaderGLES3::USE_PANORAMA_TO_DP, dp);
+			shaders.copy.bind();
+			shaders.copy.set_uniform(CopyShaderGLES3::MIP_LEVEL, src_lod);
+
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, t->tex_id);
+
+			glBindVertexArray(resources.quadie_array);
+			if (dp) {
+				// Near half on top, far half below, matching light_process_omni().
+				int half_h = MAX(1, vh / 2);
+				for (int half = 0; half < 2; half++) {
+					shaders.copy.set_uniform(CopyShaderGLES3::DP_Z_FLIP, half == 1);
+					glViewport(vx, vy + half * half_h, vw, half_h);
+					glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+				}
+			} else {
+				glViewport(vx, vy, vw, vh);
+				glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+			}
+			glBindVertexArray(0);
+		}
+	}
+
+	shaders.copy.set_conditional(CopyShaderGLES3::USE_PANORAMA_TO_DP, false);
+	shaders.copy.set_conditional(CopyShaderGLES3::USE_LOD, false);
+
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, RasterizerStorageGLES3::system_fbo);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	// Publish UV rects now that the packing is final.
+	for (int i = 0; i < keys.size(); i++) {
+		Map<ProjectorAtlas::Key, ProjectorAtlas::Entry>::Element *E = projector_atlas.entries.find(keys[i]);
+		if (!E) {
+			continue;
+		}
+		Point2i pos = offsets[i] + Point2i(PADDING, PADDING);
+		E->get().uv_rect = Rect2(
+				float(pos.x) / side,
+				float(pos.y) / side,
+				float(content_sizes[i].x) / side,
+				float(content_sizes[i].y) / side);
+	}
+}
+
+void RasterizerStorageGLES3::light_set_lens_streak(RID p_light, bool p_enabled, const Color &p_color, float p_intensity, float p_length, float p_thickness, float p_angle, float p_source_size, float p_max_distance) {
+	Light *light = light_owner.getornull(p_light);
+	ERR_FAIL_COND(!light);
+
+	// Read fresh by the scene post-process each frame, so no version bump needed.
+	light->lens_streak.enabled = p_enabled;
+	light->lens_streak.color = p_color;
+	light->lens_streak.intensity = MAX(p_intensity, 0.0f);
+	light->lens_streak.length = MAX(p_length, 0.0f);
+	light->lens_streak.thickness = MAX(p_thickness, 0.0f);
+	light->lens_streak.angle = p_angle;
+	light->lens_streak.source_size = MAX(p_source_size, 0.0f);
+	light->lens_streak.max_distance = MAX(p_max_distance, 0.0f);
+}
+
+bool RasterizerStorageGLES3::light_has_lens_streak(RID p_light) const {
+	const Light *light = light_owner.getornull(p_light);
+	ERR_FAIL_COND_V(!light, false);
+
+	return light->lens_streak.enabled;
+}
+
 void RasterizerStorageGLES3::light_set_projector(RID p_light, RID p_texture) {
 	Light *light = light_owner.getornull(p_light);
 	ERR_FAIL_COND(!light);
 
+	if (light->projector == p_texture) {
+		return;
+	}
+
+	// Directional lights have no projector support in this renderer, so they never
+	// take up atlas space.
+	if (light->type != VS::LIGHT_DIRECTIONAL) {
+		bool dp = light->type == VS::LIGHT_OMNI;
+		_projector_atlas_unreference(light->projector, dp);
+		_projector_atlas_reference(p_texture, dp);
+	}
+
 	light->projector = p_texture;
+	light->version++;
+	light->instance_change_notify(true, false);
 }
 
 void RasterizerStorageGLES3::light_set_negative(RID p_light, bool p_enable) {
@@ -7117,6 +7407,22 @@ void RasterizerStorageGLES3::_render_target_clear(RenderTarget *rt) {
 		rt->fbo = 0;
 	}
 
+	if (rt->buffers.gi_albedo) {
+		glDeleteRenderbuffers(1, &rt->buffers.gi_albedo);
+		glDeleteRenderbuffers(1, &rt->buffers.gi_ambient);
+		rt->buffers.gi_albedo = 0;
+		rt->buffers.gi_ambient = 0;
+		glDeleteTextures(1, &rt->effects.ssgi.color);
+		glDeleteTextures(1, &rt->effects.ssgi.albedo);
+		glDeleteTextures(1, &rt->effects.ssgi.ambient);
+		glDeleteFramebuffers(3, rt->effects.ssgi.resolve_fbo);
+		if (rt->effects.ssgi.width) {
+			glDeleteTextures(4, rt->effects.ssgi.work);
+			glDeleteTextures(2, rt->effects.ssgi.history_depth);
+		}
+		rt->effects.ssgi = RenderTarget::Effects::SSGI();
+	}
+
 	if (rt->buffers.active) {
 		glDeleteFramebuffers(1, &rt->buffers.fbo);
 		glDeleteRenderbuffers(1, &rt->buffers.depth);
@@ -7585,11 +7891,13 @@ void RasterizerStorageGLES3::_render_target_allocate(RenderTarget *rt) {
 				rt->effects.light_shaft.history_fbo = ls_fbo[2];
 			}
 
-			////// Volumetric fog (half-res raymarch ping-pong + temporal history)
+			////// Volumetric fog (raymarch ping-pong + temporal history)
 
 			{
-				int vf_w = MAX(rt->width / 2, 1);
-				int vf_h = MAX(rt->height / 2, 1);
+				int vf_res = GLOBAL_GET("rendering/quality/volumetric_fog/resolution");
+				int vf_div = (vf_res <= 0) ? 1 : ((vf_res == 1) ? 2 : 4); // Full / Half / Quarter
+				int vf_w = MAX(rt->width / vf_div, 1);
+				int vf_h = MAX(rt->height / vf_div, 1);
 				rt->effects.volumetric_fog.width = vf_w;
 				rt->effects.volumetric_fog.height = vf_h;
 				rt->effects.volumetric_fog.history_valid = false;
@@ -8149,6 +8457,18 @@ bool RasterizerStorageGLES3::free(RID p_rid) {
 		Texture *texture = texture_owner.get(p_rid);
 		ERR_FAIL_COND_V(texture->render_target, true); //can't free the render target texture, dude
 		info.texture_mem -= texture->total_data_size;
+
+		// A light may still be pointing at it; forcing a repack keeps the atlas from
+		// holding a dangling RID.
+		if (!projector_atlas.entries.empty()) {
+			if (projector_atlas.entries.erase(ProjectorAtlas::Key(p_rid, false))) {
+				projector_atlas.dirty = true;
+			}
+			if (projector_atlas.entries.erase(ProjectorAtlas::Key(p_rid, true))) {
+				projector_atlas.dirty = true;
+			}
+		}
+
 		texture_owner.free(p_rid);
 		memdelete(texture);
 
@@ -8299,6 +8619,10 @@ bool RasterizerStorageGLES3::free(RID p_rid) {
 		// delete the texture
 		Light *light = light_owner.get(p_rid);
 		light->instance_remove_deps();
+
+		if (light->type != VS::LIGHT_DIRECTIONAL) {
+			_projector_atlas_unreference(light->projector, light->type == VS::LIGHT_OMNI);
+		}
 
 		light_owner.free(p_rid);
 		memdelete(light);
@@ -8856,6 +9180,8 @@ void RasterizerStorageGLES3::initialize() {
 }
 
 void RasterizerStorageGLES3::finalize() {
+	_projector_atlas_clear();
+	projector_atlas.entries.clear();
 	glDeleteTextures(1, &resources.white_tex);
 	glDeleteTextures(1, &resources.black_tex);
 	glDeleteTextures(1, &resources.normal_tex);

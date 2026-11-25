@@ -19,6 +19,12 @@ render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_sc
 
 uniform sampler2DArray albedo_arr : hint_albedo;
 uniform sampler2DArray normal_arr : hint_normal;
+// Per-cell painted albedo tint (TerrainBrush::MODE_COLOR), multiplied over
+// the blended layer albedo. hint_albedo so the painted sRGB colour decodes
+// the same way a layer texture does. White is the identity - the C++ side
+// always binds something here (a 4x4 white for unpainted cells), because an
+// unbound sampler2D samples BLACK and this is a multiply.
+uniform sampler2D color_map : hint_albedo;
 uniform sampler2D splatmap0;
 uniform sampler2D splatmap1;
 uniform sampler2D splatmap2;
@@ -255,10 +261,8 @@ void fragment() {
 		}
 	}
 
-	if (macro_variation_scale > 0.0001) {
-		float mv = macro_noise(v_world_xz * macro_variation_scale);
-		albedo *= mix(macro_variation_color1.rgb, macro_variation_color2.rgb, mv);
-	}
+	// Macro variation is applied ONCE, in the shading branch below. It used to
+	// be applied here as well, which squared the tint for every lit pixel.
 
 	// Godot 3.x forbids `return` inside fragment() ("results in undefined
 	// behavior"), so the debug overlay and the normal shading path are an
@@ -291,6 +295,10 @@ void fragment() {
 			float mv = macro_noise(v_world_xz * macro_variation_scale);
 			albedo *= mix(macro_variation_color1.rgb, macro_variation_color2.rgb, mv);
 		}
+
+		// Painted colour tint. Comes last so it modulates the finished blend
+		// rather than any single layer.
+		albedo *= texture(color_map, UV).rgb;
 
 		ALBEDO = albedo;
 		ROUGHNESS = clamp(roughness, 0.0, 1.0);

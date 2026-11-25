@@ -49,6 +49,11 @@ public:
 	virtual int get_directional_light_shadow_size(RID p_light_intance) = 0;
 	virtual void set_directional_shadow_count(int p_count) = 0;
 
+	// Reference view for tessellation density. Supplied before shadows are
+	// rendered so every pass tessellates identically; a view-dependent factor
+	// makes the shadow pass disagree with the colour pass and produces acne.
+	virtual void set_tessellation_reference(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection) {}
+
 	/* ENVIRONMENT API */
 
 	virtual RID environment_create() = 0;
@@ -79,6 +84,10 @@ public:
 	virtual void environment_set_fog_depth(RID p_env, bool p_enable, float p_depth_begin, float p_depth_end, float p_depth_curve, bool p_transmit, float p_transmit_curve) = 0;
 	virtual void environment_set_fog_height(RID p_env, bool p_enable, float p_min_height, float p_max_height, float p_height_curve) = 0;
 	virtual void environment_set_volumetric_fog(RID p_env, bool p_enable, float p_density, float p_height_falloff, float p_height_ref, const Color &p_albedo, const Color &p_ambient, float p_sun_energy, float p_anisotropy, float p_length, float p_extinction, int p_samples, float p_temporal_blend) = 0;
+	virtual void environment_set_volumetric_fog_height_relative(RID p_env, bool p_relative) = 0;
+	virtual void environment_set_dynamic_gi(RID p_env, bool p_enable, int p_cascades, float p_voxel_size, float p_energy, float p_bounce_feedback, float p_normal_bias, float p_hysteresis, int p_rays, bool p_reflection_occlusion, uint32_t p_cull_mask, VS::EnvironmentDynamicGIDebug p_debug) = 0;
+	virtual void environment_set_ssgi(RID p_env, bool p_enable, float p_radius, float p_intensity, int p_rays, int p_steps, float p_thickness, float p_temporal_blend, bool p_half_resolution) = 0;
+	virtual void environment_set_exp_height_fog(RID p_env, bool p_enable, float p_density, float p_falloff, float p_ref_height, bool p_ref_height_relative, float p_start_distance, float p_max_opacity, const Color &p_inscatter, bool p_directional_enabled, const Color &p_directional_color, const Vector3 &p_light_direction, float p_directional_exponent) = 0;
 
 	virtual bool is_environment(RID p_env) = 0;
 	virtual VS::EnvironmentBG environment_get_background(RID p_env) = 0;
@@ -192,6 +201,17 @@ public:
 
 	virtual void render_scene(const Transform &p_cam_transform, const CameraMatrix &p_cam_projection, const int p_eye, bool p_cam_ortogonal, InstanceBase **p_cull_result, int p_cull_count, RID *p_light_cull_result, int p_light_cull_count, RID *p_reflection_probe_cull_result, int p_reflection_probe_cull_count, RID p_environment, RID p_shadow_atlas, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass) = 0;
 	virtual void render_shadow(RID p_light, RID p_shadow_atlas, int p_pass, InstanceBase **p_cull_result, int p_cull_count) = 0;
+
+	// Dynamic GI. begin() makes the scenario's GI current for the next
+	// render_scene(); when it returns true the caller draws every region and
+	// then calls finish().
+	virtual bool dynamic_gi_begin(RID p_scenario, RID p_environment, const Transform &p_cam_transform, bool p_reflection_probe) { return false; }
+	virtual bool dynamic_gi_next_region(AABB &r_aabb) { return false; }
+	virtual void dynamic_gi_render_region(RID p_environment, InstanceBase **p_cull_result, int p_cull_count) {}
+	virtual AABB dynamic_gi_get_bounds() { return AABB(); }
+	virtual void dynamic_gi_finish(RID p_environment, const RID *p_lights, int p_light_count) {}
+	virtual void dynamic_gi_mark_dirty(RID p_scenario, const AABB &p_aabb) {}
+	virtual void dynamic_gi_free(RID p_scenario) {}
 
 	virtual void set_scene_pass(uint64_t p_pass) = 0;
 	virtual void set_debug_draw_mode(VS::ViewportDebugDraw p_debug_draw) = 0;
@@ -465,6 +485,8 @@ public:
 	virtual void light_set_shadow(RID p_light, bool p_enabled) = 0;
 	virtual void light_set_shadow_color(RID p_light, const Color &p_color) = 0;
 	virtual void light_set_projector(RID p_light, RID p_texture) = 0;
+	virtual void light_set_lens_streak(RID p_light, bool p_enabled, const Color &p_color, float p_intensity, float p_length, float p_thickness, float p_angle, float p_source_size, float p_max_distance) = 0;
+	virtual bool light_has_lens_streak(RID p_light) const = 0;
 	virtual void light_set_negative(RID p_light, bool p_enable) = 0;
 	virtual void light_set_cull_mask(RID p_light, uint32_t p_mask) = 0;
 	virtual void light_set_reverse_cull_face_mode(RID p_light, bool p_enabled) = 0;

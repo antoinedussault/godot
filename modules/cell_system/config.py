@@ -12,6 +12,8 @@ def get_doc_classes():
         "SceneTransition",
         "SceneSpawnPoint",
         "SceneDoor",
+        "WorldLocationArea",
+        "CellCharacterBody",
         "CellItemBody",
         "ItemCategory",
         "ItemCategoryCatalog",

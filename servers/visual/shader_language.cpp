@@ -968,6 +968,9 @@ bool ShaderLanguage::_find_identifier(const BlockNode *p_block, const Map<String
 		if (r_is_const) {
 			*r_is_const = p_builtin_types[p_identifier].constant;
 		}
+		if (r_array_size) {
+			*r_array_size = p_builtin_types[p_identifier].array_size;
+		}
 		if (r_type) {
 			*r_type = IDENTIFIER_BUILTIN_VAR;
 		}

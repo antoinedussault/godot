@@ -141,11 +141,17 @@ layout(std140) uniform DirectionalLightData { //ubo:3
 	mediump vec4 light_params; // cone attenuation, angle, specular, shadow enabled,
 	mediump vec4 light_clamp;
 	mediump vec4 shadow_color_contact;
+	// Unused by directional lights, but LightDataUBO is shared with omni/spot so
+	// the matrices below have to keep their offset.
+	mediump vec4 projector_rect;
 	highp mat4 shadow_matrix1;
 	highp mat4 shadow_matrix2;
 	highp mat4 shadow_matrix3;
 	highp mat4 shadow_matrix4;
 	mediump vec4 shadow_split_offsets;
+	// World-space normal offset for each PSSM cascade, already multiplied by that
+	// cascade's shadow texel size (see _setup_directional_light).
+	highp vec4 shadow_normal_bias;
 };
 
 #endif //ubershader-skip
@@ -160,6 +166,8 @@ struct LightData {
 	mediump vec4 light_params; // cone attenuation, angle, specular, shadow enabled,
 	mediump vec4 light_clamp;
 	mediump vec4 shadow_color_contact;
+	// Cookie position/size in the projector atlas; all zeroes means no projector.
+	mediump vec4 projector_rect;
 	highp mat4 shadow_matrix;
 };
 
@@ -355,6 +363,13 @@ uniform highp sampler2D skeleton_texture; // texunit:-1
 #endif //ubershader-skip
 
 out highp vec4 position_interp;
+
+#ifdef USE_TESSELLATION //ubershader-skip
+// Tessellation is a compile-time variant only: adding or removing shader stages
+// cannot be a runtime ubershader branch. The tess_control/tess_eval stages are
+// attached only for versions with this conditional set. The vertex stage still
+// writes gl_Position, which tess_control reads for patch frustum culling.
+#endif //ubershader-skip
 
 // FIXME: This triggers a Mesa bug that breaks rendering, so disabled for now.
 // See GH-13450 and https://bugs.freedesktop.org/show_bug.cgi?id=100316
@@ -642,6 +657,418 @@ VERTEX_SHADER_CODE
 }
 
 /* clang-format off */
+[tess_control]
+
+/* clang-format off */
+layout(vertices = 3) out;
+/* clang-format on */
+
+layout(std140) uniform SceneData {
+
+	highp mat4 projection_matrix;
+	highp mat4 inv_projection_matrix;
+	highp mat4 camera_inverse_matrix;
+	highp mat4 camera_matrix;
+
+	mediump vec4 ambient_light_color;
+	mediump vec4 bg_color;
+
+	mediump vec4 fog_color_enabled;
+	mediump vec4 fog_sun_color_amount;
+
+	mediump float ambient_energy;
+	mediump float bg_energy;
+
+	mediump float z_offset;
+	mediump float z_slope_scale;
+	highp float shadow_dual_paraboloid_render_zfar;
+	highp float shadow_dual_paraboloid_render_side;
+
+	highp vec2 viewport_size;
+	highp vec2 screen_pixel_size;
+	highp vec2 shadow_atlas_pixel_size;
+	highp vec2 directional_shadow_pixel_size;
+
+	highp float time;
+	highp float z_far;
+	mediump float reflection_multiplier;
+	mediump float subsurface_scatter_width;
+	mediump float ambient_occlusion_affect_light;
+	mediump float ambient_occlusion_affect_ao_channel;
+	mediump float opaque_prepass_threshold;
+
+	bool fog_depth_enabled;
+	highp float fog_depth_begin;
+	highp float fog_depth_end;
+	mediump float fog_density;
+	highp float fog_depth_curve;
+	bool fog_transmit_enabled;
+	highp float fog_transmit_curve;
+	bool fog_height_enabled;
+	highp float fog_height_min;
+	highp float fog_height_max;
+	highp float fog_height_curve;
+
+	int view_index;
+};
+
+#if defined(ENABLE_UV2_INTERP)
+#define TESS_HAS_UV2
+#else
+#ifdef USE_LIGHTMAP
+#define TESS_HAS_UV2
+#endif
+#endif
+
+#if defined(ENABLE_TANGENT_INTERP) || defined(ENABLE_NORMALMAP) || defined(LIGHT_USE_ANISOTROPY)
+#define TESS_HAS_TANGENT
+#endif
+
+// Adaptive tessellation controls, set per frame by the renderer.
+uniform highp float tess_max_level;
+uniform highp float tess_target_edge_px;
+uniform highp float tess_cull_slack;
+
+// The reference view, supplied by the renderer and IDENTICAL in every pass.
+// Deriving these from SceneData instead would make the shadow pass tessellate
+// against the light's view: the same surface point would land at a different
+// displaced position per pass, which shows up as shadow acne.
+uniform highp vec3 tess_ref_camera_pos;
+uniform highp float tess_ref_projection_scale;
+
+#ifdef USE_VERTEX_LIGHTING
+in vec4 diffuse_light_interp[];
+out vec4 tc_diffuse_light_interp[];
+in vec4 specular_light_interp[];
+out vec4 tc_specular_light_interp[];
+#endif
+in highp vec3 vertex_interp[];
+out highp vec3 tc_vertex_interp[];
+in vec3 normal_interp[];
+out vec3 tc_normal_interp[];
+#if defined(ENABLE_COLOR_INTERP)
+in vec4 color_interp[];
+out vec4 tc_color_interp[];
+#endif
+#if defined(ENABLE_UV_INTERP)
+in vec2 uv_interp[];
+out vec2 tc_uv_interp[];
+#endif
+#if defined(TESS_HAS_UV2)
+in vec2 uv2_interp[];
+out vec2 tc_uv2_interp[];
+#endif
+#if defined(TESS_HAS_TANGENT)
+in vec3 tangent_interp[];
+out vec3 tc_tangent_interp[];
+in vec3 binormal_interp[];
+out vec3 tc_binormal_interp[];
+#endif
+#ifdef RENDER_DEPTH_DUAL_PARABOLOID
+in highp float dp_clip[];
+out highp float tc_dp_clip[];
+#endif
+in highp vec4 position_interp[];
+out highp vec4 tc_position_interp[];
+
+/* Material Uniforms */
+
+#if defined(USE_MATERIAL)
+
+/* clang-format off */
+layout(std140) uniform UniformData {
+
+MATERIAL_UNIFORMS
+
+};
+/* clang-format on */
+
+#endif
+
+TESS_CONTROL_SHADER_GLOBALS
+
+// Screen-space adaptive factor for one patch edge.
+//
+// Two patches sharing an edge feed the SAME pair of endpoints into this
+// function, so they independently arrive at the same factor. That is what makes
+// the result crack-free, with no neighbour LOD state and no cross-chunk
+// communication at all.
+//
+// vertex_interp is view space, where the camera sits at the origin, so the
+// length of the edge midpoint IS its distance to the camera.
+float tess_edge_factor(highp vec3 v0, highp vec3 v1) {
+	// Inputs are view space, which differs per pass - lift them to world space
+	// (camera_matrix is view->world for whichever view is rendering) and measure
+	// against the fixed reference camera so every pass agrees.
+	highp vec3 w0 = (camera_matrix * vec4(v0, 1.0)).xyz;
+	highp vec3 w1 = (camera_matrix * vec4(v1, 1.0)).xyz;
+	highp vec3 mid = (w0 + w1) * 0.5;
+	float radius = distance(w0, w1) * 0.5;
+	float dist = max(distance(tess_ref_camera_pos, mid), 0.0001);
+	float screen_diameter = (2.0 * radius) * tess_ref_projection_scale / dist;
+	return clamp(screen_diameter / max(tess_target_edge_px, 1.0), 1.0, max(tess_max_level, 1.0));
+}
+
+// Discard patches lying wholly outside one frustum plane. Zeroing the outer
+// levels drops the patch before any triangle is generated, which is where most
+// of the saving comes from. Planes are pushed out by tess_cull_slack so
+// displacement cannot pull visible geometry out of view.
+bool tess_patch_offscreen() {
+	highp vec4 p0 = position_interp[0];
+	highp vec4 p1 = position_interp[1];
+	highp vec4 p2 = position_interp[2];
+	float s = tess_cull_slack;
+
+	if (p0.x + p0.w + s < 0.0 && p1.x + p1.w + s < 0.0 && p2.x + p2.w + s < 0.0) { return true; }
+	if (p0.w - p0.x + s < 0.0 && p1.w - p1.x + s < 0.0 && p2.w - p2.x + s < 0.0) { return true; }
+	if (p0.y + p0.w + s < 0.0 && p1.y + p1.w + s < 0.0 && p2.y + p2.w + s < 0.0) { return true; }
+	if (p0.w - p0.y + s < 0.0 && p1.w - p1.y + s < 0.0 && p2.w - p2.y + s < 0.0) { return true; }
+	return false;
+}
+
+void main() {
+#ifdef USE_VERTEX_LIGHTING
+	tc_diffuse_light_interp[gl_InvocationID] = diffuse_light_interp[gl_InvocationID];
+	tc_specular_light_interp[gl_InvocationID] = specular_light_interp[gl_InvocationID];
+#endif
+	tc_vertex_interp[gl_InvocationID] = vertex_interp[gl_InvocationID];
+	tc_normal_interp[gl_InvocationID] = normal_interp[gl_InvocationID];
+#if defined(ENABLE_COLOR_INTERP)
+	tc_color_interp[gl_InvocationID] = color_interp[gl_InvocationID];
+#endif
+#if defined(ENABLE_UV_INTERP)
+	tc_uv_interp[gl_InvocationID] = uv_interp[gl_InvocationID];
+#endif
+#if defined(TESS_HAS_UV2)
+	tc_uv2_interp[gl_InvocationID] = uv2_interp[gl_InvocationID];
+#endif
+#if defined(TESS_HAS_TANGENT)
+	tc_tangent_interp[gl_InvocationID] = tangent_interp[gl_InvocationID];
+	tc_binormal_interp[gl_InvocationID] = binormal_interp[gl_InvocationID];
+#endif
+#ifdef RENDER_DEPTH_DUAL_PARABOLOID
+	tc_dp_clip[gl_InvocationID] = dp_clip[gl_InvocationID];
+#endif
+	tc_position_interp[gl_InvocationID] = position_interp[gl_InvocationID];
+
+	if (gl_InvocationID == 0) {
+		if (tess_patch_offscreen()) {
+			gl_TessLevelOuter[0] = 0.0;
+			gl_TessLevelOuter[1] = 0.0;
+			gl_TessLevelOuter[2] = 0.0;
+			gl_TessLevelInner[0] = 0.0;
+		} else {
+			// Outer factor i belongs to the edge OPPOSITE vertex i.
+			float e0 = tess_edge_factor(vertex_interp[1], vertex_interp[2]);
+			float e1 = tess_edge_factor(vertex_interp[2], vertex_interp[0]);
+			float e2 = tess_edge_factor(vertex_interp[0], vertex_interp[1]);
+			gl_TessLevelOuter[0] = e0;
+			gl_TessLevelOuter[1] = e1;
+			gl_TessLevelOuter[2] = e2;
+			gl_TessLevelInner[0] = (e0 + e1 + e2) * (1.0 / 3.0);
+		}
+
+		highp vec3 patch_vertex[3];
+		vec3 patch_normal[3];
+		vec2 patch_uv[3];
+		for (int i = 0; i < 3; i++) {
+			patch_vertex[i] = vertex_interp[i];
+			patch_normal[i] = normal_interp[i];
+#if defined(ENABLE_UV_INTERP)
+			patch_uv[i] = uv_interp[i];
+#else
+			patch_uv[i] = vec2(0.0);
+#endif
+		}
+
+		// User tess_control() may overwrite the levels computed above.
+		{
+TESS_CONTROL_SHADER_CODE
+		}
+	}
+}
+
+[tess_eval]
+
+/* clang-format off */
+layout(triangles, fractional_odd_spacing, ccw) in;
+/* clang-format on */
+
+layout(std140) uniform SceneData {
+
+	highp mat4 projection_matrix;
+	highp mat4 inv_projection_matrix;
+	highp mat4 camera_inverse_matrix;
+	highp mat4 camera_matrix;
+
+	mediump vec4 ambient_light_color;
+	mediump vec4 bg_color;
+
+	mediump vec4 fog_color_enabled;
+	mediump vec4 fog_sun_color_amount;
+
+	mediump float ambient_energy;
+	mediump float bg_energy;
+
+	mediump float z_offset;
+	mediump float z_slope_scale;
+	highp float shadow_dual_paraboloid_render_zfar;
+	highp float shadow_dual_paraboloid_render_side;
+
+	highp vec2 viewport_size;
+	highp vec2 screen_pixel_size;
+	highp vec2 shadow_atlas_pixel_size;
+	highp vec2 directional_shadow_pixel_size;
+
+	highp float time;
+	highp float z_far;
+	mediump float reflection_multiplier;
+	mediump float subsurface_scatter_width;
+	mediump float ambient_occlusion_affect_light;
+	mediump float ambient_occlusion_affect_ao_channel;
+	mediump float opaque_prepass_threshold;
+
+	bool fog_depth_enabled;
+	highp float fog_depth_begin;
+	highp float fog_depth_end;
+	mediump float fog_density;
+	highp float fog_depth_curve;
+	bool fog_transmit_enabled;
+	highp float fog_transmit_curve;
+	bool fog_height_enabled;
+	highp float fog_height_min;
+	highp float fog_height_max;
+	highp float fog_height_curve;
+
+	int view_index;
+};
+
+#if defined(ENABLE_UV2_INTERP)
+#define TESS_HAS_UV2
+#else
+#ifdef USE_LIGHTMAP
+#define TESS_HAS_UV2
+#endif
+#endif
+
+#if defined(ENABLE_TANGENT_INTERP) || defined(ENABLE_NORMALMAP) || defined(LIGHT_USE_ANISOTROPY)
+#define TESS_HAS_TANGENT
+#endif
+
+#ifdef USE_VERTEX_LIGHTING
+in vec4 tc_diffuse_light_interp[];
+out vec4 diffuse_light_interp;
+in vec4 tc_specular_light_interp[];
+out vec4 specular_light_interp;
+#endif
+in highp vec3 tc_vertex_interp[];
+out highp vec3 vertex_interp;
+in vec3 tc_normal_interp[];
+out vec3 normal_interp;
+#if defined(ENABLE_COLOR_INTERP)
+in vec4 tc_color_interp[];
+out vec4 color_interp;
+#endif
+#if defined(ENABLE_UV_INTERP)
+in vec2 tc_uv_interp[];
+out vec2 uv_interp;
+#endif
+#if defined(TESS_HAS_UV2)
+in vec2 tc_uv2_interp[];
+out vec2 uv2_interp;
+#endif
+#if defined(TESS_HAS_TANGENT)
+in vec3 tc_tangent_interp[];
+out vec3 tangent_interp;
+in vec3 tc_binormal_interp[];
+out vec3 binormal_interp;
+#endif
+#ifdef RENDER_DEPTH_DUAL_PARABOLOID
+in highp float tc_dp_clip[];
+out highp float dp_clip;
+#endif
+in highp vec4 tc_position_interp[];
+out highp vec4 position_interp;
+
+/* Material Uniforms */
+
+#if defined(USE_MATERIAL)
+
+/* clang-format off */
+layout(std140) uniform UniformData {
+
+MATERIAL_UNIFORMS
+
+};
+/* clang-format on */
+
+#endif
+
+TESS_EVAL_SHADER_GLOBALS
+
+void main() {
+#ifdef USE_VERTEX_LIGHTING
+	diffuse_light_interp = tc_diffuse_light_interp[0] * gl_TessCoord.x + tc_diffuse_light_interp[1] * gl_TessCoord.y + tc_diffuse_light_interp[2] * gl_TessCoord.z;
+	specular_light_interp = tc_specular_light_interp[0] * gl_TessCoord.x + tc_specular_light_interp[1] * gl_TessCoord.y + tc_specular_light_interp[2] * gl_TessCoord.z;
+#endif
+	vertex_interp = tc_vertex_interp[0] * gl_TessCoord.x + tc_vertex_interp[1] * gl_TessCoord.y + tc_vertex_interp[2] * gl_TessCoord.z;
+	normal_interp = tc_normal_interp[0] * gl_TessCoord.x + tc_normal_interp[1] * gl_TessCoord.y + tc_normal_interp[2] * gl_TessCoord.z;
+#if defined(ENABLE_COLOR_INTERP)
+	color_interp = tc_color_interp[0] * gl_TessCoord.x + tc_color_interp[1] * gl_TessCoord.y + tc_color_interp[2] * gl_TessCoord.z;
+#endif
+#if defined(ENABLE_UV_INTERP)
+	uv_interp = tc_uv_interp[0] * gl_TessCoord.x + tc_uv_interp[1] * gl_TessCoord.y + tc_uv_interp[2] * gl_TessCoord.z;
+#endif
+#if defined(TESS_HAS_UV2)
+	uv2_interp = tc_uv2_interp[0] * gl_TessCoord.x + tc_uv2_interp[1] * gl_TessCoord.y + tc_uv2_interp[2] * gl_TessCoord.z;
+#endif
+#if defined(TESS_HAS_TANGENT)
+	tangent_interp = tc_tangent_interp[0] * gl_TessCoord.x + tc_tangent_interp[1] * gl_TessCoord.y + tc_tangent_interp[2] * gl_TessCoord.z;
+	binormal_interp = tc_binormal_interp[0] * gl_TessCoord.x + tc_binormal_interp[1] * gl_TessCoord.y + tc_binormal_interp[2] * gl_TessCoord.z;
+#endif
+#ifdef RENDER_DEPTH_DUAL_PARABOLOID
+	dp_clip = tc_dp_clip[0] * gl_TessCoord.x + tc_dp_clip[1] * gl_TessCoord.y + tc_dp_clip[2] * gl_TessCoord.z;
+#endif
+
+	// Exposed to user code for displacement.
+	highp vec3 patch_vertex[3];
+	vec3 patch_normal[3];
+	vec2 patch_uv[3];
+	for (int i = 0; i < 3; i++) {
+		patch_vertex[i] = tc_vertex_interp[i];
+		patch_normal[i] = tc_normal_interp[i];
+#if defined(ENABLE_UV_INTERP)
+		patch_uv[i] = tc_uv_interp[i];
+#else
+		patch_uv[i] = vec2(0.0);
+#endif
+	}
+
+	highp vec3 vertex = vertex_interp;
+	vec3 normal = normal_interp;
+#if defined(ENABLE_UV_INTERP)
+	vec2 uv = uv_interp;
+#else
+	vec2 uv = vec2(0.0);
+#endif
+
+	// User tess_eval() displaces VERTEX along NORMAL here.
+	{
+TESS_EVAL_SHADER_CODE
+	}
+
+	vertex_interp = vertex;
+	normal_interp = normalize(normal);
+#if defined(ENABLE_UV_INTERP)
+	uv_interp = uv;
+#endif
+
+	// Recomputed after displacement; the vertex stage's gl_Position only ever
+	// fed the patch-culling test in tess_control.
+	gl_Position = projection_matrix * vec4(vertex_interp, 1.0);
+	position_interp = gl_Position;
+}
+
 [fragment]
 
 #if defined(IS_UBERSHADER)
@@ -837,11 +1264,17 @@ layout(std140) uniform DirectionalLightData {
 	mediump vec4 light_params; // cone attenuation, angle, specular, shadow enabled,
 	mediump vec4 light_clamp;
 	mediump vec4 shadow_color_contact;
+	// Unused by directional lights, but LightDataUBO is shared with omni/spot so
+	// the matrices below have to keep their offset.
+	mediump vec4 projector_rect;
 	highp mat4 shadow_matrix1;
 	highp mat4 shadow_matrix2;
 	highp mat4 shadow_matrix3;
 	highp mat4 shadow_matrix4;
 	mediump vec4 shadow_split_offsets;
+	// World-space normal offset for each PSSM cascade, already multiplied by that
+	// cascade's shadow texel size (see _setup_directional_light).
+	highp vec4 shadow_normal_bias;
 };
 
 uniform highp sampler2DShadow directional_shadow; // texunit:-5
@@ -861,6 +1294,8 @@ struct LightData {
 	mediump vec4 light_params; // cone attenuation, angle, specular, shadow enabled,
 	mediump vec4 light_clamp;
 	mediump vec4 shadow_color_contact;
+	// Cookie position/size in the projector atlas; all zeroes means no projector.
+	mediump vec4 projector_rect;
 	highp mat4 shadow_matrix;
 };
 
@@ -875,6 +1310,11 @@ layout(std140) uniform SpotLightData { // ubo:5
 };
 
 uniform highp sampler2DShadow shadow_atlas; // texunit:-6
+
+// Every omni/spot cookie in the scene, packed into one atlas so that batched
+// lights need no per-light texture binding. Omni entries hold a stacked
+// dual-paraboloid pair baked from the source panorama (see copy.glsl).
+uniform mediump sampler2D projector_atlas; // texunit:-14
 
 struct ReflectionData {
 	mediump vec4 box_extents;
@@ -921,11 +1361,34 @@ layout(location = 2) out vec4 normal_mr_buffer;
 #if defined(ENABLE_SSS)
 layout(location = 3) out float sss_buffer;
 #endif
+// Only attached while SSGI is enabled.
+layout(location = 4) out vec4 gi_albedo_buffer;
+layout(location = 5) out vec3 gi_ambient_buffer;
 
 #endif //ubershader-skip
 
 in highp vec4 position_interp;
 uniform highp sampler2D depth_buffer; // texunit:-9
+
+#define GI_PROBE_ACCESS readonly
+#include "gi/gi_common.glsl"
+
+// Compile-time variant only: image writes must never end up in the ubershader.
+#ifdef RENDER_GI_VOXELS
+
+layout(r32ui, binding = 4)
+uniform coherent highp uimage3D gi_voxel_albedo;
+layout(r32ui, binding = 5)
+uniform coherent highp uimage3D gi_voxel_emission;
+layout(r32ui, binding = 7)
+uniform coherent highp uimage3D gi_voxel_facing;
+uniform bool gi_voxel_two_sided;
+uniform highp ivec3 gi_voxel_box_min;
+uniform highp ivec3 gi_voxel_box_max;
+uniform highp float gi_voxel_size;
+uniform int gi_voxel_cascade;
+
+#endif
 
 #ifdef USE_CONTACT_SHADOWS //ubershader-skip
 
@@ -1340,6 +1803,34 @@ void light_process_omni(int idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 bi
 		omni_attenuation = 0.0;
 	}
 	vec3 light_attenuation = vec3(omni_attenuation);
+	vec3 light_color = omni_lights[idx].light_color_energy.rgb;
+
+	if (omni_lights[idx].projector_rect != vec4(0.0)) {
+		// Dual-paraboloid lookup, the same mapping the shadow atlas uses below: the
+		// lower half of the rect holds the -Z hemisphere, the upper half +Z.
+		highp vec3 local_v = normalize((omni_lights[idx].shadow_matrix * vec4(vertex, 1.0)).xyz);
+
+		vec4 atlas_rect = omni_lights[idx].projector_rect;
+		atlas_rect.w *= 0.5;
+		if (local_v.z >= 0.0) {
+			atlas_rect.y += atlas_rect.w;
+		}
+
+		vec2 base_uv = (local_v.xy / (1.0 + abs(local_v.z))) * 0.5 + 0.5;
+		vec2 proj_uv = atlas_rect.xy + clamp(base_uv, vec2(0.0), vec2(1.0)) * atlas_rect.zw;
+
+		// Automatic derivatives are wrong across the hemisphere seam (where
+		// atlas_rect.y jumps a half-rect), which would draw a blurred line around
+		// the equator. Re-project the neighbouring fragments' positions instead and
+		// difference those, staying on this half.
+		highp vec3 ddx_v = normalize((omni_lights[idx].shadow_matrix * vec4(vertex + dFdx(vertex), 1.0)).xyz);
+		highp vec3 ddy_v = normalize((omni_lights[idx].shadow_matrix * vec4(vertex + dFdy(vertex), 1.0)).xyz);
+		vec2 proj_ddx = ((ddx_v.xy / (1.0 + abs(ddx_v.z))) * 0.5 + 0.5 - base_uv) * atlas_rect.zw;
+		vec2 proj_ddy = ((ddy_v.xy / (1.0 + abs(ddy_v.z))) * 0.5 + 0.5 - base_uv) * atlas_rect.zw;
+
+		vec4 proj = textureGrad(projector_atlas, proj_uv, proj_ddx, proj_ddy);
+		light_color *= proj.rgb * proj.a;
+	}
 
 #if !defined(SHADOWS_DISABLED)
 #ifdef USE_SHADOW //ubershader-runtime
@@ -1386,7 +1877,7 @@ void light_process_omni(int idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 bi
 	}
 #endif //USE_SHADOW //ubershader-runtime
 #endif //SHADOWS_DISABLED
-	light_compute(normal, normalize(light_rel_vec), eye_vec, binormal, tangent, omni_lights[idx].light_color_energy.rgb, light_attenuation, albedo, transmission, omni_lights[idx].light_params.z * p_blob_intensity, roughness, metallic, specular, rim * omni_attenuation, rim_tint, clearcoat, clearcoat_gloss, anisotropy, diffuse_light, specular_light, alpha);
+	light_compute(normal, normalize(light_rel_vec), eye_vec, binormal, tangent, light_color, light_attenuation, albedo, transmission, omni_lights[idx].light_params.z * p_blob_intensity, roughness, metallic, specular, rim * omni_attenuation, rim_tint, clearcoat, clearcoat_gloss, anisotropy, diffuse_light, specular_light, alpha);
 }
 
 void light_process_spot(int idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 binormal, vec3 tangent, vec3 albedo, vec3 transmission, float roughness, float metallic, float specular, float rim, float rim_tint, float clearcoat, float clearcoat_gloss, float anisotropy, float p_blob_intensity, inout vec3 diffuse_light, inout vec3 specular_light, inout float alpha) {
@@ -1409,6 +1900,18 @@ void light_process_spot(int idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 bi
 	float spot_rim = max(0.0001, (1.0 - scos) / (1.0 - spot_cutoff));
 	spot_attenuation *= 1.0 - pow(spot_rim, spot_lights[idx].light_params.x);
 	vec3 light_attenuation = vec3(spot_attenuation);
+	vec3 light_color = spot_lights[idx].light_color_energy.rgb;
+
+	if (spot_lights[idx].projector_rect != vec4(0.0)) {
+		// The spot frustum already yields straight [0,1] UVs, so no remapping beyond
+		// the atlas rect is needed.
+		highp vec4 splane = (spot_lights[idx].shadow_matrix * vec4(vertex, 1.0));
+		vec2 proj_uv = clamp(splane.xy / splane.w, vec2(0.0), vec2(1.0));
+		proj_uv = spot_lights[idx].projector_rect.xy + proj_uv * spot_lights[idx].projector_rect.zw;
+
+		vec4 proj = texture(projector_atlas, proj_uv);
+		light_color *= proj.rgb * proj.a;
+	}
 
 #if !defined(SHADOWS_DISABLED)
 #ifdef USE_SHADOW //ubershader-runtime
@@ -1416,6 +1919,11 @@ void light_process_spot(int idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 bi
 		//there is a shadowmap
 		highp vec4 splane = (spot_lights[idx].shadow_matrix * vec4(vertex, 1.0));
 		splane.xyz /= splane.w;
+
+		// shadow_matrix is shared with the projector above, so it maps into the
+		// light's own [0,1] frustum rather than straight into the shadow atlas; fold
+		// in the atlas rect here, as light_process_omni() does.
+		splane.xy = spot_lights[idx].light_clamp.xy + splane.xy * spot_lights[idx].light_clamp.zw;
 
 		float shadow = sample_shadow(shadow_atlas, shadow_atlas_pixel_size, splane.xy, splane.z, spot_lights[idx].light_clamp);
 
@@ -1430,7 +1938,7 @@ void light_process_spot(int idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 bi
 #endif //USE_SHADOW //ubershader-runtime
 #endif //SHADOWS_DISABLED
 
-	light_compute(normal, normalize(light_rel_vec), eye_vec, binormal, tangent, spot_lights[idx].light_color_energy.rgb, light_attenuation, albedo, transmission, spot_lights[idx].light_params.z * p_blob_intensity, roughness, metallic, specular, rim * spot_attenuation, rim_tint, clearcoat, clearcoat_gloss, anisotropy, diffuse_light, specular_light, alpha);
+	light_compute(normal, normalize(light_rel_vec), eye_vec, binormal, tangent, light_color, light_attenuation, albedo, transmission, spot_lights[idx].light_params.z * p_blob_intensity, roughness, metallic, specular, rim * spot_attenuation, rim_tint, clearcoat, clearcoat_gloss, anisotropy, diffuse_light, specular_light, alpha);
 }
 
 void reflection_process(int idx, vec3 vertex, vec3 normal, vec3 binormal, vec3 tangent, float roughness, float anisotropy, vec3 ambient, vec3 skybox, inout highp vec4 reflection_accum, inout highp vec4 ambient_accum) {
@@ -1944,6 +2452,42 @@ FRAGMENT_SHADER_CODE
 
 #endif
 
+#ifdef RENDER_GI_VOXELS
+	{
+		if (alpha < 0.5) {
+			discard;
+		}
+		highp vec3 wpos = (camera_matrix * vec4(vertex_interp, 1.0)).xyz;
+		highp vec3 wn = mat3(camera_matrix) * normal_interp;
+		// Pull samples inside the surface, so faces lying exactly on a voxel
+		// boundary always pick the same side.
+		wpos -= wn * (0.1 * gi_voxel_size / max(length(wn), 1e-4));
+		ivec3 cell = ivec3(floor(wpos / gi_voxel_size));
+		if (any(lessThan(cell, gi_voxel_box_min)) || any(greaterThanEqual(cell, gi_voxel_box_max))) {
+			discard;
+		}
+		ivec3 tc = (cell & ivec3(GI_RES - 1)) + ivec3(0, 0, gi_voxel_cascade * GI_RES);
+		// Atomic max keeps the result independent of fragment order.
+		uvec3 a = uvec3(clamp(albedo * (1.0 - 0.7 * metallic), vec3(0.0), vec3(1.0)) * 1023.0 + 0.5);
+		imageAtomicMax(gi_voxel_albedo, tc, 0x80000000u | (a.g << 20u) | (a.r << 10u) | a.b);
+		// Which of the six directions this surface faces: meshes voxelize as
+		// hollow shells, and the inside must not count as lit.
+		vec3 fn = wn / max(length(wn), 1e-4);
+		uint facing = (fn.x > 0.2 ? 1u : 0u) | (fn.x < -0.2 ? 2u : 0u) | (fn.y > 0.2 ? 4u : 0u) | (fn.y < -0.2 ? 8u : 0u) | (fn.z > 0.2 ? 16u : 0u) | (fn.z < -0.2 ? 32u : 0u);
+		if (gi_voxel_two_sided) {
+			facing = 63u;
+		}
+		imageAtomicOr(gi_voxel_facing, tc, facing);
+		highp float em = max(emission.r, max(emission.g, emission.b));
+		if (em > 0.001) {
+			highp float ex = clamp(ceil(log2(em) + 1e-3), -15.0, 15.0);
+			uvec3 m = uvec3(clamp(emission * exp2(-ex), vec3(0.0), vec3(1.0)) * 511.0 + 0.5);
+			imageAtomicMax(gi_voxel_emission, tc, (uint(ex + 15.0) << 27u) | (m.r << 18u) | (m.g << 9u) | m.b);
+		}
+		return;
+	}
+#endif
+
 	/////////////////////// LIGHTING //////////////////////////////
 
 	//apply energy conservation
@@ -2019,6 +2563,29 @@ FRAGMENT_SHADER_CODE
 #endif //ubershader-runtime
 
 	ambient_light *= ambient_energy;
+
+#if !defined(AMBIENT_LIGHT_DISABLED)
+#ifdef USE_FORWARD_LIGHTING //ubershader-runtime
+	if (gi_config.x > 0) {
+		highp vec3 gi_pos = (camera_matrix * vec4(vertex, 1.0)).xyz;
+		vec3 gi_normal = normalize(mat3(camera_matrix) * normal);
+		vec3 gi_reflect = normalize(mat3(camera_matrix) * reflect(-eye_vec, normal));
+		vec3 gi_irr;
+		vec3 gi_refl;
+		float gi_weight = gi_sample(gi_pos, gi_normal, gi_reflect, 0, gi_irr, gi_refl);
+		if (gi_config.z > 0) {
+			// Scale sky reflections by how much of the open sky's light gets here,
+			// and hand rough reflections over to the probes.
+			vec3 lum = vec3(0.2126, 0.7152, 0.0722);
+			float sky_lum = max(dot(env_reflection_light, lum), 1e-3);
+			float occ = clamp(dot(gi_refl, lum) / sky_lum, 0.0, 1.0);
+			vec3 occluded = mix(env_reflection_light * occ, gi_refl, smoothstep(0.35, 0.85, roughness));
+			env_reflection_light = mix(env_reflection_light, occluded, gi_weight);
+		}
+		ambient_light = mix(ambient_light, gi_irr * gi_params.x * (1.0 - F), gi_weight);
+	}
+#endif //ubershader-runtime
+#endif
 
 	float specular_blob_intensity = 1.0;
 
@@ -2139,6 +2706,18 @@ FRAGMENT_SHADER_CODE
 		vec3 pssm_coord;
 		float pssm_fade = 0.0;
 
+		// Normal-offset shadows: slide the lookup position along the surface
+		// normal so it lands inside the caster's own depth texel instead of
+		// straddling it. The needed distance grows as the surface tilts away from
+		// the light (sin of the angle) and with the cascade's texel size, which is
+		// already folded into shadow_normal_bias. Because the offset is lateral it
+		// removes acne without pushing the shadow off the contact point the way a
+		// depth push does. normal_interp, not `normal`, so normal maps don't warp
+		// the lookup.
+		vec3 pssm_normal = normalize(normal_interp);
+		float pssm_ndotl = clamp(dot(pssm_normal, -light_direction_attenuation.xyz), 0.0, 1.0);
+		vec3 pssm_normal_offset = pssm_normal * sqrt(1.0 - pssm_ndotl * pssm_ndotl);
+
 #ifdef LIGHT_USE_PSSM_BLEND //ubershader-skip
 		float pssm_blend;
 		vec3 pssm_coord2;
@@ -2149,39 +2728,39 @@ FRAGMENT_SHADER_CODE
 
 		if (depth_z < shadow_split_offsets.y) {
 			if (depth_z < shadow_split_offsets.x) {
-				highp vec4 splane = (shadow_matrix1 * vec4(vertex, 1.0));
+				highp vec4 splane = (shadow_matrix1 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.x, 1.0));
 				pssm_coord = splane.xyz / splane.w;
 
 #ifdef LIGHT_USE_PSSM_BLEND //ubershader-runtime
 
-				splane = (shadow_matrix2 * vec4(vertex, 1.0));
+				splane = (shadow_matrix2 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.y, 1.0));
 				pssm_coord2 = splane.xyz / splane.w;
 				pssm_blend = smoothstep(0.0, shadow_split_offsets.x, depth_z);
 #endif //ubershader-runtime
 
 			} else {
-				highp vec4 splane = (shadow_matrix2 * vec4(vertex, 1.0));
+				highp vec4 splane = (shadow_matrix2 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.y, 1.0));
 				pssm_coord = splane.xyz / splane.w;
 
 #ifdef LIGHT_USE_PSSM_BLEND //ubershader-runtime
-				splane = (shadow_matrix3 * vec4(vertex, 1.0));
+				splane = (shadow_matrix3 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.z, 1.0));
 				pssm_coord2 = splane.xyz / splane.w;
 				pssm_blend = smoothstep(shadow_split_offsets.x, shadow_split_offsets.y, depth_z);
 #endif //ubershader-runtime
 			}
 		} else {
 			if (depth_z < shadow_split_offsets.z) {
-				highp vec4 splane = (shadow_matrix3 * vec4(vertex, 1.0));
+				highp vec4 splane = (shadow_matrix3 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.z, 1.0));
 				pssm_coord = splane.xyz / splane.w;
 
 #ifdef LIGHT_USE_PSSM_BLEND //ubershader-runtime
-				splane = (shadow_matrix4 * vec4(vertex, 1.0));
+				splane = (shadow_matrix4 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.w, 1.0));
 				pssm_coord2 = splane.xyz / splane.w;
 				pssm_blend = smoothstep(shadow_split_offsets.y, shadow_split_offsets.z, depth_z);
 #endif //ubershader-runtime
 
 			} else {
-				highp vec4 splane = (shadow_matrix4 * vec4(vertex, 1.0));
+				highp vec4 splane = (shadow_matrix4 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.w, 1.0));
 				pssm_coord = splane.xyz / splane.w;
 				pssm_fade = smoothstep(shadow_split_offsets.z, shadow_split_offsets.w, depth_z);
 
@@ -2197,18 +2776,18 @@ FRAGMENT_SHADER_CODE
 #ifdef LIGHT_USE_PSSM2 //ubershader-runtime
 
 		if (depth_z < shadow_split_offsets.x) {
-			highp vec4 splane = (shadow_matrix1 * vec4(vertex, 1.0));
+			highp vec4 splane = (shadow_matrix1 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.x, 1.0));
 			pssm_coord = splane.xyz / splane.w;
 
 #ifdef LIGHT_USE_PSSM_BLEND //ubershader-runtime
 
-			splane = (shadow_matrix2 * vec4(vertex, 1.0));
+			splane = (shadow_matrix2 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.y, 1.0));
 			pssm_coord2 = splane.xyz / splane.w;
 			pssm_blend = smoothstep(0.0, shadow_split_offsets.x, depth_z);
 #endif //ubershader-runtime
 
 		} else {
-			highp vec4 splane = (shadow_matrix2 * vec4(vertex, 1.0));
+			highp vec4 splane = (shadow_matrix2 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.y, 1.0));
 			pssm_coord = splane.xyz / splane.w;
 			pssm_fade = smoothstep(shadow_split_offsets.x, shadow_split_offsets.y, depth_z);
 #ifdef LIGHT_USE_PSSM_BLEND //ubershader-runtime
@@ -2222,7 +2801,7 @@ FRAGMENT_SHADER_CODE
 #ifndef LIGHT_USE_PSSM2 //ubershader-runtime
 #ifndef LIGHT_USE_PSSM4 //ubershader-runtime
 		{ //regular orthogonal
-			highp vec4 splane = (shadow_matrix1 * vec4(vertex, 1.0));
+			highp vec4 splane = (shadow_matrix1 * vec4(vertex + pssm_normal_offset * shadow_normal_bias.x, 1.0));
 			pssm_coord = splane.xyz / splane.w;
 		}
 #endif //ubershader-runtime
@@ -2315,6 +2894,11 @@ FRAGMENT_SHADER_CODE
 	diffuse_light *= ao_light_affect;
 #endif
 
+	vec3 gi_albedo_out = albedo * (1.0 - metallic);
+#if defined(ENABLE_AO)
+	gi_albedo_out *= ao;
+#endif
+
 	// base color remapping
 	diffuse_light *= 1.0 - metallic; // TODO: avoid all diffuse and ambient light calculations when metallic == 1 up to this point
 	ambient_light *= 1.0 - metallic;
@@ -2355,6 +2939,7 @@ FRAGMENT_SHADER_CODE
 
 		emission = emission * rev_amount + fog_color * fog_amount;
 		ambient_light *= rev_amount;
+		gi_albedo_out *= rev_amount;
 		specular_light *= rev_amount;
 		diffuse_light *= rev_amount;
 	}
@@ -2364,6 +2949,8 @@ FRAGMENT_SHADER_CODE
 #ifdef SHADELESS //ubershader-runtime
 	diffuse_buffer = vec4(albedo.rgb, 0.0);
 	specular_buffer = vec4(0.0);
+	gi_albedo_buffer = vec4(0.0);
+	gi_ambient_buffer = vec3(0.0);
 
 #else //ubershader-runtime
 
@@ -2385,6 +2972,12 @@ FRAGMENT_SHADER_CODE
 
 #ifdef USE_FORWARD_LIGHTING //ubershader-runtime
 	diffuse_buffer.rgb += emission;
+	gi_albedo_buffer = vec4(gi_albedo_out, 1.0);
+	gi_ambient_buffer = ambient_light;
+#else //ubershader-runtime
+	// Additive directional passes must not accumulate these twice.
+	gi_albedo_buffer = vec4(0.0);
+	gi_ambient_buffer = vec3(0.0);
 #endif //ubershader-runtime
 #endif //SHADELESS //ubershader-runtime
 

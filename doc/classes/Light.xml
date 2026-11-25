@@ -31,6 +31,31 @@
 		<member name="editor_only" type="bool" setter="set_editor_only" getter="is_editor_only" default="false">
 			If [code]true[/code], the light only appears in the editor and will not be visible at runtime.
 		</member>
+		<member name="lens_streak_angle" type="float" setter="set_lens_streak_angle" getter="get_lens_streak_angle" default="0.0">
+			Rotation of the streak in degrees. [code]0[/code] is horizontal.
+		</member>
+		<member name="lens_streak_color" type="Color" setter="set_lens_streak_color" getter="get_lens_streak_color" default="Color( 1, 1, 1, 1 )">
+			Tint of the streak, multiplied with [member light_color].
+		</member>
+		<member name="lens_streak_enabled" type="bool" setter="set_lens_streak_enabled" getter="is_lens_streak_enabled" default="false">
+			If [code]true[/code], the light draws an anamorphic lens streak over the screen at its position while the camera can see it. A [SpotLight] only streaks while the camera is inside its cone.
+			[b]Note:[/b] Only supported by the GLES3 renderer.
+		</member>
+		<member name="lens_streak_intensity" type="float" setter="set_lens_streak_intensity" getter="get_lens_streak_intensity" default="1.0">
+			Brightness of the streak, multiplied with [member light_energy].
+		</member>
+		<member name="lens_streak_length" type="float" setter="set_lens_streak_length" getter="get_lens_streak_length" default="0.6">
+			Length of the streak on screen. [code]1.0[/code] spans the height of the viewport.
+		</member>
+		<member name="lens_streak_max_distance" type="float" setter="set_lens_streak_max_distance" getter="get_lens_streak_max_distance" default="100.0">
+			Distance from the camera at which the streak has faded out. [code]0[/code] disables the fade. Not used by [DirectionalLight].
+		</member>
+		<member name="lens_streak_source_size" type="float" setter="set_lens_streak_source_size" getter="get_lens_streak_source_size" default="0.1">
+			Size of the light source used to test whether the streak is hidden: a radius in meters for [OmniLight] and [SpotLight], in degrees for [DirectionalLight]. Larger values fade more gradually behind geometry. Geometry closer to the light than this, such as a bulb mesh, does not hide the streak. For a [DirectionalLight], any geometry that writes depth hides it, including a sky dome mesh.
+		</member>
+		<member name="lens_streak_thickness" type="float" setter="set_lens_streak_thickness" getter="get_lens_streak_thickness" default="0.02">
+			Thickness of the streak on screen, relative to the height of the viewport.
+		</member>
 		<member name="light_bake_mode" type="int" setter="set_bake_mode" getter="get_bake_mode" enum="Light.BakeMode" default="1">
 			The light's bake mode. See [enum BakeMode].
 		</member>
@@ -45,6 +70,12 @@
 		</member>
 		<member name="light_indirect_energy" type="float" setter="set_param" getter="get_param" default="1.0">
 			Secondary multiplier used with indirect light (light bounces). This works on both [BakedLightmap] and [GIProbe].
+		</member>
+		<member name="light_projector" type="Texture" setter="set_projector" getter="get_projector">
+			Texture projected by the light, often called a "cookie" or "gobo". The light's color is multiplied by this texture's color times its alpha, so black or fully transparent texels mask the light out entirely.
+			For a [SpotLight] the texture is projected straight through the light's cone, like a slide projector. For an [OmniLight] it must be an equirectangular panorama (the same layout a panorama sky uses); it is resampled into a dual-paraboloid pair internally so it can be sampled cheaply. In both cases the projection rotates with the light node.
+			All projector textures in the scene share one atlas, sized by [member ProjectSettings.rendering/quality/lights/projector_size]. Reusing the same texture across many lights costs no extra atlas space.
+			[b]Note:[/b] Only supported on [OmniLight] and [SpotLight] with the GLES3 renderer. Directional lights and GLES2 ignore this property.
 		</member>
 		<member name="light_negative" type="bool" setter="set_negative" getter="is_negative" default="false">
 			If [code]true[/code], the light's effect is reversed, darkening areas and casting bright shadows.
